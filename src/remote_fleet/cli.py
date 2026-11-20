@@ -29,6 +29,12 @@ from remote_fleet.config import (
 )
 from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
+from remote_fleet.mac_integration import (
+    install_macos_launch_agent,
+    mount_all_machines,
+    sync_ssh_config,
+    unmount_all_machines,
+)
 from remote_fleet.mcp_server import serve_stdio
 from remote_fleet.mount import (
     compute_local_workspace_dir,
@@ -747,6 +753,86 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0 if res.get("ok") else 1
 
 
+def cmd_ssh_config(args: argparse.Namespace) -> int:
+    cfg, ts_self = load_fleet_config(include_tailscale=True)
+    target = Path(args.output).expanduser().resolve() if args.output else None
+    written = sync_ssh_config(cfg, ts_self, ssh_config_path=target)
+    print(f"Updated SSH config at {written}")
+    print("Configured SSH hosts (automatic Home LAN -> Tailscale fallback):")
+    for m in cfg.machines:
+        print(f"  - {m.id:<12} (LAN={m.lan_host or '-'} -> Tailscale={m.tailscale_host or '-'})")
+    return 0
+
+
+def cmd_mount_all(args: argparse.Namespace) -> int:
+    cfg, ts_self = load_fleet_config(include_tailscale=True)
+    transport = FleetTransport(cfg, ts_self)
+    base = Path(args.dir).expanduser().resolve() if args.dir else None
+    summary = mount_all_machines(cfg, transport, base_dir=base)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+    print(f"Remote Computers folder: {summary['base_dir']}")
+    for r in summary["results"]:
+        mid = r.get("machine_id", "?")
+        if r.get("skipped"):
+            print(f"  [SKIP] {mid:<12} ({r.get('reason')})")
+        elif r.get("ok"):
+            state = "already mounted" if r.get("already_mounted") else f"mounted via {r.get('engine')}"
+            print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({state})")
+        else:
+            print(f"  [WARN] {mid:<12} -> {r.get('error')}")
+    return 0
+
+
+def cmd_unmount_all(args: argparse.Namespace) -> int:
+    base = Path(args.dir).expanduser().resolve() if args.dir else None
+    summary = unmount_all_machines(base_dir=base)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_setup_mac(args: argparse.Namespace) -> int:
+    print("=== Step 1/4: Discovering Tailscale peers (if active) & loading fleet config ===")
+    ts_nodes = query_tailscale_nodes()
+    cfg, ts_self = load_fleet_config(include_tailscale=False)
+    if ts_nodes:
+        cfg, ts_self = merge_tailscale_into_config(cfg, ts_nodes)
+    cfg_path = save_fleet_config(cfg)
+    print(f"  Saved {cfg_path} ({len(cfg.machines)} machines)")
+
+    print("\n=== Step 2/4: Installing MCP server, Skills & Global Rules across all Harnesses ===")
+    install_all_harnesses()
+    print("  Configured: Antigravity, Claude Code / Desktop, Codex, Kimi Code, DSH")
+
+    print("\n=== Step 3/4: Writing ~/.ssh/config hosts (for Codex SSH & Remote-SSH) ===")
+    ssh_cfg = sync_ssh_config(cfg, ts_self)
+    print(f"  Updated {ssh_cfg} with LAN-first + Tailscale-fallback Host entries")
+
+    print("\n=== Step 4/4: Mounting online computers under ~/RemoteComputers/ (for 'Choose Folder' dialogs) ===")
+    mount_dir = Path(args.dir).expanduser().resolve() if args.dir else (Path.home() / "RemoteComputers")
+    transport = FleetTransport(cfg, ts_self)
+    summary = mount_all_machines(cfg, transport, base_dir=mount_dir)
+    for r in summary["results"]:
+        mid = r.get("machine_id", "?")
+        if r.get("skipped"):
+            print(f"  [LOCAL] {mid:<12} (this Mac)")
+        elif r.get("ok"):
+            print(f"  [MOUNT] {mid:<12} -> {r.get('mount_point')}")
+        else:
+            print(f"  [INFO]  {mid:<12} -> {r.get('error')}")
+
+    if sys.platform == "darwin" and not args.no_autostart:
+        plist = install_macos_launch_agent(base_dir=mount_dir)
+        print(f"\nInstalled macOS login auto-mounter: {plist}")
+
+    print(
+        f"\nDone! Drag `{mount_dir}` into your macOS Finder Sidebar Favorites so `spark-1`, "
+        "`spark-2`, `spark-3`, and `pc` appear directly inside every harness's 'New / Create Project' dialog!"
+    )
+    return 0
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     harnesses = (
         [h.strip() for h in args.harnesses.split(",") if h.strip()]
@@ -763,7 +849,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"\n  [{section}]")
         for p in paths:
             print(f"    - {p}")
-    print("\nTip: Open `~/Fleet/Start-Here` in any harness (or run `fleet gui` / `fleet pick`) to start a remote project!")
+    print("\nTip: On macOS, run `fleet setup-mac` to also configure `~/.ssh/config` and mount `~/RemoteComputers/`!")
     return 0
 
 
@@ -903,6 +989,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_unmount = sub.add_parser("unmount", help="Unmount an rclone/SSHFS workspace")
     p_unmount.add_argument("local_path", nargs="?")
     p_unmount.set_defaults(func=cmd_unmount)
+
+    p_sshcfg = sub.add_parser(
+        "ssh-config",
+        help="Write LAN-first / Tailscale-fallback Host blocks into ~/.ssh/config (for Codex SSH & Remote-SSH)",
+    )
+    p_sshcfg.add_argument("--output", help="Optional custom ssh config path")
+    p_sshcfg.set_defaults(func=cmd_ssh_config)
+
+    p_mall = sub.add_parser(
+        "mount-all",
+        help="Mount all reachable computers under ~/RemoteComputers/<machine> so 'Choose Folder' dialogs see them",
+    )
+    p_mall.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
+    p_mall.add_argument("--json", action="store_true")
+    p_mall.set_defaults(func=cmd_mount_all)
+
+    p_umall = sub.add_parser("unmount-all", help="Unmount all ~/RemoteComputers/<machine> mounts")
+    p_umall.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
+    p_umall.set_defaults(func=cmd_unmount_all)
+
+    p_mac = sub.add_parser(
+        "setup-mac",
+        help="All-in-one Mac setup: install into all harnesses, configure ~/.ssh/config, and mount ~/RemoteComputers/",
+    )
+    p_mac.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
+    p_mac.add_argument("--no-autostart", action="store_true", help="Skip creating macOS login LaunchAgent")
+    p_mac.set_defaults(func=cmd_setup_mac)
 
     p_start = sub.add_parser(
         "start",

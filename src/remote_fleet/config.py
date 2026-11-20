@@ -521,8 +521,55 @@ def find_workspace_marker(start_dir: Optional[Path] = None) -> Optional[Tuple[Pa
     return None
 
 
+def get_mounts_registry_path() -> Path:
+    return get_config_dir() / "mounts.json"
+
+
+def load_mounts_registry() -> Dict[str, Dict[str, str]]:
+    reg_file = get_mounts_registry_path()
+    if not reg_file.is_file():
+        return {}
+    try:
+        data = json.loads(reg_file.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_mounts_registry(mapping: Dict[str, Dict[str, str]]) -> Path:
+    reg_file = get_mounts_registry_path()
+    reg_file.parent.mkdir(parents=True, exist_ok=True)
+    reg_file.write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
+    return reg_file
+
+
+def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[ActiveProjectState]:
+    """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/spark-1/foo`), map it back."""
+    cur = (start_dir or Path.cwd()).resolve()
+    registry = load_mounts_registry()
+    for local_mount_str, info in registry.items():
+        try:
+            mount_root = Path(local_mount_str).expanduser().resolve()
+            rel = cur.relative_to(mount_root)
+        except Exception:
+            continue
+        machine_id = str(info.get("machine_id") or "").strip()
+        remote_root = str(info.get("remote_root") or "~").rstrip("/")
+        if not machine_id:
+            continue
+        rel_posix = str(rel).replace("\\", "/")
+        remote_path = remote_root if rel_posix in ("", ".") else f"{remote_root}/{rel_posix}"
+        return ActiveProjectState(
+            machine_id=machine_id,
+            remote_path=remote_path,
+            local_workspace_path=str(cur),
+            source="mounted_folder",
+        )
+    return None
+
+
 def load_active_project(cwd: Optional[Path] = None) -> Optional[ActiveProjectState]:
-    """Resolve the active remote project from env vars, `.remote-fleet.json`, or saved user state."""
+    """Resolve the active remote project from env vars, `.remote-fleet.json`, mounted folder path, or saved state."""
     env_machine = os.environ.get("REMOTE_FLEET_MACHINE", "").strip()
     env_path = os.environ.get("REMOTE_FLEET_PATH", "").strip()
     if env_machine and env_path:
@@ -535,6 +582,10 @@ def load_active_project(cwd: Optional[Path] = None) -> Optional[ActiveProjectSta
     found = find_workspace_marker(cwd)
     if found:
         return found[1]
+
+    mounted_state = detect_mounted_machine_path(cwd)
+    if mounted_state:
+        return mounted_state
 
     state_file = get_state_path()
     if state_file.is_file():
