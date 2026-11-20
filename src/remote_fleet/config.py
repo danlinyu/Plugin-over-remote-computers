@@ -215,34 +215,34 @@ def default_home_fleet_config() -> FleetConfig:
             MachineConfig(
                 id="spark-1",
                 name="DGX Spark 1",
-                lan_host="spark-1.local",
-                tailscale_host="spark-1",
+                lan_host="spark01.local",
+                tailscale_host="spark01",
                 os="linux",
                 default_roots=["~/projects", "~/workspace", "~"],
                 tags=["linux", "gpu", "spark"],
-                hostnames=["spark-1", "spark1", "dgx-spark-1"],
+                hostnames=["spark01", "spark-1", "spark1", "dgx-spark-1"],
                 description="Spark node #1 over Home LAN or Tailscale",
             ),
             MachineConfig(
                 id="spark-2",
                 name="DGX Spark 2",
-                lan_host="spark-2.local",
-                tailscale_host="spark-2",
+                lan_host="spark02.local",
+                tailscale_host="spark02",
                 os="linux",
                 default_roots=["~/projects", "~/workspace", "~"],
                 tags=["linux", "gpu", "spark"],
-                hostnames=["spark-2", "spark2", "dgx-spark-2"],
+                hostnames=["spark02", "spark-2", "spark2", "dgx-spark-2"],
                 description="Spark node #2 over Home LAN or Tailscale",
             ),
             MachineConfig(
                 id="spark-3",
                 name="DGX Spark 3",
-                lan_host="spark-3.local",
-                tailscale_host="spark-3",
+                lan_host="spark03.local",
+                tailscale_host="spark03",
                 os="linux",
                 default_roots=["~/projects", "~/workspace", "~"],
                 tags=["linux", "gpu", "spark"],
-                hostnames=["spark-3", "spark3", "dgx-spark-3"],
+                hostnames=["spark03", "spark-3", "spark3", "dgx-spark-3"],
                 description="Spark node #3 over Home LAN or Tailscale",
             ),
         ],
@@ -373,7 +373,7 @@ def merge_tailscale_into_config(
         if matched:
             # Prefer full MagicDNS name or IPv4 Tailscale IP if configured tailscale_host is bare/empty
             preferred_ts = node.dns_name or (node.ips[0] if node.ips else node.hostname)
-            if not matched.tailscale_host or matched.tailscale_host == matched.id:
+            if not matched.tailscale_host or "." not in matched.tailscale_host:
                 matched.tailscale_host = preferred_ts
             if matched.os == "auto" and node.os != "auto":
                 matched.os = node.os

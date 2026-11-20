@@ -27,6 +27,7 @@ from remote_fleet.config import (
     save_active_project,
     save_fleet_config,
 )
+from remote_fleet.bootstrap import run_bootstrap
 from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
@@ -1016,6 +1017,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_mac.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
     p_mac.add_argument("--no-autostart", action="store_true", help="Skip creating macOS login LaunchAgent")
     p_mac.set_defaults(func=cmd_setup_mac)
+
+    p_boot = sub.add_parser(
+        "bootstrap",
+        help="Turnkey Home LAN & Tailscale discovery, SSH key setup, Spark Tailscale fix, and Mac harness setup",
+    )
+    p_boot.add_argument("--user", default="danlinyu", help="Default SSH username on remote machines (default: danlinyu)")
+    p_boot.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        help="Optional explicit override `id=hostname_or_ip` (repeatable, e.g. --host pc=192.168.1.20)",
+    )
+    p_boot.add_argument(
+        "--fix-spark-tailscale",
+        action="store_true",
+        help="Install/enable system-level tailscaled.service on Sparks and move shadowing ~/.local/bin/tailscale",
+    )
+    p_boot.add_argument("--no-ssh-copy", action="store_true", help="Skip interactive ssh-copy-id prompts")
+    p_boot.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
+    p_boot.set_defaults(
+        func=lambda a: run_bootstrap(
+            ssh_user=a.user,
+            extra_hosts=a.host,
+            interactive_ssh_copy=not a.no_ssh_copy,
+            fix_spark_tailscale=a.fix_spark_tailscale,
+            mount_dir=Path(a.dir) if a.dir else None,
+        )
+    )
 
     p_start = sub.add_parser(
         "start",

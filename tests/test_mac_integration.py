@@ -45,7 +45,7 @@ class TestMacIntegration(unittest.TestCase):
                 self.assertIn("Host spark-1\n", text)
                 self.assertIn("HostName spark-1.tailnet.ts.net", text)
                 self.assertIn("Match host spark-1 exec", text)
-                self.assertIn("HostName spark-1.local", text)
+                self.assertIn("HostName spark01.local", text)
                 self.assertIn("User danlin", text)
                 self.assertIn("Host pc\n", text)
 
