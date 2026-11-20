@@ -13,17 +13,49 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from remote_fleet.config import default_home_fleet_config, get_config_path, save_fleet_config
-from remote_fleet.mount import get_repo_root
+from remote_fleet.mount import create_launchpad_workspace, get_repo_root
 
 
 CODEX_BEGIN_MARKER = "# >>> remote-fleet >>>"
 CODEX_END_MARKER = "# <<< remote-fleet <<<"
+
+MD_BEGIN_MARKER = "<!-- remote-fleet-begin -->"
+MD_END_MARKER = "<!-- remote-fleet-end -->"
+
+GLOBAL_FLEET_INSTRUCTION_BLOCK = f"""{MD_BEGIN_MARKER}
+## Remote Fleet (Home LAN & Tailscale Multi-Computer Projects)
+
+You have the `remote-fleet` MCP server and skill installed. The user uses this machine (e.g., Mac Mini) as a fast, lightweight control interface while heavy computations and large local datasets live on their remote machines (`pc`, `spark-1`, `spark-2`, `spark-3`, `mac-mini`) over Home LAN / Tailscale.
+
+- **Starting a new project or picking a remote folder**: Whenever the user starts a new project (especially from `~/Fleet/Start-Here` or without a target repo yet) or asks to open/create a project on another machine, call `fleet_list_machines(probe=true, include_load=true)` and `fleet_browse_folders`, then bind the folder with `fleet_select_project` or `fleet_create_project`.
+- **Keep changes, datasets, and compute on the target machine**: Once a remote machine folder is active, perform ALL file reads/writes/edits (`fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, `fleet_search_files`) and command execution (`fleet_run_command`) on that target machine—never leave edits stranded only on this interface computer, and never run heavy calculations locally on this interface computer.
+- **Heavy calculations**: Use `fleet_start_job`, `fleet_job_status`, and `fleet_stop_job` for long-running or heavy CPU/GPU workloads on the PC or Sparks so this harness stays responsive.
+{MD_END_MARKER}
+"""
 
 
 def _make_executable(path: Path) -> None:
     if os.name != "nt":
         mode = path.stat().st_mode
         path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _upsert_global_agent_md(md_path: Path) -> Path:
+    """Idempotently insert or update the Remote Fleet rule block in a global agent markdown file."""
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    pattern = re.compile(
+        re.escape(MD_BEGIN_MARKER) + r".*?" + re.escape(MD_END_MARKER) + r"\n?",
+        re.DOTALL,
+    )
+    if pattern.search(existing):
+        updated = pattern.sub(GLOBAL_FLEET_INSTRUCTION_BLOCK, existing)
+    else:
+        sep = "\n" if existing and not existing.endswith("\n") else ""
+        extra_nl = "\n" if existing.strip() else ""
+        updated = f"{existing}{sep}{extra_nl}{GLOBAL_FLEET_INSTRUCTION_BLOCK}"
+    md_path.write_text(updated, encoding="utf-8")
+    return md_path
 
 
 def _install_bin_wrappers(home: Path, repo_root: Path, python_exe: str) -> List[str]:
@@ -62,6 +94,28 @@ def _install_bin_wrappers(home: Path, repo_root: Path, python_exe: str) -> List[
         installed.extend([str(fleet_sh), str(mcp_sh)])
 
     return installed
+
+
+def _install_launchpad_and_mac_shortcut(
+    home: Path, repo_root: Path, python_exe: str
+) -> List[str]:
+    """Create `~/Fleet/Start-Here` launchpad and clickable macOS `Pick Remote Folder.command`."""
+    fleet_dir = home / "Fleet"
+    launchpad = create_launchpad_workspace(str(fleet_dir), python_executable=python_exe)
+    created = [str(launchpad)]
+
+    if os.name != "nt":
+        shortcut = fleet_dir / "Pick Remote Folder.command"
+        src_dir = repo_root / "src"
+        shortcut.write_text(
+            "#!/usr/bin/env sh\n"
+            f'export PYTHONPATH="{src_dir}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+            f'exec "{python_exe}" -m remote_fleet gui\n',
+            encoding="utf-8",
+        )
+        _make_executable(shortcut)
+        created.append(str(shortcut))
+    return created
 
 
 def _merge_mcp_json_file(
@@ -154,7 +208,7 @@ def install_all_harnesses(
     harnesses: Optional[List[str]] = None,
     python_executable: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Install Remote Fleet CLI, Skills, Slash Commands, and MCP entries across harnesses."""
+    """Install Remote Fleet CLI, Launchpad, Global Instructions, Skills, Slash Commands, and MCP configs."""
     home = (home_dir or Path.home()).expanduser().resolve()
     repo_root = get_repo_root()
     py_exe = python_executable or sys.executable or "python3"
@@ -168,6 +222,7 @@ def install_all_harnesses(
 
     report: Dict[str, List[str]] = {
         "cli": [],
+        "launchpad": [],
         "config": [],
         "antigravity": [],
         "claude": [],
@@ -177,8 +232,9 @@ def install_all_harnesses(
         "cursor": [],
     }
 
-    # 1. CLI wrappers in ~/.local/bin
+    # 1. CLI wrappers in ~/.local/bin + ~/Fleet/Start-Here launchpad + macOS GUI shortcut
     report["cli"].extend(_install_bin_wrappers(home, repo_root, py_exe))
+    report["launchpad"].extend(_install_launchpad_and_mac_shortcut(home, repo_root, py_exe))
 
     # 2. Ensure fleet.json exists
     cfg_path = (
@@ -190,7 +246,7 @@ def install_all_harnesses(
         save_fleet_config(default_home_fleet_config(), cfg_path)
     report["config"].append(str(cfg_path))
 
-    # 3. Antigravity (Skills + MCP config)
+    # 3. Antigravity (Skills + MCP config + Global GEMINI.md rule)
     if "antigravity" in selected:
         report["antigravity"].append(
             str(_copy_skill_bundle(home / ".gemini" / "antigravity" / "skills" / "remote-fleet", repo_root))
@@ -201,8 +257,11 @@ def install_all_harnesses(
         report["antigravity"].append(
             str(_merge_mcp_json_file(home / ".gemini" / "antigravity" / "mcp_config.json", py_exe, repo_root))
         )
+        report["antigravity"].append(
+            str(_upsert_global_agent_md(home / ".gemini" / "GEMINI.md"))
+        )
 
-    # 4. Claude Code & Claude Desktop (Skills + Slash Commands + MCP config)
+    # 4. Claude Code & Claude Desktop (Skills + Slash Commands + MCP config + Global CLAUDE.md rule)
     if "claude" in selected:
         report["claude"].append(
             str(_copy_skill_bundle(home / ".claude" / "skills" / "remote-fleet", repo_root))
@@ -219,8 +278,10 @@ def install_all_harnesses(
         report["claude"].append(
             str(_merge_mcp_json_file(home / ".claude.json", py_exe, repo_root))
         )
+        report["claude"].append(
+            str(_upsert_global_agent_md(home / ".claude" / "CLAUDE.md"))
+        )
 
-        # Also configure Claude Desktop if its config directory exists (or on macOS/Windows)
         sys_name = platform.system().lower()
         if sys_name == "darwin":
             desktop_cfg = home / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
@@ -233,7 +294,7 @@ def install_all_harnesses(
         if desktop_cfg.parent.exists():
             report["claude"].append(str(_merge_mcp_json_file(desktop_cfg, py_exe, repo_root)))
 
-    # 5. OpenAI Codex (Skills + ~/.agents/skills + ~/.codex/config.toml MCP)
+    # 5. OpenAI Codex (Skills + ~/.agents/skills + ~/.codex/config.toml MCP + Global AGENTS.md)
     if "codex" in selected:
         report["codex"].append(
             str(_copy_skill_bundle(home / ".codex" / "skills" / "remote-fleet", repo_root))
@@ -244,8 +305,11 @@ def install_all_harnesses(
         report["codex"].append(
             str(_update_codex_toml(home / ".codex" / "config.toml", py_exe, repo_root))
         )
+        report["codex"].append(
+            str(_upsert_global_agent_md(home / ".codex" / "AGENTS.md"))
+        )
 
-    # 6. Kimi Code (Skills + MCP config)
+    # 6. Kimi Code (Skills + MCP config + Global AGENTS.md)
     if "kimi" in selected:
         report["kimi"].append(
             str(_copy_skill_bundle(home / ".kimi" / "skills" / "remote-fleet", repo_root))
@@ -256,11 +320,17 @@ def install_all_harnesses(
         report["kimi"].append(
             str(_merge_mcp_json_file(home / ".kimi" / "mcp.json", py_exe, repo_root))
         )
+        report["kimi"].append(
+            str(_upsert_global_agent_md(home / ".kimi" / "AGENTS.md"))
+        )
 
-    # 7. DSH (Skill bundle + CLI support)
+    # 7. DSH (Skill bundle + Global AGENTS.md)
     if "dsh" in selected:
         report["dsh"].append(
             str(_copy_skill_bundle(home / ".dsh" / "skills" / "remote-fleet", repo_root))
+        )
+        report["dsh"].append(
+            str(_upsert_global_agent_md(home / ".dsh" / "AGENTS.md"))
         )
 
     # 8. Cursor (MCP config if ~/.cursor exists or explicitly requested)

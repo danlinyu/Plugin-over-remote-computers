@@ -461,6 +461,189 @@ def handle(req: dict) -> dict:
             _search_dir(root)
         return {"ok": True, "root": str(root), "matches": matches, "engine": "python"}
 
+    if op == "machine_metrics":
+        import time as _time
+        cpu_count = os.cpu_count() or 1
+        load_1m = None
+        load_5m = None
+        if hasattr(os, "getloadavg"):
+            try:
+                l1, l5, _ = os.getloadavg()
+                load_1m = round(l1, 2)
+                load_5m = round(l5, 2)
+            except OSError:
+                pass
+        disk = shutil.disk_usage(str(Path.home()))
+        gpus = []
+        if shutil.which("nvidia-smi"):
+            g = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if g.returncode == 0:
+                for line in g.stdout.splitlines():
+                    if line.strip():
+                        gpus.append(line.strip())
+        return {
+            "ok": True,
+            "hostname": socket.gethostname(),
+            "os": platform.system().lower(),
+            "cpu_count": cpu_count,
+            "load_1m": load_1m,
+            "load_5m": load_5m,
+            "disk_free_gb": round(disk.free / (1024 ** 3), 1),
+            "disk_total_gb": round(disk.total / (1024 ** 3), 1),
+            "gpus": gpus,
+        }
+
+    if op == "start_job":
+        import signal as _signal
+        import time as _time
+        import uuid as _uuid
+
+        cwd_path = _expand(req.get("cwd") or "~")
+        if not cwd_path.is_dir():
+            return {"ok": False, "error": f"Working directory does not exist: {cwd_path}"}
+        command = str(req["command"])
+        low_priority = bool(req.get("low_priority", False))
+        job_id = str(req.get("job_id") or f"job-{int(_time.time())}-{_uuid.uuid4().hex[:6]}")
+        jobs_root = Path.home() / ".cache" / "remote-fleet" / "jobs"
+        job_dir = jobs_root / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        log_file = job_dir / "output.log"
+        meta_file = job_dir / "meta.json"
+        done_file = job_dir / "done.json"
+        runner_file = job_dir / "runner.py"
+
+        actual_cmd = f"nice -n 10 {command}" if (low_priority and os.name == "posix") else command
+        runner_src = (
+            "import json, os, subprocess, time\n"
+            f"log_path = {repr(str(log_file))}\n"
+            f"done_path = {repr(str(done_file))}\n"
+            f"cwd = {repr(str(cwd_path))}\n"
+            f"cmd = {repr(actual_cmd)}\n"
+            "with open(log_path, 'wb') as lf:\n"
+            "    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT)\n"
+            "    rc = proc.wait()\n"
+            "with open(done_path, 'w', encoding='utf-8') as df:\n"
+            "    json.dump({'exit_code': rc, 'finished_at': time.time()}, df)\n"
+        )
+        runner_file.write_text(runner_src, encoding="utf-8")
+
+        popen_kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "cwd": str(cwd_path),
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            popen_kwargs["creationflags"] = flags
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        child = subprocess.Popen([sys.executable, str(runner_file)], **popen_kwargs)
+        meta = {
+            "job_id": job_id,
+            "pid": child.pid,
+            "command": command,
+            "cwd": str(cwd_path),
+            "started_at": _time.time(),
+            "log_path": str(log_file),
+        }
+        meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return {"ok": True, **meta}
+
+    if op in ("job_status", "job_logs", "stop_job"):
+        import signal as _signal
+        job_id = str(req["job_id"])
+        job_dir = Path.home() / ".cache" / "remote-fleet" / "jobs" / job_id
+        meta_file = job_dir / "meta.json"
+        done_file = job_dir / "done.json"
+        log_file = job_dir / "output.log"
+        if not meta_file.is_file():
+            return {"ok": False, "error": f"Unknown job_id '{job_id}' on {socket.gethostname()}"}
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        pid = int(meta["pid"])
+
+        done_info = json.loads(done_file.read_text(encoding="utf-8")) if done_file.is_file() else None
+        running = False
+        if done_info is None:
+            try:
+                os.kill(pid, 0)
+                running = True
+            except OSError:
+                running = False
+
+        if op == "stop_job":
+            if running:
+                try:
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+                    else:
+                        os.killpg(pid, _signal.SIGTERM)
+                except Exception:
+                    try:
+                        os.kill(pid, _signal.SIGTERM)
+                    except Exception:
+                        pass
+            return {"ok": True, "job_id": job_id, "stopped": True, "was_running": running}
+
+        tail_lines = int(req.get("tail_lines", 60))
+        log_tail = ""
+        if log_file.is_file():
+            lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            log_tail = "\n".join(lines[-tail_lines:])
+
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "pid": pid,
+            "command": meta.get("command"),
+            "cwd": meta.get("cwd"),
+            "running": running,
+            "exit_code": done_info.get("exit_code") if done_info else None,
+            "log_path": str(log_file),
+            "log_tail": log_tail,
+        }
+
+    if op == "list_jobs":
+        jobs_root = Path.home() / ".cache" / "remote-fleet" / "jobs"
+        if not jobs_root.is_dir():
+            return {"ok": True, "jobs": []}
+        jobs = []
+        for entry in sorted(jobs_root.iterdir(), reverse=True)[:30]:
+            mf = entry / "meta.json"
+            df = entry / "done.json"
+            if not mf.is_file():
+                continue
+            meta = json.loads(mf.read_text(encoding="utf-8"))
+            done_info = json.loads(df.read_text(encoding="utf-8")) if df.is_file() else None
+            running = False
+            if done_info is None:
+                try:
+                    os.kill(int(meta["pid"]), 0)
+                    running = True
+                except OSError:
+                    running = False
+            jobs.append({
+                "job_id": meta["job_id"],
+                "pid": meta["pid"],
+                "command": meta.get("command"),
+                "cwd": meta.get("cwd"),
+                "running": running,
+                "exit_code": done_info.get("exit_code") if done_info else None,
+            })
+        return {"ok": True, "jobs": jobs}
+
     return {"ok": False, "error": f"Unknown worker op: {op}"}
 '''
 

@@ -24,13 +24,14 @@ SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 
 
 SERVER_INSTRUCTIONS = (
-    "Remote Fleet lets the user browse folders, pick or create a project directory, edit files, "
-    "and execute commands on any computer across their Home LAN or Tailscale (e.g., Mac Mini, PC, "
-    "DGX Spark 1, Spark 2, Spark 3). When starting a new project or asked to work on another machine, "
-    "call `fleet_list_machines` and `fleet_browse_folders`, then call `fleet_select_project` (or "
-    "`fleet_create_project`). Once a project is selected, `fleet_read_file`, `fleet_write_file`, "
-    "`fleet_edit_file`, `fleet_list_files`, `fleet_search_files`, and `fleet_run_command` operate "
-    "directly on that remote (or local) machine."
+    "Remote Fleet lets the user run this harness smoothly on their local interface machine (e.g., Mac Mini) "
+    "while picking a folder, keeping all project files/changes/datasets, and running computations on any "
+    "computer across their Home LAN or Tailscale (PC, DGX Spark 1, Spark 2, Spark 3, Mac Mini). "
+    "When starting a new project, call `fleet_list_machines(probe=true, include_load=true)` and `fleet_browse_folders`, "
+    "then `fleet_select_project` (or `fleet_create_project`). Once a remote project is selected, ALWAYS use "
+    "`fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, `fleet_search_files`, "
+    "`fleet_run_command`, and `fleet_start_job` (for heavy/long calculations) so all changes and compute "
+    "happen on the target computer without slowing down the local interface machine."
 )
 
 
@@ -40,7 +41,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         "description": (
             "List all computers in the Home LAN / Tailscale fleet (Mac Mini, PC, Sparks, plus "
             "any auto-discovered Tailscale nodes), showing whether each machine is LOCAL, reachable "
-            "over Home LAN, or reachable over Tailscale, along with latency and active project."
+            "over Home LAN, or reachable over Tailscale, along with latency, optional CPU/GPU load, and active project."
         ),
         "inputSchema": {
             "type": "object",
@@ -49,7 +50,12 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                     "type": "boolean",
                     "description": "Probe live LAN/Tailscale connectivity and latency (default true).",
                     "default": True,
-                }
+                },
+                "include_load": {
+                    "type": "boolean",
+                    "description": "Also query CPU load, free disk, and GPU utilization on online machines (default false).",
+                    "default": False,
+                },
             },
         },
     },
@@ -361,6 +367,80 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "required": ["direction"],
         },
     },
+    {
+        "name": "fleet_start_job",
+        "description": (
+            "Start a heavy calculation, training run, or long-running command detached in the background "
+            "on the target computer (PC or Spark). Returns immediately with `job_id` so the harness on the "
+            "Mac never blocks or slows down."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Command to launch in the background on the target computer.",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory override (defaults to active project root).",
+                },
+                "machine": {
+                    "type": "string",
+                    "description": "Optional machine override.",
+                },
+                "low_priority": {
+                    "type": "boolean",
+                    "description": "Run under `nice -n 10` so interactive SSH stays snappy (default false).",
+                    "default": False,
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "fleet_job_status",
+        "description": (
+            "Check status, exit code, and recent log output of a detached background job (`job_id`) "
+            "on the target computer, or omit `job_id` to list recent background jobs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Background job ID returned by `fleet_start_job` (omit to list jobs).",
+                },
+                "tail_lines": {
+                    "type": "integer",
+                    "description": "Number of recent log lines to return (default 60).",
+                    "default": 60,
+                },
+                "machine": {
+                    "type": "string",
+                    "description": "Optional machine override.",
+                },
+            },
+        },
+    },
+    {
+        "name": "fleet_stop_job",
+        "description": "Terminate a running detached background job (`job_id`) on the target computer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Background job ID to stop.",
+                },
+                "machine": {
+                    "type": "string",
+                    "description": "Optional machine override.",
+                },
+            },
+            "required": ["job_id"],
+        },
+    },
 ]
 
 
@@ -427,9 +507,10 @@ class RemoteFleetMCPServer:
 
         if name == "fleet_list_machines":
             probe = bool(args.get("probe", True))
+            include_load = bool(args.get("include_load", False))
             ep_map = (
                 self.transport.resolve_all_endpoints(self.config.machines, force_refresh=True)
-                if probe
+                if (probe or include_load)
                 else {}
             )
             machines_out = []
@@ -443,8 +524,19 @@ class RemoteFleetMCPServer:
                     "default_roots": m.default_roots,
                     "tags": m.tags,
                 }
-                if probe and m.id in ep_map:
-                    entry["status"] = ep_map[m.id].to_dict()
+                if m.id in ep_map:
+                    ep = ep_map[m.id]
+                    entry["status"] = ep.to_dict()
+                    if include_load and ep.reachable:
+                        metrics = self.transport.run_worker_op(m, {"op": "machine_metrics"}, timeout_sec=6)
+                        if metrics.get("ok"):
+                            entry["load"] = {
+                                "cpu_count": metrics.get("cpu_count"),
+                                "load_1m": metrics.get("load_1m"),
+                                "load_5m": metrics.get("load_5m"),
+                                "disk_free_gb": metrics.get("disk_free_gb"),
+                                "gpus": metrics.get("gpus"),
+                            }
                 machines_out.append(entry)
             active = self.session_project or load_active_project()
             return self._tool_result(
@@ -647,6 +739,50 @@ class RemoteFleetMCPServer:
                 local_dir=local_dir,
                 direction=str(args["direction"]),
                 delete=bool(args.get("delete", False)),
+            )
+            return self._tool_result(res, is_error=not res.get("ok", False))
+
+        if name == "fleet_start_job":
+            m, base, err = self._resolve_machine_and_base(args.get("machine"))
+            if err or not m:
+                return self._tool_result(err, is_error=True)
+            cwd = str(args.get("cwd") or "").strip() or base
+            res = self.transport.run_worker_op(
+                m,
+                {
+                    "op": "start_job",
+                    "command": str(args["command"]),
+                    "cwd": cwd,
+                    "low_priority": bool(args.get("low_priority", False)),
+                },
+            )
+            return self._tool_result(res, is_error=not res.get("ok", False))
+
+        if name == "fleet_job_status":
+            m, _, err = self._resolve_machine_and_base(args.get("machine"))
+            if err or not m:
+                return self._tool_result(err, is_error=True)
+            job_id = str(args.get("job_id") or "").strip()
+            if not job_id:
+                res = self.transport.run_worker_op(m, {"op": "list_jobs"})
+            else:
+                res = self.transport.run_worker_op(
+                    m,
+                    {
+                        "op": "job_status",
+                        "job_id": job_id,
+                        "tail_lines": int(args.get("tail_lines", 60)),
+                    },
+                )
+            return self._tool_result(res, is_error=not res.get("ok", False))
+
+        if name == "fleet_stop_job":
+            m, _, err = self._resolve_machine_and_base(args.get("machine"))
+            if err or not m:
+                return self._tool_result(err, is_error=True)
+            res = self.transport.run_worker_op(
+                m,
+                {"op": "stop_job", "job_id": str(args["job_id"])},
             )
             return self._tool_result(res, is_error=not res.get("ok", False))
 

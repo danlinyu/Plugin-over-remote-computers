@@ -1,60 +1,36 @@
 ---
 name: remote-fleet
-description: Browse folders, pick or create a project directory, edit files, and run commands on any computer across your Home LAN or Tailscale (Mac Mini, PC, DGX Spark 1, Spark 2, Spark 3). Use whenever the user wants to start or open a project on another machine, list online machines, browse remote directories, edit remote files, or execute commands/GPU workloads on a remote computer without going through GitHub.
+description: Browse folders, pick or create a project directory, edit files, access remote datasets, and run heavy calculations on any computer across your Home LAN or Tailscale (Mac Mini, PC, DGX Spark 1, Spark 2, Spark 3) while keeping your local interface machine fast and idle.
 ---
 
-# Remote Fleet (Home LAN & Tailscale)
+# Remote Fleet (Mac Control Terminal -> Remote Files, Data & Compute)
 
-`remote-fleet` enables any LLM harness (**Antigravity**, **Claude**, **Codex**, **DSH**, **Kimi Code**, etc.) to access all computers across your Home LAN or Tailscale, browse/pick or create a project folder on any computer, and run file operations + commands directly on that target host.
+`remote-fleet` lets the user run any LLM harness (**Antigravity**, **Claude**, **Codex**, **DSH**, **Kimi Code**) smoothly on their local interface computer (e.g., **Mac Mini**), while **picking a folder, keeping all project files/changes/datasets, and running heavy calculations** directly on **PC**, **Spark 1**, **Spark 2**, **Spark 3** (or the Mac Mini itself) over **Home LAN or Tailscale**.
 
-## Preferred Interface: MCP Tools (`remote-fleet`)
+## Golden Rules
 
-If the `remote-fleet` MCP tools are registered in this harness session, prefer calling them directly:
+1. **When starting a new project (or inside `~/Fleet/Start-Here`)**:
+   - Call `fleet_list_machines(probe=true, include_load=true)` to show online machines, LAN/Tailscale latency, and live CPU/GPU load so the user can pick a responsive or idle machine.
+   - Browse folders with `fleet_browse_folders(machine=...)`, then bind the target directory using `fleet_select_project` or `fleet_create_project`.
+2. **Keep files & edits on the target machine — NOT stranded on the local interface machine**:
+   - Once a remote folder is selected, perform **all** file reads, writes, edits, and searches via `fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, and `fleet_search_files`.
+   - You can also inspect any other local data folder on that remote machine (e.g. `/data/...`, `/mnt/nvme/...`, `D:\Datasets\...`) by passing its path to `fleet_list_files`, `fleet_read_file`, or `fleet_run_command` — without copying gigabytes of data to the Mac!
+3. **Keep heavy calculations off the Mac**:
+   - Use `fleet_run_command` for quick commands (`git`, `pytest`, `nvidia-smi`, environment setup) on the target computer.
+   - Use `fleet_start_job`, `fleet_job_status`, and `fleet_stop_job` for heavy or long-running training/calculation jobs on the PC or Sparks so the job runs detached in the background and never slows down or times out the harness on the Mac.
 
-1. **Discover & check computers**: `fleet_list_machines(probe=true)`
-2. **Browse folders on a target computer**: `fleet_browse_folders(machine="spark-1", path="~/projects")`
-3. **Select an existing folder**: `fleet_select_project(machine="spark-1", path="~/projects/my-app")`
-4. **Create a brand-new project folder**: `fleet_create_project(machine="spark-2", path="~/projects/new-app", init_git=true, template="python")`
-5. **Read / Write / Edit / Search files**:
-   - `fleet_list_files()`
-   - `fleet_read_file(path="src/main.py")`
-   - `fleet_write_file(path="src/new_file.py", content="...")`
-   - `fleet_edit_file(path="src/main.py", old_text="...", new_text="...")`
-   - `fleet_search_files(query="def train")`
-6. **Execute commands / tests / GPU jobs directly on that computer**:
-   - `fleet_run_command(command="nvidia-smi")`
-   - `fleet_run_command(command="pytest -q")`
-7. **Sync local <-> remote mirror if needed**:
-   - `fleet_sync_project(direction="pull")` or `fleet_sync_project(direction="push")`
+## CLI Fallback (`fleet`)
 
-## CLI Interface (`fleet`)
-
-When MCP tools are not active or when running shell commands directly, invoke `<path/to/this/skill>/scripts/fleet` (or `<path\to\this\skill>\scripts\fleet.cmd` on Windows, or `fleet` if `~/.local/bin` is on `PATH`):
+When MCP tools are unavailable, run `<path/to/this/skill>/scripts/fleet` (or `fleet` on `PATH`):
 
 ```bash
-# 1. Check all computers (Mac Mini, PC, Spark 1-3 + Tailscale peers)
-<path/to/this/skill>/scripts/fleet status
-
-# 2. Browse folders on a machine
-<path/to/this/skill>/scripts/fleet browse spark-1 ~/projects
-
-# 3. Select (or create) a folder as the active project
-<path/to/this/skill>/scripts/fleet use spark-1 ~/projects/my-app
-<path/to/this/skill>/scripts/fleet use spark-2 ~/projects/new-model --create --init-git --template python
-
-# 4. Inspect & edit files on the active remote project
-<path/to/this/skill>/scripts/fleet ls
-<path/to/this/skill>/scripts/fleet read README.md
-<path/to/this/skill>/scripts/fleet edit src/app.py --old "DEBUG = False" --new "DEBUG = True"
-<path/to/this/skill>/scripts/fleet search "TODO"
-
-# 5. Run builds, tests, git, or GPU jobs directly on the target computer
-<path/to/this/skill>/scripts/fleet exec -- pytest -q
-<path/to/this/skill>/scripts/fleet exec -- nvidia-smi
+fleet status --load                                       # Check LAN/Tailscale latency + CPU/GPU load
+fleet browse spark-1 ~/projects                           # Browse folders on spark-1
+fleet use spark-2 ~/projects/new-app --create --init-git  # Create & select remote folder
+fleet ls                                                  # List files in active remote project
+fleet read src/main.py                                    # Read remote file
+fleet edit src/main.py --old "lr = 1e-3" --new "lr = 3e-4"# Edit remote file directly on target host
+fleet exec -- nvidia-smi                                  # Run quick command on target host
+fleet jobs start -- python train.py --epochs 100          # Start detached heavy calculation on target host
+fleet jobs status                                         # Check background jobs & logs
 ```
-
-## Workflow When User Starts a New Project
-
-1. Run `fleet_list_machines` (or `fleet status --json`) to see which computers (`mac-mini`, `pc`, `spark-1`, `spark-2`, `spark-3`, etc.) are online via `[LOCAL]`, `[LAN]`, or `[TAILSCALE]`.
-2. If the user named a computer (e.g. *"start a project on Spark 2"*), browse its default root with `fleet_browse_folders(machine="spark-2")` and ask which subfolder to open or what new folder name to create. If they haven't picked a computer yet, show the online computers and ask which one they want.
-3. Call `fleet_select_project` or `fleet_create_project`. From that point forward, execute all project file reads, edits, searches, and terminal commands against that computer!

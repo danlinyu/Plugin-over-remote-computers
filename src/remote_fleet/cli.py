@@ -27,6 +27,7 @@ from remote_fleet.config import (
     save_active_project,
     save_fleet_config,
 )
+from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mcp_server import serve_stdio
 from remote_fleet.mount import (
@@ -34,6 +35,7 @@ from remote_fleet.mount import (
     prepare_local_workspace,
     sync_workspace,
     unmount_sshfs,
+    watch_workspace,
 )
 from remote_fleet.picker import interactive_browse_folder, interactive_pick_machine
 from remote_fleet.transport import FleetTransport
@@ -48,6 +50,14 @@ HARNESS_COMMANDS: Dict[str, List[str]] = {
     "dsh": ["dsh"],
     "cursor": ["cursor", "."],
     "code": ["code", "."],
+    "open": ["open", "."],
+}
+
+MACOS_APP_NAMES: Dict[str, str] = {
+    "antigravity": "Antigravity",
+    "agy": "Antigravity",
+    "cursor": "Cursor",
+    "code": "Visual Studio Code",
 }
 
 
@@ -127,7 +137,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     rows = []
     for m in cfg.machines:
         ep = ep_map[m.id]
-        rows.append({"machine": m.to_dict(), "status": ep.to_dict()})
+        row: Dict[str, Any] = {"machine": m.to_dict(), "status": ep.to_dict()}
+        if getattr(args, "load", False) and ep.reachable:
+            metrics = transport.run_worker_op(m, {"op": "machine_metrics"}, timeout_sec=6)
+            if metrics.get("ok"):
+                row["load"] = metrics
+        rows.append(row)
 
     if args.json:
         print(
@@ -139,15 +154,25 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Fleet Configuration: {get_config_path()}")
-    print(f"{'ID':<14} {'NAME':<18} {'TRANSPORT':<12} {'ENDPOINT':<24} {'LATENCY':<10}")
-    print("-" * 82)
+    hdr = f"{'ID':<14} {'NAME':<18} {'TRANSPORT':<12} {'ENDPOINT':<22} {'LATENCY':<9}"
+    if getattr(args, "load", False):
+        hdr += " LOAD / GPUS"
+    print(hdr)
+    print("-" * (105 if getattr(args, "load", False) else 80))
     for row in rows:
         m = row["machine"]
         st = row["status"]
         lat = f"{st['latency_ms']:.1f}ms" if st["latency_ms"] is not None else "-"
         tr = st["transport"].upper()
         host_disp = "localhost" if st["transport"] == "local" else st["host"]
-        print(f"{m['id']:<14} {m['name'][:17]:<18} {tr:<12} {host_disp[:23]:<24} {lat:<10}")
+        line = f"{m['id']:<14} {m['name'][:17]:<18} {tr:<12} {host_disp[:21]:<22} {lat:<9}"
+        if getattr(args, "load", False) and "load" in row:
+            ld = row["load"]
+            load_str = f"cpu={ld.get('load_1m')}/{ld.get('cpu_count')}c"
+            if ld.get("gpus"):
+                load_str += f" gpu=[{'; '.join(ld['gpus'])}]"
+            line += f" {load_str}"
+        print(line)
 
     print("")
     if active:
@@ -593,24 +618,133 @@ def cmd_start(args: argparse.Namespace) -> int:
     harness_cmd = HARNESS_COMMANDS.get(args.harness.lower(), [args.harness])
 
     if args.remote_ssh and res["endpoint"]["transport"] != "local":
+        harness_cmd = HARNESS_COMMANDS.get(args.harness.lower(), [args.harness])
         ep_host = res["endpoint"]["host"]
         ssh_base = transport.build_ssh_args(m, ep_host, use_control_master=False)
-        # Replace -T with -t for interactive TTY harness session on remote machine
         ssh_interactive = [("-t" if x == "-T" else x) for x in ssh_base]
         remote_launch = f"cd {shlex.quote(resolved_remote)} && {' '.join(shlex.quote(c) for c in harness_cmd)}"
         print(f"Launching '{args.harness}' directly on {m.id} ({ep_host}:{resolved_remote})...")
         return subprocess.call([*ssh_interactive, remote_launch])
 
-    if not shutil.which(harness_cmd[0]):
-        print(f"Project ready at: {local_ws} (linked to {m.id}:{resolved_remote})")
-        print(f"Note: '{harness_cmd[0]}' was not found on PATH; open `{local_ws}` in {args.harness} manually.")
-        return 0
+    return _launch_local_harness(args.harness, local_ws, m.id, resolved_remote)
 
+
+def _launch_local_harness(
+    harness_name: str, local_ws: str, machine_id: str, resolved_remote: str
+) -> int:
+    """Launch a harness locally (e.g. on Mac Mini) bound to `machine_id:resolved_remote`."""
+    low = harness_name.lower()
+    harness_cmd = HARNESS_COMMANDS.get(low, [harness_name])
     env = os.environ.copy()
-    env["REMOTE_FLEET_MACHINE"] = m.id
+    env["REMOTE_FLEET_MACHINE"] = machine_id
     env["REMOTE_FLEET_PATH"] = resolved_remote
-    print(f"Starting {args.harness} in {local_ws} (bound to {m.id}:{resolved_remote})...")
-    return subprocess.call(harness_cmd, cwd=local_ws, env=env)
+
+    if shutil.which(harness_cmd[0]):
+        print(f"Starting {harness_name} locally in {local_ws} (bound to {machine_id}:{resolved_remote})...")
+        return subprocess.call(harness_cmd, cwd=local_ws, env=env)
+
+    # On macOS, try `open -a "<AppName>" <local_ws>` for GUI harnesses (Antigravity, Cursor, VS Code)
+    if sys.platform == "darwin" and low in MACOS_APP_NAMES and shutil.which("open"):
+        app_name = MACOS_APP_NAMES[low]
+        print(f"Opening {app_name}.app on this Mac for {local_ws} (bound to {machine_id}:{resolved_remote})...")
+        return subprocess.call(["open", "-a", app_name, local_ws], env=env)
+
+    print(f"Project ready at: {local_ws} (linked to {machine_id}:{resolved_remote})")
+    print(f"Note: '{harness_cmd[0]}' was not found on PATH; open `{local_ws}` in {harness_name} manually.")
+    return 0
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    cfg, ts_self = load_fleet_config(include_tailscale=True)
+    transport = FleetTransport(cfg, ts_self)
+    picked = gui_pick_machine_and_folder(
+        cfg,
+        transport,
+        preselected_machine=args.machine,
+        initial_path=args.path or "",
+    )
+    if not picked:
+        return 1
+    m, chosen_path, should_create, chosen_harness = picked
+    res = _activate_selection(
+        cfg,
+        transport,
+        m,
+        chosen_path,
+        create=should_create,
+        init_git=should_create,
+        mode=args.mode,
+    )
+    if not res.get("ok"):
+        sys.stderr.write(f"Failed to activate remote folder: {res.get('error')}\n")
+        return 1
+
+    resolved_remote = res["path"]
+    local_ws = res["workspace"]["local_path"]
+    harness_to_run = args.harness or chosen_harness
+    if not harness_to_run:
+        print(f"Active project set to {m.id}:{resolved_remote}")
+        print(f"Local handle: {local_ws}")
+        return 0
+    return _launch_local_harness(harness_to_run, local_ws, m.id, resolved_remote)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    cfg, ts_self = load_fleet_config(include_tailscale=True)
+    transport = FleetTransport(cfg, ts_self)
+    m, base = _resolve_active(cfg, args.machine)
+    remote_path = args.remote_path or base
+    local_dir = (
+        Path(args.local_path).expanduser().resolve()
+        if args.local_path
+        else compute_local_workspace_dir(cfg, m, remote_path)
+    )
+    return watch_workspace(
+        transport,
+        m,
+        remote_path=remote_path,
+        local_dir=local_dir,
+        interval_sec=args.interval,
+    )
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    cfg, ts_self = load_fleet_config(include_tailscale=True)
+    transport = FleetTransport(cfg, ts_self)
+    m, base = _resolve_active(cfg, args.machine)
+
+    action = args.job_action or "list"
+    if action == "start":
+        cmd_parts = args.command or []
+        if cmd_parts and cmd_parts[0] == "--":
+            cmd_parts = cmd_parts[1:]
+        if not cmd_parts:
+            raise SystemExit("`fleet jobs start` requires a command (e.g. `fleet jobs start -- python train.py`).")
+        res = transport.run_worker_op(
+            m,
+            {
+                "op": "start_job",
+                "command": " ".join(cmd_parts),
+                "cwd": args.cwd or base,
+                "low_priority": args.low_priority,
+            },
+        )
+    elif action == "status":
+        if args.job_id:
+            res = transport.run_worker_op(
+                m, {"op": "job_status", "job_id": args.job_id, "tail_lines": args.tail}
+            )
+        else:
+            res = transport.run_worker_op(m, {"op": "list_jobs"})
+    elif action == "stop":
+        if not args.job_id:
+            raise SystemExit("`fleet jobs stop` requires a <job_id>.")
+        res = transport.run_worker_op(m, {"op": "stop_job", "job_id": args.job_id})
+    else:
+        res = transport.run_worker_op(m, {"op": "list_jobs"})
+
+    print(json.dumps(res, indent=2))
+    return 0 if res.get("ok") else 1
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -629,7 +763,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"\n  [{section}]")
         for p in paths:
             print(f"    - {p}")
-    print("\nTip: Ensure `~/.local/bin` is on your PATH, then run `fleet doctor` or `fleet pick`!")
+    print("\nTip: Open `~/Fleet/Start-Here` in any harness (or run `fleet gui` / `fleet pick`) to start a remote project!")
     return 0
 
 
@@ -651,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_disc.set_defaults(func=cmd_discover)
 
     p_stat = sub.add_parser("status", aliases=["machines"], help="Check all fleet computers over Home LAN & Tailscale")
+    p_stat.add_argument("--load", action="store_true", help="Also query CPU & GPU load on online machines")
     p_stat.add_argument("--json", action="store_true", help="Output JSON")
     p_stat.set_defaults(func=cmd_status)
 
@@ -669,6 +804,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pick.add_argument("--path", default="", help="Starting folder path")
     p_pick.add_argument("--mode", choices=["link", "sync", "sshfs"], default="link", help="Local workspace mode")
     p_pick.set_defaults(func=cmd_pick)
+
+    p_gui = sub.add_parser("gui", help="Open native macOS GUI picker to choose computer, folder, and local harness")
+    p_gui.add_argument("--machine", help="Optional pre-selected computer ID")
+    p_gui.add_argument("--path", default="", help="Optional starting folder path")
+    p_gui.add_argument("--harness", help="Optional harness override")
+    p_gui.add_argument("--mode", choices=["link", "sync", "sshfs"], default="link")
+    p_gui.set_defaults(func=cmd_gui)
 
     p_use = sub.add_parser("use", help="Select (or create) a remote folder non-interactively")
     p_use.add_argument("machine", help="Machine ID or name (e.g. spark-2, pc, mac-mini)")
@@ -728,7 +870,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute")
     p_exec.set_defaults(func=cmd_exec)
 
-    p_sync = sub.add_parser("sync", help="Sync files between local workspace and remote computer")
+    p_jobs = sub.add_parser("jobs", help="Manage detached heavy background jobs on PC / Sparks")
+    p_jobs.add_argument("job_action", nargs="?", choices=["list", "start", "status", "stop"], default="list")
+    p_jobs.add_argument("--job-id", help="Job ID for status or stop")
+    p_jobs.add_argument("--machine", help="Machine override")
+    p_jobs.add_argument("--cwd", help="Working directory override")
+    p_jobs.add_argument("--tail", type=int, default=60, help="Log lines to tail")
+    p_jobs.add_argument("--low-priority", action="store_true", help="Run with nice -n 10")
+    p_jobs.add_argument("command", nargs=argparse.REMAINDER, help="Command when job_action=start")
+    p_jobs.set_defaults(func=cmd_jobs)
+
+    p_sync = sub.add_parser("sync", help="Sync code files between local workspace and remote computer (skips datasets)")
     p_sync.add_argument("direction", choices=["pull", "push"])
     p_sync.add_argument("--machine")
     p_sync.add_argument("--remote-path")
@@ -736,20 +888,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--delete", action="store_true")
     p_sync.set_defaults(func=cmd_sync)
 
-    p_mount = sub.add_parser("mount", help="Mount remote folder locally via SSHFS")
+    p_watch = sub.add_parser("watch", help="Mirror lightweight code files locally and auto-push edits to remote")
+    p_watch.add_argument("--machine")
+    p_watch.add_argument("--remote-path")
+    p_watch.add_argument("--local-path")
+    p_watch.add_argument("--interval", type=float, default=1.5)
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_mount = sub.add_parser("mount", help="Mount remote folder locally via rclone nfsmount (macOS) or SSHFS")
     p_mount.add_argument("machine", nargs="?")
     p_mount.add_argument("path", nargs="?")
     p_mount.set_defaults(func=cmd_mount)
 
-    p_unmount = sub.add_parser("unmount", help="Unmount an SSHFS workspace")
+    p_unmount = sub.add_parser("unmount", help="Unmount an rclone/SSHFS workspace")
     p_unmount.add_argument("local_path", nargs="?")
     p_unmount.set_defaults(func=cmd_unmount)
 
     p_start = sub.add_parser(
         "start",
-        help="Pick a folder on any machine and launch Antigravity, Claude, Codex, DSH, or Kimi Code",
+        help="Pick a folder on any machine and launch Antigravity, Claude, Codex, DSH, or Kimi Code locally",
     )
-    p_start.add_argument("--harness", help="Harness to launch (antigravity, claude, codex, dsh, kimi, cursor)")
+    p_start.add_argument("--harness", help="Harness to launch locally (antigravity, claude, codex, dsh, kimi, cursor)")
     p_start.add_argument("--machine", help="Target machine ID")
     p_start.add_argument("--path", help="Target folder on machine")
     p_start.add_argument("--create", action="store_true", help="Create folder if missing")
@@ -757,13 +916,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument(
         "--remote-ssh",
         action="store_true",
-        help="SSH into the remote machine and launch the harness directly there instead of locally",
+        help="Optional: SSH into remote machine to run harness there instead of locally on this Mac",
     )
     p_start.set_defaults(func=cmd_start)
 
     p_inst = sub.add_parser(
         "install",
-        help="Install Remote Fleet MCP server, Skills, and CLI into Antigravity, Claude, Codex, Kimi Code, and DSH",
+        help="Install Remote Fleet MCP server, Launchpad, Global Rules, Skills, and CLI into all harnesses",
     )
     p_inst.add_argument(
         "--harnesses",
