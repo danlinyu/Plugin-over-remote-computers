@@ -1,0 +1,11 @@
+{
+  "name": "remote-fleet",
+  "version": "0.1.0",
+  "description": "Pick a folder and work on projects across any computer over Home LAN or Tailscale (PC, DGX Sparks, Mac Mini) from Claude Code and other LLM harnesses.",
+  "author": {
+    "name": "Danlin Yu"
+  },
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

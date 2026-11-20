@@ -1,0 +1,65 @@
+{
+  "prefer_lan": true,
+  "lan_probe_timeout_ms": 450,
+  "ssh_connect_timeout_sec": 5,
+  "auto_discover_tailscale": true,
+  "include_unlisted_tailscale_peers": true,
+  "fleet_mount_dir": "~/Fleet",
+  "machines": [
+    {
+      "id": "mac-mini",
+      "name": "Mac Mini",
+      "lan_host": "mac-mini.local",
+      "tailscale_host": "mac-mini",
+      "os": "macos",
+      "default_roots": ["~/Projects", "~/Developer", "~"],
+      "tags": ["macos", "apple-silicon", "desktop"],
+      "hostnames": ["mac-mini", "macmini", "Mac-mini"],
+      "description": "Mac Mini workstation over Home LAN or Tailscale"
+    },
+    {
+      "id": "pc",
+      "name": "Home PC",
+      "lan_host": "pc.local",
+      "tailscale_host": "pc",
+      "os": "auto",
+      "default_roots": ["~/projects", "~/source/repos", "~"],
+      "tags": ["pc", "workstation"],
+      "hostnames": ["pc", "desktop-pc"],
+      "description": "PC (Windows / WSL2 / Linux) over Home LAN or Tailscale"
+    },
+    {
+      "id": "spark-1",
+      "name": "DGX Spark 1",
+      "lan_host": "spark-1.local",
+      "tailscale_host": "spark-1",
+      "os": "linux",
+      "default_roots": ["~/projects", "~/workspace", "~"],
+      "tags": ["linux", "gpu", "spark"],
+      "hostnames": ["spark-1", "spark1", "dgx-spark-1"],
+      "description": "Spark node #1 over Home LAN or Tailscale"
+    },
+    {
+      "id": "spark-2",
+      "name": "DGX Spark 2",
+      "lan_host": "spark-2.local",
+      "tailscale_host": "spark-2",
+      "os": "linux",
+      "default_roots": ["~/projects", "~/workspace", "~"],
+      "tags": ["linux", "gpu", "spark"],
+      "hostnames": ["spark-2", "spark2", "dgx-spark-2"],
+      "description": "Spark node #2 over Home LAN or Tailscale"
+    },
+    {
+      "id": "spark-3",
+      "name": "DGX Spark 3",
+      "lan_host": "spark-3.local",
+      "tailscale_host": "spark-3",
+      "os": "linux",
+      "default_roots": ["~/projects", "~/workspace", "~"],
+      "tags": ["linux", "gpu", "spark"],
+      "hostnames": ["spark-3", "spark3", "dgx-spark-3"],
+      "description": "Spark node #3 over Home LAN or Tailscale"
+    }
+  ]
+}

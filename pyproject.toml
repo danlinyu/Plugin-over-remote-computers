@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-fleet"
+version = "0.1.0"
+description = "Pick folders and run projects on any computer across your Home LAN or Tailscale from Antigravity, Claude, Codex, DSH, Kimi Code, and more."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Danlin Yu" }
+]
+keywords = ["mcp", "tailscale", "ssh", "remote-workspace", "antigravity", "claude-code", "codex", "kimi", "dsh"]
+dependencies = []
+
+[project.scripts]
+fleet = "remote_fleet.cli:main"
+remote-fleet-mcp = "remote_fleet.mcp_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

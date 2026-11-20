@@ -1,0 +1,7 @@
+{
+  "name": "remote-fleet",
+  "displayName": "Remote Fleet (Home LAN & Tailscale)",
+  "version": "0.1.0",
+  "description": "Browse, pick, or create project folders on any computer across your Home LAN or Tailscale (PC, DGX Sparks, Mac Mini) and run commands directly on the target host.",
+  "logo": "assets/logo.svg"
+}

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "remote-fleet": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "remote_fleet.mcp_server"
+      ],
+      "env": {
+        "PYTHONPATH": "${CLAUDE_PLUGIN_ROOT:-.}/src"
+      }
+    }
+  }
+}

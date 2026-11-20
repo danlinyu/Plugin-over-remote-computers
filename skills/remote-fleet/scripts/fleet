@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -e
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_CANDIDATE="$(CDPATH= cd -- "$SCRIPT_DIR/../../.." 2>/dev/null && pwd || true)"
+
+if [ -d "$REPO_CANDIDATE/src/remote_fleet" ]; then
+  SRC_DIR="$REPO_CANDIDATE/src"
+elif [ -f "$SCRIPT_DIR/.repo_src" ]; then
+  SRC_DIR="$(head -n 1 "$SCRIPT_DIR/.repo_src" | tr -d '\r\n')"
+elif [ -n "${REMOTE_FLEET_REPO:-}" ] && [ -d "$REMOTE_FLEET_REPO/src/remote_fleet" ]; then
+  SRC_DIR="$REMOTE_FLEET_REPO/src"
+elif [ -x "$HOME/.local/bin/fleet" ]; then
+  exec "$HOME/.local/bin/fleet" "$@"
+else
+  echo "Error: Could not locate remote_fleet package source." >&2
+  exit 1
+fi
+
+PY_BIN="$(command -v python3 || command -v /opt/homebrew/bin/python3 || command -v python)"
+export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY_BIN" -m remote_fleet "$@"
