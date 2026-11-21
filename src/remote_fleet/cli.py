@@ -1036,6 +1036,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deprecated no-op flag kept for CLI compatibility",
     )
     p_boot.add_argument(
+        "--install-tailscale",
+        action="store_true",
+        help="Download, install, and launch official standalone Tailscale on this Mac Mini",
+    )
+    p_boot.add_argument(
         "--no-cleanup-tailscale",
         action="store_true",
         help="Skip removing duplicate second Tailscale (`spark01-1` / `spark03-1`)",
@@ -1050,6 +1055,7 @@ def build_parser() -> argparse.ArgumentParser:
             interactive_ssh_copy=not a.no_ssh_copy,
             fix_spark_tailscale=a.fix_spark_tailscale,
             cleanup_duplicate_tailscale=not a.no_cleanup_tailscale,
+            install_tailscale=a.install_tailscale,
             mount_dir=Path(a.dir) if a.dir else None,
         )
     )

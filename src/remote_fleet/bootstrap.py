@@ -216,14 +216,103 @@ def _scan_subnet_for_missing_hosts(
     return discovered, win_no_ssh
 
 
-def ensure_macos_tailscale_connected() -> bool:
+def resolve_latest_macos_tailscale_pkg_url() -> str:
+    """Resolve the exact latest `Tailscale-<ver>-macos.pkg` URL from `https://pkgs.tailscale.com/stable/`."""
+    index_url = "https://pkgs.tailscale.com/stable/"
+    try:
+        req = urllib.request.Request(index_url, headers={"User-Agent": "remote-fleet/0.1"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        matches = re.findall(r'href="(Tailscale-[0-9.]+-macos\.pkg)"', html)
+        if matches:
+            return f"{index_url}{matches[0]}"
+    except Exception:
+        pass
+    return "https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg"
+
+
+def install_and_connect_tailscale_macos(wait_seconds: int = 180) -> bool:
+    """Download & install official standalone macOS Tailscale `.pkg`, launch it, and wait for login."""
+    import select
+    import time
+
+    if platform.system().lower() != "darwin":
+        print("  `--install-tailscale` automatic .pkg installer is for macOS.")
+        return False
+
+    app_cli = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    if not app_cli.exists():
+        pkg_url = resolve_latest_macos_tailscale_pkg_url()
+        pkg_dest = Path("/tmp/Tailscale-macos.pkg")
+        print(f"\n  -> Downloading official macOS Tailscale installer:\n     {pkg_url}")
+        dl_rc = subprocess.call(["curl", "-fL", "--progress-bar", "-o", str(pkg_dest), pkg_url])
+        if dl_rc != 0 or not pkg_dest.is_file():
+            print("  ! Failed to download Tailscale .pkg from pkgs.tailscale.com.")
+            return False
+
+        print("\n  -> Installing /Applications/Tailscale.app (enter your Mac password for `sudo` if prompted)...")
+        inst_rc = subprocess.call(["sudo", "installer", "-pkg", str(pkg_dest), "-target", "/"])
+        try:
+            pkg_dest.unlink()
+        except OSError:
+            pass
+        if inst_rc != 0 or not app_cli.exists():
+            print("  ! `sudo installer` did not complete.")
+            return False
+        print("  [OK] Installed /Applications/Tailscale.app")
+
+    # Symlink CLI into ~/.local/bin/tailscale so `tailscale` works in Terminal
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    ts_link = local_bin / "tailscale"
+    try:
+        if ts_link.is_symlink() or ts_link.exists():
+            ts_link.unlink()
+        ts_link.symlink_to(app_cli)
+    except OSError:
+        pass
+
+    # Check if already logged in and Running
+    if ensure_macos_tailscale_connected(quiet_if_missing=True):
+        return True
+
+    # Launch GUI app so macOS triggers System Extension + VPN Configuration approval + browser login
+    subprocess.run(["open", "-a", "/Applications/Tailscale.app"], check=False)
+    print(
+        "\n  === Action Needed on Your Mac Screen (One-Time Tailscale Approval) ===\n"
+        "  1. If macOS pops up 'System Extension Blocked', click 'Open System Settings'\n"
+        "     (General -> Login Items & Extensions -> Network Extensions -> toggle Tailscale ON).\n"
+        "  2. Click 'Allow' on 'Tailscale Would Like to Add VPN Configurations'.\n"
+        "  3. Click the Tailscale icon in your top-right menu bar -> 'Log in' (danlinyu@gmail.com).\n"
+        "     (Tip: In console.tailscale.com/admin/machines, remove the old Nov 18 `danlins-mac-mini`,\n"
+        "      `spark01-1`, and `spark03-1` so this new Mac gets the clean name `danlins-mac-mini`!)\n"
+        f"\n  Waiting up to {wait_seconds}s for Tailscale to connect (will continue automatically once green, or press Enter to skip)..."
+    )
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if ensure_macos_tailscale_connected(quiet_if_missing=True):
+            return True
+        if sys.stdin.isatty():
+            ready, _, _ = select.select([sys.stdin], [], [], 2.0)
+            if ready:
+                sys.stdin.readline()
+                break
+        else:
+            time.sleep(2.0)
+
+    return ensure_macos_tailscale_connected(quiet_if_missing=True)
+
+
+def ensure_macos_tailscale_connected(quiet_if_missing: bool = False) -> bool:
     """Check if Tailscale is installed & running on this Mac. Returns True if running."""
     ts_bin = find_tailscale_binary()
     if not ts_bin:
-        print(
-            "  [HOME LAN MODE] Tailscale is not installed on this Mac Mini — using pure Home LAN "
-            "(Tailscale is completely optional while at home)."
-        )
+        if not quiet_if_missing:
+            print(
+                "  [HOME LAN MODE] Tailscale is not installed on this Mac Mini yet "
+                "(pass `--install-tailscale` to install it automatically!)."
+            )
         return False
     try:
         proc = subprocess.run(
@@ -237,9 +326,10 @@ def ensure_macos_tailscale_connected() -> bool:
             data = json.loads(proc.stdout)
             state = str(data.get("BackendState") or "")
             if state == "Running":
-                print("  [TAILSCALE] Local Tailscale is connected and running.")
+                print("  [TAILSCALE] Local Tailscale is connected and running!")
                 return True
-            print(f"  [TAILSCALE] Local Tailscale state is '{state}' — using Home LAN.")
+            if not quiet_if_missing:
+                print(f"  [TAILSCALE] Local Tailscale state is '{state}' — using Home LAN until logged in.")
     except Exception:
         pass
     return False
@@ -421,10 +511,14 @@ def copy_ssh_key_interactive(
 
 
 def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
-    """If both userspace Tailscale backup AND newly-installed apt `tailscaled` exist, remove the duplicate apt daemon."""
+    """If newly-installed apt `tailscaled` coexists with existing userspace Tailscale, remove the duplicate apt daemon."""
     target = f"{user}@{host}" if user else host
     check_cmd = (
-        "[ -f \"$HOME/.local/bin/tailscale.userspace.bak\" ] && [ -x /usr/bin/tailscale ] && echo DUPLICATE || echo CLEAN"
+        "[ -x /usr/bin/tailscale ] && ( "
+        "[ -f \"$HOME/.local/bin/tailscale.userspace.bak\" ] || "
+        "[ -e \"$HOME/.config/NVIDIA/Sync/session/tailscale\" ] || "
+        "[ -e \"$HOME/qwen38-service/tailscale\" ] "
+        ") && echo DUPLICATE || echo CLEAN"
     )
     proc = subprocess.run(
         ["ssh", "-T", "-o", "BatchMode=yes", target, check_cmd],
@@ -437,8 +531,8 @@ def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
         return
 
     print(
-        f"\n  -> Cleaning up redundant second Tailscale (`{host.split('.')[0]}-1`) on {target} "
-        f"and restoring original Tailscale..."
+        f"\n  -> Removing duplicate second Tailscale (`{host.split('.')[0]}-1`) on {target} "
+        f"(enter `{user}` sudo password on {host} if prompted)..."
     )
     cleanup_cmd = (
         "sudo /usr/bin/tailscale logout 2>/dev/null || true; "
@@ -449,7 +543,7 @@ def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
         "  mv \"$HOME/.local/bin/tailscale.userspace.bak\" \"$HOME/.local/bin/tailscale\"; "
         "  chmod +x \"$HOME/.local/bin/tailscale\"; "
         "fi; "
-        "echo '  [CLEANED] Removed duplicate system tailscaled and restored original ~/.local/bin/tailscale'"
+        "echo '  [CLEANED] Logged out & removed duplicate apt tailscaled; original Spark Tailscale preserved!'"
     )
     subprocess.call(["ssh", "-t", target, cleanup_cmd])
 
@@ -513,24 +607,42 @@ def run_bootstrap(
     interactive_ssh_copy: bool = True,
     fix_spark_tailscale: bool = False,
     cleanup_duplicate_tailscale: bool = True,
+    install_tailscale: bool = False,
     mount_dir: Optional[Path] = None,
 ) -> int:
-    """Run full turnkey discovery, duplicate Tailscale cleanup, SSH key setup, standalone rclone install, and Mac mounting."""
+    """Run full turnkey discovery, duplicate Tailscale cleanup, optional macOS Tailscale install, rclone install, and Mac mounting."""
     effective_pc_user = (pc_user or ssh_user).strip()
     print("=== Remote Fleet Turnkey Bootstrap ===")
     print(f"Spark SSH user: {ssh_user} | Windows PC (`danlin-hud`) SSH user: {effective_pc_user}\n")
 
-    # 1. Check local Tailscale + scan Home LAN (mDNS + ARP + /24 subnet)
+    # 1. Scan Home LAN first & clean up duplicate Spark Tailscale BEFORE macOS Tailscale browser login!
     print("[1/5] Scanning Home Network (spark01, spark03, spark04, danlin-hud)...")
-    ts_running = ensure_macos_tailscale_connected() if platform.system().lower() == "darwin" else False
-
-    lan_hits, pc_alive_no_ssh = probe_home_lan_candidates(
-        ssh_user=ssh_user, tailscale_running=ts_running
+    lan_hits_initial, pc_alive_no_ssh = probe_home_lan_candidates(
+        ssh_user=ssh_user, tailscale_running=False
     )
-    for slot, (h, ip) in sorted(lan_hits.items()):
+    for slot, (h, ip) in sorted(lan_hits_initial.items()):
         print(f"  [LAN FOUND] {slot:<10} -> {h} ({ip}:22)")
+
+    if cleanup_duplicate_tailscale:
+        for slot in ("spark01", "spark03", "spark04"):
+            if slot in lan_hits_initial:
+                h_lan = lan_hits_initial[slot][0]
+                if check_batch_ssh(ssh_user, h_lan, 22):
+                    cleanup_duplicate_spark_tailscale_if_present(ssh_user, h_lan)
+
+    if install_tailscale and platform.system().lower() == "darwin":
+        print("\n[Tailscale Setup] Installing & connecting official Tailscale on this Mac Mini...")
+        ts_running = install_and_connect_tailscale_macos()
+    else:
+        ts_running = ensure_macos_tailscale_connected() if platform.system().lower() == "darwin" else False
+
+    lan_hits = lan_hits_initial
+    if ts_running and "pc" not in lan_hits:
+        lan_hits, pc_alive_2 = probe_home_lan_candidates(ssh_user=ssh_user, tailscale_running=True)
+        if pc_alive_no_ssh is None:
+            pc_alive_no_ssh = pc_alive_2
     if pc_alive_no_ssh and "pc" not in lan_hits:
-        print(f"  [LAN PC]    danlin-hud -> {pc_alive_no_ssh[1]} (online on Home LAN; Windows SSH port 22 not yet enabled)")
+        print(f"  [LAN PC]    danlin-hud -> {pc_alive_no_ssh[1]} (online; Windows SSH port 22 not yet enabled)")
 
     local_hostname = socket.gethostname().removesuffix(".local")
     pc_default_lan = (
