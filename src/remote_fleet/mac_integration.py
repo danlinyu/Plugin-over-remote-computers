@@ -1,4 +1,4 @@
-"""macOS / OS-level integration: `~/.ssh/config` generator (for Codex SSH / Remote-SSH) and `~/RemoteComputers` auto-mounter (for native 'Choose Folder' dialogs in Antigravity, Claude, Codex, Kimi, DSH)."""
+"""macOS / OS-level integration: `~/.ssh/config` generator and `~/RemoteComputers` verified live mounter."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from remote_fleet.config import (
     FleetConfig,
@@ -40,8 +41,8 @@ def render_ssh_config_block(
     """Render `~/.ssh/config` entries.
 
     - When Tailscale IS installed/running locally: emits automatic Home-LAN-first -> Tailscale fallback.
-    - When Tailscale is NOT installed on this Mac: emits clean, direct Home LAN `HostName` entries
-      so SSH never falls through to an unroutable `100.x.y.z` IP!
+    - When Tailscale is NOT installed/running on this Mac: emits direct Home LAN `HostName` entries
+      so SSH never falls through to an unroutable `100.x.y.z` IP.
     """
     ts_active = (
         tailscale_available
@@ -51,7 +52,7 @@ def render_ssh_config_block(
     mode_note = (
         "Automatic Home LAN -> Tailscale failover."
         if ts_active
-        else "Home LAN direct mode (Tailscale not currently installed/running on this computer)."
+        else "Home LAN direct mode (Tailscale not currently active on this computer)."
     )
     lines: List[str] = [
         SSH_BEGIN_MARKER,
@@ -154,13 +155,6 @@ def find_rclone_binary() -> Optional[str]:
     return None
 
 
-def _ssh_agent_has_keys() -> bool:
-    if not os.environ.get("SSH_AUTH_SOCK") or not shutil.which("ssh-add"):
-        return False
-    proc = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, timeout=2, check=False)
-    return proc.returncode == 0 and "no identities" not in proc.stdout.lower()
-
-
 def _detect_default_ssh_key(machine: MachineConfig) -> Optional[str]:
     if machine.ssh_identity_file:
         expanded = os.path.expanduser(machine.ssh_identity_file)
@@ -175,7 +169,7 @@ def _detect_default_ssh_key(machine: MachineConfig) -> Optional[str]:
 
 
 def build_rclone_sftp_ssh_command(machine: MachineConfig, host: str) -> str:
-    """Build `--sftp-ssh` string so rclone uses `/usr/bin/ssh` directly (inheriting ~/.ssh/config, NVIDIA Sync, Keychain)."""
+    """Build `--sftp-ssh` string so rclone uses `/usr/bin/ssh` directly."""
     parts = [
         shutil.which("ssh") or "/usr/bin/ssh",
         "-o",
@@ -192,20 +186,95 @@ def build_rclone_sftp_ssh_command(machine: MachineConfig, host: str) -> str:
     return " ".join(f'"{p}"' if " " in p else p for p in parts)
 
 
+def _cleanup_unmounted_empty_dir(mount_point: Path) -> None:
+    """Remove an unmounted folder that only contains `.DS_Store` or nothing so Finder never shows dead empty folders."""
+    if not mount_point.is_dir() or is_mounted(mount_point):
+        return
+    try:
+        items = [p for p in mount_point.iterdir() if p.name != ".DS_Store"]
+        if not items:
+            ds = mount_point / ".DS_Store"
+            if ds.is_file():
+                ds.unlink()
+            mount_point.rmdir()
+    except OSError:
+        pass
+
+
+def _select_verified_rclone_sftp_flags(
+    rclone_bin: str,
+    machine: MachineConfig,
+    host: str,
+    rclone_path: str,
+) -> Tuple[Optional[List[str]], str]:
+    """Run a fast `rclone lsf --max-depth 1` preflight to pick working SFTP flags before mounting."""
+    candidates: List[Tuple[str, List[str]]] = []
+
+    key_path = _detect_default_ssh_key(machine)
+    if key_path:
+        native_flags = [
+            "--sftp-host",
+            host,
+            "--sftp-port",
+            str(machine.port or 22),
+            "--sftp-key-file",
+            key_path,
+            "--sftp-md5sum-command",
+            "none",
+            "--sftp-sha1sum-command",
+            "none",
+        ]
+        if machine.user:
+            native_flags.extend(["--sftp-user", machine.user])
+        candidates.append(("native-key", native_flags))
+
+    ssh_ext = build_rclone_sftp_ssh_command(machine, host)
+    ext_flags = [
+        "--sftp-ssh",
+        ssh_ext,
+        "--sftp-md5sum-command",
+        "none",
+        "--sftp-sha1sum-command",
+        "none",
+    ]
+    candidates.append(("external-ssh", ext_flags))
+
+    errors: List[str] = []
+    for label, flags in candidates:
+        cmd = [
+            rclone_bin,
+            "lsf",
+            f":sftp:{rclone_path}",
+            *flags,
+            "--max-depth",
+            "1",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        if proc.returncode == 0:
+            return flags, ""
+        errors.append(f"{label}: {proc.stderr.strip() or proc.stdout.strip()}")
+
+    return None, "; ".join(errors)
+
+
 def mount_single_machine_root(
     transport: FleetTransport,
     machine: MachineConfig,
     base_dir: Path,
 ) -> Dict[str, Any]:
-    """Mount a remote computer's home/root directory onto `~/RemoteComputers/<machine.id>`."""
+    """Mount a remote computer's home directory onto `~/RemoteComputers/<machine.id>` and verify real files appear."""
+    mount_point = (base_dir / machine.id).resolve()
+
     ep = transport.resolve_endpoint(machine)
     if ep.transport == "local":
         return {"ok": True, "skipped": True, "reason": "self (local computer)", "machine_id": machine.id}
     if not ep.reachable:
+        _cleanup_unmounted_empty_dir(mount_point)
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
     ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=8)
     if not ping.get("ok"):
+        _cleanup_unmounted_empty_dir(mount_point)
         return {
             "ok": False,
             "machine_id": machine.id,
@@ -213,54 +282,110 @@ def mount_single_machine_root(
         }
 
     remote_home = str(ping.get("home") or "/").replace("\\", "/")
-    mount_point = (base_dir / machine.id).resolve()
-    mount_point.mkdir(parents=True, exist_ok=True)
 
-    if is_mounted(mount_point):
-        reg = load_mounts_registry()
-        reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
-        save_mounts_registry(reg)
-        return {
-            "ok": True,
-            "machine_id": machine.id,
-            "mount_point": str(mount_point),
-            "remote_root": remote_home,
-            "already_mounted": True,
-            "endpoint": ep.to_dict(),
-        }
+    # Already mounted: verify we can actually list entries inside it!
+    if mount_point.is_dir() and is_mounted(mount_point):
+        try:
+            visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
+            reg = load_mounts_registry()
+            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+            save_mounts_registry(reg)
+            return {
+                "ok": True,
+                "machine_id": machine.id,
+                "mount_point": str(mount_point),
+                "remote_root": remote_home,
+                "already_mounted": True,
+                "visible_count": len(visible),
+                "sample_entries": visible[:6],
+                "endpoint": ep.to_dict(),
+            }
+        except OSError:
+            unmount_sshfs(mount_point)
 
     is_macos = platform.system().lower() == "darwin"
     rclone_bin = find_rclone_binary()
     sshfs_bin = shutil.which("sshfs")
 
-    # Prefer `rclone nfsmount` on macOS: native macOS user-space NFSv3, zero macFUSE kernel extensions!
-    if rclone_bin and (is_macos or not sshfs_bin):
-        # Windows OpenSSH SFTP paths start with `/C:/Users/...` when absolute
-        rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
-        subcmd = "nfsmount" if is_macos else "mount"
-        ssh_ext = build_rclone_sftp_ssh_command(machine, ep.host)
+    if not rclone_bin and not sshfs_bin:
+        _cleanup_unmounted_empty_dir(mount_point)
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "missing_mounter": True,
+            "error": "Neither `rclone` nor `sshfs` is installed yet.",
+        }
 
-        # Important on macOS: `--daemon-wait 5s` avoids rclone's 60s default fixed sleep on Darwin!
+    mount_point.mkdir(parents=True, exist_ok=True)
+    # Remove any stray Finder `.DS_Store` before mounting
+    try:
+        (mount_point / ".DS_Store").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    # 1. Preferred on macOS: `rclone nfsmount` spawned cleanly in detached session + verified via `ismount()` & `os.listdir()`
+    if rclone_bin and (is_macos or not sshfs_bin):
+        rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
+        sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
+            rclone_bin, machine, ep.host, rclone_path
+        )
+        if not sftp_flags:
+            _cleanup_unmounted_empty_dir(mount_point)
+            return {
+                "ok": False,
+                "machine_id": machine.id,
+                "error": f"rclone SFTP preflight failed on {ep.host}: {preflight_err}",
+            }
+
+        subcmd = "nfsmount" if is_macos else "mount"
+        log_dir = Path.home() / ".cache" / "remote-fleet"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"rclone-{machine.id}.log"
+
         cmd = [
             rclone_bin,
             subcmd,
             f":sftp:{rclone_path}",
             str(mount_point),
-            "--sftp-ssh",
-            ssh_ext,
-            "--daemon",
-            "--daemon-wait",
-            "5s",
+            *sftp_flags,
+            "--allow-non-empty",
             "--vfs-cache-mode",
             "writes",
             "--vfs-fast-fingerprint",
+            "--poll-interval",
+            "0",
             "--dir-cache-time",
             "5s",
             "--volname",
             f"Fleet-{machine.id}",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
-        if proc.returncode == 0 or is_mounted(mount_point):
+
+        with open(log_file, "w", encoding="utf-8") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+
+        deadline = time.monotonic() + 12.0
+        mounted_ok = False
+        while time.monotonic() < deadline:
+            if is_mounted(mount_point):
+                mounted_ok = True
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.3)
+
+        if mounted_ok:
+            visible = []
+            try:
+                visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
+            except OSError:
+                pass
             reg = load_mounts_registry()
             reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
             save_mounts_registry(reg)
@@ -270,54 +395,29 @@ def mount_single_machine_root(
                 "engine": f"rclone-{subcmd}",
                 "mount_point": str(mount_point),
                 "remote_root": remote_home,
+                "visible_count": len(visible),
+                "sample_entries": visible[:6],
                 "endpoint": ep.to_dict(),
             }
 
-        # Fallback to native rclone SFTP Go client with key_file if `--sftp-ssh` failed
-        sftp_opts = [f"host={ep.host}"]
-        if machine.user:
-            sftp_opts.append(f"user={machine.user}")
-        if machine.port and machine.port != 22:
-            sftp_opts.append(f"port={machine.port}")
-        key_path = _detect_default_ssh_key(machine)
-        if key_path:
-            sftp_opts.append(f"key_file={key_path}")
-        elif _ssh_agent_has_keys():
-            sftp_opts.append("key_use_agent=true")
-
-        cmd_fallback = [
-            rclone_bin,
-            subcmd,
-            f":sftp,{','.join(sftp_opts)}:{rclone_path}",
-            str(mount_point),
-            "--daemon",
-            "--daemon-wait",
-            "5s",
-            "--vfs-cache-mode",
-            "writes",
-            "--vfs-fast-fingerprint",
-            "--dir-cache-time",
-            "5s",
-            "--volname",
-            f"Fleet-{machine.id}",
-        ]
-        proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=25, check=False)
-        if proc2.returncode == 0 or is_mounted(mount_point):
-            reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
-            save_mounts_registry(reg)
-            return {
-                "ok": True,
-                "machine_id": machine.id,
-                "engine": f"rclone-{subcmd}",
-                "mount_point": str(mount_point),
-                "remote_root": remote_home,
-                "endpoint": ep.to_dict(),
-            }
-        err_msg = proc2.stderr.strip() or proc.stderr.strip() or proc2.stdout.strip()
+        # Clean up child if still hanging without mounting
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        log_tail = ""
+        if log_file.is_file():
+            log_tail = "\n".join(log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-8:])
         if not sshfs_bin:
-            return {"ok": False, "machine_id": machine.id, "error": f"rclone {subcmd} failed: {err_msg}"}
+            _cleanup_unmounted_empty_dir(mount_point)
+            return {
+                "ok": False,
+                "machine_id": machine.id,
+                "error": f"rclone {subcmd} did not mount {mount_point}: {log_tail or 'timeout'}",
+            }
 
+    # 2. Fallback: `sshfs`
     if sshfs_bin:
         target_spec = (
             f"{machine.user}@{ep.host}:{remote_home}"
@@ -336,8 +436,9 @@ def mount_single_machine_root(
         key_path = _detect_default_ssh_key(machine)
         if key_path:
             cmd.extend(["-o", f"IdentityFile={key_path}"])
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        if proc.returncode == 0:
+        proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        if proc2.returncode == 0 and is_mounted(mount_point):
+            visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
             reg = load_mounts_registry()
             reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
             save_mounts_registry(reg)
@@ -347,23 +448,19 @@ def mount_single_machine_root(
                 "engine": "sshfs",
                 "mount_point": str(mount_point),
                 "remote_root": remote_home,
+                "visible_count": len(visible),
+                "sample_entries": visible[:6],
                 "endpoint": ep.to_dict(),
             }
+        _cleanup_unmounted_empty_dir(mount_point)
         return {
             "ok": False,
             "machine_id": machine.id,
-            "error": f"sshfs failed: {proc.stderr.strip() or proc.stdout.strip()}",
+            "error": f"sshfs failed: {proc2.stderr.strip() or proc2.stdout.strip()}",
         }
 
-    return {
-        "ok": False,
-        "machine_id": machine.id,
-        "missing_mounter": True,
-        "error": (
-            "Install `rclone` (`brew install rclone`) on your Mac so `~/RemoteComputers/<machine>` "
-            "mounts natively via macOS NFSv3 (no macFUSE required!)."
-        ),
-    }
+    _cleanup_unmounted_empty_dir(mount_point)
+    return {"ok": False, "machine_id": machine.id, "error": "Mount failed."}
 
 
 def mount_all_machines(
@@ -371,15 +468,28 @@ def mount_all_machines(
     transport: FleetTransport,
     base_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>`."""
+    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>` and refresh Finder."""
     root = (base_dir or (Path.home() / "RemoteComputers")).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    # Prime parallel endpoint cache
     transport.resolve_all_endpoints(config.machines, force_refresh=True)
 
     results = []
     for m in config.machines:
         results.append(mount_single_machine_root(transport, m, root))
+
+    # Refresh macOS Finder window if open so newly mounted folders show contents immediately
+    if platform.system().lower() == "darwin" and shutil.which("osascript"):
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'tell application "Finder" to if exists (POSIX file "{root}" as alias) then update (POSIX file "{root}" as alias)',
+            ],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+
     return {"base_dir": str(root), "results": results}
 
 

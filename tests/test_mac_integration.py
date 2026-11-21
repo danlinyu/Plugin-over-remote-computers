@@ -137,6 +137,24 @@ class TestMacIntegration(unittest.TestCase):
             self.assertIn("mount-all", data["ProgramArguments"])
             self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
 
+    def test_empty_unmounted_folder_cleanup(self) -> None:
+        from remote_fleet.mac_integration import _cleanup_unmounted_empty_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Folder containing only Finder `.DS_Store` should be cleaned up when unmounted
+            dead_dir = Path(tmp) / "spark01"
+            dead_dir.mkdir()
+            (dead_dir / ".DS_Store").write_bytes(b"finder")
+            _cleanup_unmounted_empty_dir(dead_dir)
+            self.assertFalse(dead_dir.exists())
+
+            # 2. Folder containing real files must never be removed
+            real_dir = Path(tmp) / "spark03"
+            real_dir.mkdir()
+            (real_dir / "keep.txt").write_text("hi", encoding="utf-8")
+            _cleanup_unmounted_empty_dir(real_dir)
+            self.assertTrue(real_dir.is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

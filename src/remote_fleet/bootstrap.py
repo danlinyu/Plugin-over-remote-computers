@@ -1,15 +1,12 @@
 """Turnkey Home LAN & Tailscale Bootstrapper (`fleet bootstrap` / `./bootstrap_mac.sh`).
 
-Tailored for Mac Mini (`danlins-mac-mini`) + 3 DGX Sparks (`spark01`, `spark03`, `spark04`) +
-Windows 11 Home PC (`danlin-hud` / `pc`):
-1. Reconnects macOS Tailscale if stopped, and scans Home LAN + Tailscale.
-2. Cleans up duplicate apt `tailscaled` (`spark01-1`, `spark03-1`) if present so each Spark keeps
-   its original single Tailscale node (`spark01`, `spark03`, `spark04`).
-3. Sets up passwordless SSH keys (`spark01`, `spark03`, `spark04`, and Windows 11 `danlin-hud` helper
-   including `C:\\ProgramData\\ssh\\administrators_authorized_keys`).
-4. Downloads official standalone `rclone` binary directly into `~/.local/bin/rclone` on macOS
-   when Homebrew is not installed (zero `brew`, zero `sudo`, zero macFUSE!).
-5. Configures `~/.ssh/config`, all 5 harnesses, and mounts `~/RemoteComputers/{spark01,spark03,spark04,pc}`.
+Hardened end-to-end for Mac Mini (`Danlins-Mac-Mini`) + 3 DGX Sparks (`spark01`, `spark03`, `spark04`)
++ Windows 11 Home PC (`danlin-hud` at `192.168.68.70` / `100.93.148.108`):
+1. Cleans up duplicate `apt` Tailscale (`spark01-1`, `spark03-1`) on `spark01` and `spark03`.
+2. Automatically downloads & installs official standalone macOS Tailscale `.pkg` via `curl` when missing.
+3. Downloads standalone macOS `rclone` directly from GitHub Releases via `curl` (bypassing Cloudflare 403!).
+4. Mounts `~/RemoteComputers/{spark01,spark03,spark04,pc}` and verifies live remote files appear inside Finder.
+5. Prints a hardened, unmissable Windows 11 PowerShell block at the very end if `danlin-hud` still has port 22 off.
 """
 
 from __future__ import annotations
@@ -20,6 +17,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -27,7 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import urllib.request
+import time
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,10 +52,9 @@ CANDIDATE_LAN_HOSTS: Dict[str, List[str]] = {
     "spark01": ["spark01.local", "spark01"],
     "spark03": ["spark03.local", "spark03"],
     "spark04": ["spark04.local", "spark04"],
-    "pc": ["danlin-hud.local", "danlin-hud", "pc.local", "pc"],
+    "pc": ["danlin-hud.local", "danlin-hud", "192.168.68.70", "pc.local", "pc"],
 }
 
-# Known Tailscale fallback IPs from the tailnet (`danlinyu@gmail.com`)
 KNOWN_TAILSCALE_IPS: Dict[str, str] = {
     "mac-mini": "100.71.43.59",
     "spark01": "100.85.241.120",
@@ -79,7 +76,7 @@ def _tcp_open(host: str, port: int = 22, timeout: float = 0.8) -> Optional[str]:
 
 
 def _host_resolves_or_pings(host: str) -> Optional[str]:
-    """Check if a Windows PC resolves via mDNS/DNS or SMB/RDP ports even when SSH port 22 is off."""
+    """Check if a Windows PC resolves and answers on SMB/RDP/RPC ports even when SSH port 22 is off."""
     try:
         ip = socket.gethostbyname(host)
     except Exception:
@@ -90,7 +87,7 @@ def _host_resolves_or_pings(host: str) -> Optional[str]:
                 return ip
         except Exception:
             continue
-    return ip
+    return None
 
 
 def _get_local_private_ipv4() -> Optional[str]:
@@ -109,7 +106,7 @@ def _get_local_private_ipv4() -> Optional[str]:
 
 
 def _query_netbios_name(ip: str, timeout: float = 0.35) -> str:
-    """Send a standard 50-byte UDP 137 NetBIOS NBSTAT query to identify a Windows 11 PC by name on Home LAN."""
+    """Send a 50-byte UDP 137 NetBIOS NBSTAT query to identify a Windows 11 PC by name on Home LAN."""
     packet = (
         b"\x82\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
         b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
@@ -145,7 +142,7 @@ def _scan_subnet_for_missing_hosts(
     already_found_ips: set[str],
     ssh_user: str,
 ) -> Tuple[Dict[str, Tuple[str, str]], Optional[Tuple[str, str]]]:
-    """Scan `<subnet_prefix>.1..254` in ~1.2s to find `spark04` or Windows PC `danlin-hud` even without mDNS or Tailscale."""
+    """Scan `<subnet_prefix>.1..254` in ~1.2s to find `spark04` or Windows PC `danlin-hud`."""
     discovered: Dict[str, Tuple[str, str]] = {}
     win_no_ssh: Optional[Tuple[str, str]] = None
 
@@ -175,7 +172,6 @@ def _scan_subnet_for_missing_hosts(
 
     for ip, ssh_ok, win_ok in scan_results:
         if ssh_ok:
-            # Identify hostname via reverse DNS, NetBIOS, or quick BatchMode SSH `hostname`
             name_guess = ""
             try:
                 name_guess = socket.gethostbyaddr(ip)[0].lower()
@@ -217,27 +213,52 @@ def _scan_subnet_for_missing_hosts(
 
 
 def resolve_latest_macos_tailscale_pkg_url() -> str:
-    """Resolve the exact latest `Tailscale-<ver>-macos.pkg` URL from `https://pkgs.tailscale.com/stable/`."""
+    """Resolve the exact latest `Tailscale-<ver>-macos.pkg` URL using macOS `/usr/bin/curl` (never blocked by WAF)."""
     index_url = "https://pkgs.tailscale.com/stable/"
-    try:
-        req = urllib.request.Request(index_url, headers={"User-Agent": "remote-fleet/0.1"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        matches = re.findall(r'href="(Tailscale-[0-9.]+-macos\.pkg)"', html)
+    proc = subprocess.run(
+        ["curl", "-fsSL", "--max-time", "12", index_url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0 and proc.stdout:
+        matches = re.findall(r"Tailscale-[0-9.]+-macos\.pkg", proc.stdout)
         if matches:
             return f"{index_url}{matches[0]}"
+    return f"{index_url}Tailscale-1.104.7-macos.pkg"
+
+
+def ensure_macos_tailscale_connected(quiet_if_missing: bool = False) -> bool:
+    """Check if Tailscale is installed & running on this Mac. Returns True if `BackendState == 'Running'`."""
+    ts_bin = find_tailscale_binary()
+    if not ts_bin:
+        if not quiet_if_missing:
+            print("  [TAILSCALE] Not installed yet on this Mac.")
+        return False
+    try:
+        proc = subprocess.run(
+            [ts_bin, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout)
+            state = str(data.get("BackendState") or "")
+            if state == "Running":
+                print("  [TAILSCALE] Local Tailscale is connected and running!")
+                return True
+            if not quiet_if_missing:
+                print(f"  [TAILSCALE] Installed, current state is '{state}'.")
     except Exception:
         pass
-    return "https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg"
+    return False
 
 
 def install_and_connect_tailscale_macos(wait_seconds: int = 180) -> bool:
     """Download & install official standalone macOS Tailscale `.pkg`, launch it, and wait for login."""
-    import select
-    import time
-
     if platform.system().lower() != "darwin":
-        print("  `--install-tailscale` automatic .pkg installer is for macOS.")
         return False
 
     app_cli = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
@@ -259,7 +280,7 @@ def install_and_connect_tailscale_macos(wait_seconds: int = 180) -> bool:
         if inst_rc != 0 or not app_cli.exists():
             print("  ! `sudo installer` did not complete.")
             return False
-        print("  [OK] Installed /Applications/Tailscale.app")
+        print("  [OK] Installed /Applications/Tailscale.app!")
 
     # Symlink CLI into ~/.local/bin/tailscale so `tailscale` works in Terminal
     local_bin = Path.home() / ".local" / "bin"
@@ -272,21 +293,22 @@ def install_and_connect_tailscale_macos(wait_seconds: int = 180) -> bool:
     except OSError:
         pass
 
-    # Check if already logged in and Running
     if ensure_macos_tailscale_connected(quiet_if_missing=True):
         return True
 
-    # Launch GUI app so macOS triggers System Extension + VPN Configuration approval + browser login
     subprocess.run(["open", "-a", "/Applications/Tailscale.app"], check=False)
     print(
-        "\n  === Action Needed on Your Mac Screen (One-Time Tailscale Approval) ===\n"
-        "  1. If macOS pops up 'System Extension Blocked', click 'Open System Settings'\n"
-        "     (General -> Login Items & Extensions -> Network Extensions -> toggle Tailscale ON).\n"
+        "\n  =======================================================================\n"
+        "  ACTION ON YOUR MAC SCREEN: Complete One-Time Tailscale Sign-In\n"
+        "  -----------------------------------------------------------------------\n"
+        "  1. If macOS pops up 'System Extension Blocked', open System Settings ->\n"
+        "     General -> Login Items & Extensions -> Network Extensions -> toggle Tailscale ON.\n"
         "  2. Click 'Allow' on 'Tailscale Would Like to Add VPN Configurations'.\n"
         "  3. Click the Tailscale icon in your top-right menu bar -> 'Log in' (danlinyu@gmail.com).\n"
-        "     (Tip: In console.tailscale.com/admin/machines, remove the old Nov 18 `danlins-mac-mini`,\n"
-        "      `spark01-1`, and `spark03-1` so this new Mac gets the clean name `danlins-mac-mini`!)\n"
-        f"\n  Waiting up to {wait_seconds}s for Tailscale to connect (will continue automatically once green, or press Enter to skip)..."
+        "     (Tip: Remove the old Nov 18 `danlins-mac-mini` in console.tailscale.com first\n"
+        "      so this Mac gets the clean name `danlins-mac-mini`!)\n"
+        "  =======================================================================\n"
+        f"  Waiting up to {wait_seconds}s for Tailscale to turn green (continues automatically once connected, or press Enter to continue now)..."
     )
 
     deadline = time.time() + wait_seconds
@@ -304,39 +326,7 @@ def install_and_connect_tailscale_macos(wait_seconds: int = 180) -> bool:
     return ensure_macos_tailscale_connected(quiet_if_missing=True)
 
 
-def ensure_macos_tailscale_connected(quiet_if_missing: bool = False) -> bool:
-    """Check if Tailscale is installed & running on this Mac. Returns True if running."""
-    ts_bin = find_tailscale_binary()
-    if not ts_bin:
-        if not quiet_if_missing:
-            print(
-                "  [HOME LAN MODE] Tailscale is not installed on this Mac Mini yet "
-                "(pass `--install-tailscale` to install it automatically!)."
-            )
-        return False
-    try:
-        proc = subprocess.run(
-            [ts_bin, "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            data = json.loads(proc.stdout)
-            state = str(data.get("BackendState") or "")
-            if state == "Running":
-                print("  [TAILSCALE] Local Tailscale is connected and running!")
-                return True
-            if not quiet_if_missing:
-                print(f"  [TAILSCALE] Local Tailscale state is '{state}' — using Home LAN until logged in.")
-    except Exception:
-        pass
-    return False
-
-
 def scan_arp_neighbors() -> List[Tuple[str, str]]:
-    """Return `(hostname_or_ip, ip)` entries from `arp -a`."""
     if not shutil.which("arp"):
         return []
     try:
@@ -380,7 +370,7 @@ def probe_home_lan_candidates(
 
     pc_alive_no_ssh: Optional[Tuple[str, str]] = None
     if "pc" not in found:
-        pc_cands = ["danlin-hud.local", "danlin-hud"]
+        pc_cands = ["192.168.68.70", "danlin-hud.local", "danlin-hud"]
         if tailscale_running:
             pc_cands.append(KNOWN_TAILSCALE_IPS["pc"])
         for pc_cand in pc_cands:
@@ -389,7 +379,6 @@ def probe_home_lan_candidates(
                 pc_alive_no_ssh = (pc_cand, ip)
                 break
 
-    # If spark04 or pc wasn't found via mDNS/ARP yet, do a fast 1.2s /24 Home LAN subnet scan!
     missing_slots = {s for s in ("spark01", "spark03", "spark04", "pc") if s not in found}
     if missing_slots:
         local_ip = _get_local_private_ipv4()
@@ -407,7 +396,6 @@ def probe_home_lan_candidates(
 
 
 def ensure_local_ssh_key() -> Path:
-    """Ensure `~/.ssh/id_ed25519` (or existing `id_rsa`) exists on the Mac Mini."""
     ssh_dir = Path.home() / ".ssh"
     ssh_dir.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -420,10 +408,7 @@ def ensure_local_ssh_key() -> Path:
 
     key_file = ssh_dir / "id_ed25519"
     print(f"  Generating new SSH key at {key_file}...")
-    subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_file)],
-        check=True,
-    )
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key_file)], check=True)
     return key_file
 
 
@@ -431,18 +416,8 @@ def check_batch_ssh(user: str, host: str, port: int = 22) -> bool:
     target = f"{user}@{host}" if user else host
     proc = subprocess.run(
         [
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=4",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-p",
-            str(port),
-            target,
-            "echo ok",
+            "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+            "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), target, "echo ok",
         ],
         capture_output=True,
         text=True,
@@ -455,49 +430,33 @@ def check_batch_ssh(user: str, host: str, port: int = 22) -> bool:
 def copy_ssh_key_interactive(
     user: str, host: str, key_file: Path, port: int = 22, is_windows: bool = False
 ) -> bool:
-    """Copy SSH public key to a Linux Spark or Windows 11 PC."""
     target = f"{user}@{host}" if user else host
     pub_file = Path(f"{key_file}.pub")
     pub_text = pub_file.read_text(encoding="utf-8").strip()
 
     print(f"\n  -> Authorizing SSH key on {target} (enter password for {target} if prompted):")
     if is_windows:
-        # Windows OpenSSH requires writing administrators_authorized_keys when user is an Administrator
         ps_cmd = (
             f"$pub = '{pub_text}'; "
             "$uDir = Join-Path $HOME '.ssh'; New-Item -ItemType Directory -Force -Path $uDir | Out-Null; "
-            "Add-Content -Path (Join-Path $uDir 'authorized_keys') -Value $pub; "
+            "[System.IO.File]::AppendAllText((Join-Path $uDir 'authorized_keys'), $pub + \"`n\"); "
             "$adm = 'C:\\ProgramData\\ssh\\administrators_authorized_keys'; "
             "if (Test-Path 'C:\\ProgramData\\ssh') { "
-            "  Add-Content -Path $adm -Value $pub -ErrorAction SilentlyContinue; "
+            "  [System.IO.File]::AppendAllText($adm, $pub + \"`n\"); "
             "  icacls.exe $adm /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null "
             "}"
         )
         rc = subprocess.call(
             [
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-p",
-                str(port),
-                target,
-                f"powershell -NoProfile -Command \"{ps_cmd}\"",
+                "ssh", "-o", "StrictHostKeyChecking=accept-new", "-p", str(port),
+                target, f"powershell -NoProfile -Command \"{ps_cmd}\"",
             ]
         )
         return rc == 0 and check_batch_ssh(user, host, port)
 
     if shutil.which("ssh-copy-id"):
         rc = subprocess.call(
-            [
-                "ssh-copy-id",
-                "-i",
-                str(pub_file),
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-p",
-                str(port),
-                target,
-            ]
+            ["ssh-copy-id", "-i", str(pub_file), "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), target]
         )
         return rc == 0 and check_batch_ssh(user, host, port)
 
@@ -549,7 +508,7 @@ def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
 
 
 def ensure_rclone_installed_macos() -> Optional[str]:
-    """Find `rclone` or download official standalone macOS binary into `~/.local/bin/rclone` (zero Homebrew needed!)."""
+    """Download standalone macOS `rclone` from GitHub Releases via `/usr/bin/curl` (never blocked by Cloudflare 403!)."""
     existing = find_rclone_binary()
     if existing:
         return existing
@@ -559,45 +518,83 @@ def ensure_rclone_installed_macos() -> Optional[str]:
 
     arch = platform.machine().lower()
     zip_arch = "arm64" if arch in ("arm64", "aarch64") else "amd64"
-    url = f"https://downloads.rclone.org/rclone-current-osx-{zip_arch}.zip"
+
+    # Resolve latest release tag from GitHub API via curl (fallback v1.76.0)
+    tag = "v1.76.0"
+    api_proc = subprocess.run(
+        ["curl", "-fsSL", "--max-time", "10", "https://api.github.com/repos/rclone/rclone/releases/latest"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if api_proc.returncode == 0 and api_proc.stdout.strip():
+        try:
+            tag = str(json.loads(api_proc.stdout).get("tag_name") or tag)
+        except Exception:
+            pass
+
+    candidate_urls = [
+        f"https://github.com/rclone/rclone/releases/download/{tag}/rclone-{tag}-osx-{zip_arch}.zip",
+        f"https://downloads.rclone.org/rclone-current-osx-{zip_arch}.zip",
+    ]
     dest_dir = Path.home() / ".local" / "bin"
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_bin = dest_dir / "rclone"
 
-    print(f"  Downloading standalone macOS `rclone` ({zip_arch}) -> {dest_bin} (no Homebrew needed)...")
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            zip_path = Path(tmp) / "rclone.zip"
-            urllib.request.urlretrieve(url, str(zip_path))
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                member = next((n for n in zf.namelist() if n.endswith("/rclone")), None)
-                if not member:
-                    raise RuntimeError("rclone binary not found inside archive")
-                with zf.open(member) as src, open(dest_bin, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-        dest_bin.chmod(dest_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        if shutil.which("xattr"):
-            subprocess.run(["xattr", "-c", str(dest_bin)], capture_output=True, check=False)
-        return str(dest_bin)
-    except Exception as exc:
-        print(f"  ! Could not auto-download rclone ({exc}). You can download it from https://rclone.org/downloads/")
-        return None
+    for url in candidate_urls:
+        print(f"  Downloading standalone macOS `rclone` ({tag}, {zip_arch}) -> {dest_bin}...")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                zip_path = Path(tmp) / "rclone.zip"
+                dl = subprocess.run(
+                    ["curl", "-fL", "--progress-bar", "-A", "curl/8.7.1", "-o", str(zip_path), url],
+                    check=False,
+                )
+                if dl.returncode != 0 or not zip_path.is_file():
+                    continue
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    member = next((n for n in zf.namelist() if n.endswith("/rclone")), None)
+                    if not member:
+                        continue
+                    with zf.open(member) as src, open(dest_bin, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+            dest_bin.chmod(dest_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            if shutil.which("xattr"):
+                subprocess.run(["xattr", "-c", str(dest_bin)], capture_output=True, check=False)
+            ver = subprocess.run([str(dest_bin), "version"], capture_output=True, text=True, timeout=5, check=False)
+            if ver.returncode == 0:
+                first_line = ver.stdout.splitlines()[0] if ver.stdout else "rclone"
+                print(f"  [OK] Installed {first_line} at {dest_bin}")
+                return str(dest_bin)
+        except Exception as exc:
+            print(f"  ! Attempt from {url} failed: {exc}")
+
+    return None
 
 
-def _print_windows_pc_setup_instructions(pc_user: str, pub_key: str) -> None:
-    print("\n  --- One-Time Windows 11 PC (`danlin-hud`) SSH Enablement ---")
-    print("  Windows 11 disables OpenSSH Server (`sshd` port 22) by default. To make `danlin-hud` appear")
-    print("  alongside `spark01`, `spark03`, and `spark04`, open **PowerShell as Administrator** on `danlin-hud`")
-    print("  once and paste these 4 lines:\n")
-    print("    Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0")
-    print("    Start-Service sshd; Set-Service -Name sshd -StartupType 'Automatic'")
-    print(f"    $k = \"{pub_key}\"")
+def _print_windows_pc_final_banner(pc_ip_or_host: str, pc_user: str, pub_key: str) -> None:
+    print("\n" + "=" * 78)
+    print(f"  ACTION NEEDED ONCE ON YOUR WINDOWS 11 PC (`danlin-hud` at {pc_ip_or_host})")
+    print("=" * 78)
+    print("  Why `pc` isn't in Finder yet: `danlin-hud` is online on your network,")
+    print("  but Windows 11 turns OFF OpenSSH Server (port 22) until you enable it once.")
+    print("\n  1. Sit at `danlin-hud`, right-click Start -> **Terminal (Admin)** or **PowerShell (Admin)**")
+    print("  2. Paste this block once and press Enter:\n")
+    print("Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0")
+    print("Start-Service sshd; Set-Service -Name sshd -StartupType 'Automatic'")
+    print("New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any -ErrorAction SilentlyContinue")
+    print(f'$k = "{pub_key}"')
+    print("New-Item -Force -ItemType Directory \"$HOME\\.ssh\" | Out-Null")
+    print("[System.IO.File]::AppendAllText(\"$HOME\\.ssh\\authorized_keys\", $k + \"`n\")")
+    print("[System.IO.File]::AppendAllText(\"C:\\ProgramData\\ssh\\administrators_authorized_keys\", $k + \"`n\")")
+    print("icacls.exe \"C:\\ProgramData\\ssh\\administrators_authorized_keys\" /inheritance:r /grant \"Administrators:F\" /grant \"SYSTEM:F\"")
+    print("Write-Host \"SUCCESS! Your Windows SSH username is: $env:USERNAME\" -ForegroundColor Green")
     print(
-        "    New-Item -Force -ItemType Directory $HOME\\.ssh | Out-Null; Add-Content $HOME\\.ssh\\authorized_keys $k; "
-        "Add-Content C:\\ProgramData\\ssh\\administrators_authorized_keys $k; "
-        "icacls C:\\ProgramData\\ssh\\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'"
+        f"\n  3. Back on this Mac Mini, if your Windows username printed above is NOT `{pc_user}`,\n"
+        "     run: `./bootstrap_mac.sh --pc-user <that_windows_username>`\n"
+        "     (otherwise just run: `~/.local/bin/fleet mount-all`)"
     )
-    print(f"\n  (If your Windows username on `danlin-hud` is different from `{pc_user}`, re-run with `--pc-user <win_user>`.)")
+    print("=" * 78)
 
 
 def run_bootstrap(
@@ -607,10 +604,10 @@ def run_bootstrap(
     interactive_ssh_copy: bool = True,
     fix_spark_tailscale: bool = False,
     cleanup_duplicate_tailscale: bool = True,
-    install_tailscale: bool = False,
+    install_tailscale: bool = True,
     mount_dir: Optional[Path] = None,
 ) -> int:
-    """Run full turnkey discovery, duplicate Tailscale cleanup, optional macOS Tailscale install, rclone install, and Mac mounting."""
+    """Run full turnkey discovery, duplicate Tailscale cleanup, macOS Tailscale install, rclone install, and verified Mac mounting."""
     effective_pc_user = (pc_user or ssh_user).strip()
     print("=== Remote Fleet Turnkey Bootstrap ===")
     print(f"Spark SSH user: {ssh_user} | Windows PC (`danlin-hud`) SSH user: {effective_pc_user}\n")
@@ -630,11 +627,15 @@ def run_bootstrap(
                 if check_batch_ssh(ssh_user, h_lan, 22):
                     cleanup_duplicate_spark_tailscale_if_present(ssh_user, h_lan)
 
-    if install_tailscale and platform.system().lower() == "darwin":
-        print("\n[Tailscale Setup] Installing & connecting official Tailscale on this Mac Mini...")
-        ts_running = install_and_connect_tailscale_macos()
+    # Install & connect Tailscale on macOS automatically unless --no-install-tailscale was passed
+    if platform.system().lower() == "darwin":
+        if install_tailscale and not ensure_macos_tailscale_connected(quiet_if_missing=True):
+            print("\n[Tailscale Setup] Ensuring official Tailscale is installed & connected on this Mac Mini...")
+            ts_running = install_and_connect_tailscale_macos()
+        else:
+            ts_running = ensure_macos_tailscale_connected()
     else:
-        ts_running = ensure_macos_tailscale_connected() if platform.system().lower() == "darwin" else False
+        ts_running = False
 
     lan_hits = lan_hits_initial
     if ts_running and "pc" not in lan_hits:
@@ -642,13 +643,13 @@ def run_bootstrap(
         if pc_alive_no_ssh is None:
             pc_alive_no_ssh = pc_alive_2
     if pc_alive_no_ssh and "pc" not in lan_hits:
-        print(f"  [LAN PC]    danlin-hud -> {pc_alive_no_ssh[1]} (online; Windows SSH port 22 not yet enabled)")
+        print(f"  [LAN PC]    danlin-hud -> {pc_alive_no_ssh[1]} (online on LAN; Windows SSH port 22 currently closed)")
 
     local_hostname = socket.gethostname().removesuffix(".local")
     pc_default_lan = (
         lan_hits["pc"][0]
         if "pc" in lan_hits
-        else (pc_alive_no_ssh[1] if pc_alive_no_ssh else "danlin-hud.local")
+        else (pc_alive_no_ssh[1] if pc_alive_no_ssh else "192.168.68.70")
     )
     machines: List[MachineConfig] = [
         MachineConfig(
@@ -728,51 +729,47 @@ def run_bootstrap(
                         )
                     )
 
-    # Do NOT auto-append duplicate `spark01-1` / `spark03-1` or `danlindep` unless explicitly added
     cfg = FleetConfig(machines=machines, include_unlisted_tailscale_peers=False)
     ts_nodes = query_tailscale_nodes()
     ts_self = None
     if ts_nodes:
-        # Filter out transient `-1` duplicate nodes when merging
         clean_ts_nodes = [n for n in ts_nodes if not re.search(r"^spark0\d-\d+$", n.hostname.lower())]
         cfg, ts_self = merge_tailscale_into_config(cfg, clean_ts_nodes)
-        print(f"  [TAILSCALE] Synced {len(clean_ts_nodes)} Tailscale peer(s)")
+        print(f"  [TAILSCALE] Synced {len(clean_ts_nodes)} live Tailscale peer(s)")
 
     saved_cfg = save_fleet_config(cfg)
     print(f"  Saved fleet config -> {saved_cfg}")
 
-    # Remove stale ~/RemoteComputers/spark02 directory from earlier run if empty & unmounted
     target_mount_dir = (mount_dir or (Path.home() / "RemoteComputers")).expanduser().resolve()
     stale_spark02 = target_mount_dir / "spark02"
     if stale_spark02.is_dir() and not is_mounted(stale_spark02):
         try:
+            (stale_spark02 / ".DS_Store").unlink(missing_ok=True)
             stale_spark02.rmdir()
-            print(f"  Removed unused folder {stale_spark02}")
         except OSError:
             pass
 
-    # 2. SSH Key check + duplicate Tailscale cleanup on Sparks + Windows PC check
-    print("\n[2/5] Verifying SSH keys & cleaning up duplicate Tailscale nodes if needed...")
+    # 2. Verify SSH keys
+    print("\n[2/5] Verifying SSH keys across reachable machines...")
     key_file = ensure_local_ssh_key()
     pub_key_str = Path(f"{key_file}.pub").read_text(encoding="utf-8").strip()
     transport = FleetTransport(cfg, ts_self)
     ep_map = transport.resolve_all_endpoints(cfg.machines, force_refresh=True)
 
+    pc_needs_windows_sshd = False
     for m in cfg.machines:
         ep = ep_map[m.id]
         if ep.transport == "local":
             print(f"  [LOCAL] {m.id:<10} (this Mac Mini)")
             continue
         if not ep.reachable:
-            print(f"  [OFF]   {m.id:<10} (port 22 not reachable at LAN={m.lan_host} or Tailscale={m.tailscale_host})")
+            print(f"  [OFF]   {m.id:<10} (SSH port 22 closed at LAN={m.lan_host})")
             if m.id == "pc":
-                if pc_alive_no_ssh:
-                    print(f"          Detected `danlin-hud` online at {pc_alive_no_ssh[1]}, but SSH port 22 is closed.")
-                _print_windows_pc_setup_instructions(m.user, pub_key_str)
+                pc_needs_windows_sshd = True
             continue
 
         if check_batch_ssh(m.user, ep.host, m.port):
-            print(f"  [OK]    {m.id:<10} passwordless SSH works ({m.user}@{ep.host} via {ep.transport.upper()})")
+            print(f"  [OK]    {m.id:<10} passwordless SSH verified ({m.user}@{ep.host} via {ep.transport.upper()})")
         elif interactive_ssh_copy and sys.stdin.isatty():
             ok = copy_ssh_key_interactive(
                 m.user, ep.host, key_file, m.port, is_windows=(m.os == "windows")
@@ -781,38 +778,42 @@ def run_bootstrap(
         else:
             print(f"  [AUTH]  {m.id:<10} needs SSH key on {m.user}@{ep.host}")
 
-        if cleanup_duplicate_tailscale and m.id.startswith("spark") and check_batch_ssh(m.user, ep.host, m.port):
-            cleanup_duplicate_spark_tailscale_if_present(m.user, ep.host)
-
-    # 3. Ensure rclone is installed (downloads standalone binary to ~/.local/bin/rclone if Homebrew is absent!)
-    print("\n[3/5] Ensuring `rclone` is installed on this Mac (no Homebrew required)...")
+    # 3. Ensure rclone is installed via GitHub Releases + curl (no Homebrew, no Cloudflare 403!)
+    print("\n[3/5] Installing standalone `rclone` on this Mac (from GitHub Releases)...")
     rclone_path = ensure_rclone_installed_macos()
-    print(f"  rclone ready: {rclone_path or 'not installed'}")
+    if not rclone_path:
+        print("  [ERROR] Could not install `rclone` automatically!")
 
     # 4. Install across all harnesses + ~/.ssh/config
     print("\n[4/5] Updating Antigravity, Claude, Codex, Kimi, DSH & ~/.ssh/config...")
     install_all_harnesses()
     ssh_cfg = sync_ssh_config(cfg, ts_self)
-    print(f"  Updated {ssh_cfg} (hosts: spark01, spark03, spark04, pc)")
+    print(f"  Updated {ssh_cfg}")
 
-    # 5. Mount ~/RemoteComputers/
-    print("\n[5/5] Mounting online computers under ~/RemoteComputers/...")
+    # 5. Mount ~/RemoteComputers/ and verify live folder contents!
+    print("\n[5/5] Mounting computers into ~/RemoteComputers/ & verifying live folder contents...")
     summary = mount_all_machines(cfg, FleetTransport(cfg, ts_self), base_dir=target_mount_dir)
+    mounted_count = 0
     for r in summary["results"]:
         mid = r.get("machine_id", "?")
         if r.get("skipped"):
             continue
         if r.get("ok"):
-            print(f"  [MOUNTED] {mid:<10} -> {r.get('mount_point')}")
+            mounted_count += 1
+            samples = ", ".join(r.get("sample_entries") or [])
+            cnt = r.get("visible_count", 0)
+            print(f"  [MOUNTED] {mid:<10} -> {r.get('mount_point')} ({cnt} items visible: {samples})")
         else:
-            print(f"  [INFO]    {mid:<10} -> {r.get('error')}")
+            print(f"  [SKIP]    {mid:<10} -> {r.get('error')}")
 
     if platform.system().lower() == "darwin":
         plist = install_macos_launch_agent(base_dir=target_mount_dir)
         print(f"\nUpdated macOS login auto-mounter: {plist}")
 
-    print("\n=== All Set! ===")
-    print(f"1. Open `{target_mount_dir}` in Finder (`open ~/RemoteComputers`) and drag it to your Finder Sidebar.")
-    print("2. In your Tailscale web console (`console.tailscale.com/admin/machines`), click `... -> Remove` on `spark01-1` and `spark03-1` if still listed as logged-out.")
-    print("3. Quit (Cmd+Q) and reopen Antigravity, Claude, Codex, and Kimi once — then pick `RemoteComputers/spark01`, `spark03`, `spark04`, or `pc`!")
+    if pc_needs_windows_sshd:
+        _print_windows_pc_final_banner(pc_default_lan, effective_pc_user, pub_key_str)
+
+    print(f"\n=== Summary: {mounted_count} remote computer(s) live-mounted in {target_mount_dir} ===")
+    if platform.system().lower() == "darwin" and mounted_count > 0:
+        subprocess.run(["open", str(target_mount_dir)], check=False)
     return 0
