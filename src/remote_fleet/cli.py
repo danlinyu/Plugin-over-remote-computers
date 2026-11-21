@@ -1020,28 +1020,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_boot = sub.add_parser(
         "bootstrap",
-        help="Turnkey Home LAN & Tailscale discovery, SSH key setup, Spark Tailscale fix, and Mac harness setup",
+        help="Turnkey Home LAN & Tailscale discovery, duplicate Tailscale cleanup, standalone rclone download, and Mac setup",
     )
-    p_boot.add_argument("--user", default="danlinyu", help="Default SSH username on remote machines (default: danlinyu)")
+    p_boot.add_argument("--user", default="danlinyu", help="SSH username on Sparks (default: danlinyu)")
+    p_boot.add_argument("--pc-user", default="", help="Optional Windows SSH username on `danlin-hud` if different from --user")
     p_boot.add_argument(
         "--host",
         action="append",
         default=[],
-        help="Optional explicit override `id=hostname_or_ip` (repeatable, e.g. --host pc=192.168.1.20)",
+        help="Optional explicit override `id=hostname_or_ip` (repeatable, e.g. --host pc=192.168.68.50)",
     )
     p_boot.add_argument(
         "--fix-spark-tailscale",
         action="store_true",
-        help="Install/enable system-level tailscaled.service on Sparks and move shadowing ~/.local/bin/tailscale",
+        help="Deprecated no-op flag kept for CLI compatibility",
+    )
+    p_boot.add_argument(
+        "--no-cleanup-tailscale",
+        action="store_true",
+        help="Skip removing duplicate second Tailscale (`spark01-1` / `spark03-1`)",
     )
     p_boot.add_argument("--no-ssh-copy", action="store_true", help="Skip interactive ssh-copy-id prompts")
     p_boot.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
     p_boot.set_defaults(
         func=lambda a: run_bootstrap(
             ssh_user=a.user,
+            pc_user=a.pc_user,
             extra_hosts=a.host,
             interactive_ssh_copy=not a.no_ssh_copy,
             fix_spark_tailscale=a.fix_spark_tailscale,
+            cleanup_duplicate_tailscale=not a.no_cleanup_tailscale,
             mount_dir=Path(a.dir) if a.dir else None,
         )
     )

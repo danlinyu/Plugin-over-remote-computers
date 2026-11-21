@@ -121,6 +121,27 @@ def sync_ssh_config(
     return target
 
 
+def find_rclone_binary() -> Optional[str]:
+    found = shutil.which("rclone")
+    if found:
+        return found
+    for cand in (
+        Path.home() / ".local" / "bin" / "rclone",
+        Path("/opt/homebrew/bin/rclone"),
+        Path("/usr/local/bin/rclone"),
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def _ssh_agent_has_keys() -> bool:
+    if not os.environ.get("SSH_AUTH_SOCK") or not shutil.which("ssh-add"):
+        return False
+    proc = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True, timeout=2, check=False)
+    return proc.returncode == 0 and "no identities" not in proc.stdout.lower()
+
+
 def _detect_default_ssh_key(machine: MachineConfig) -> Optional[str]:
     if machine.ssh_identity_file:
         expanded = os.path.expanduser(machine.ssh_identity_file)
@@ -172,7 +193,7 @@ def mount_single_machine_root(
         }
 
     is_macos = platform.system().lower() == "darwin"
-    rclone_bin = shutil.which("rclone")
+    rclone_bin = find_rclone_binary()
     sshfs_bin = shutil.which("sshfs")
 
     # Prefer `rclone nfsmount` on macOS: native macOS user-space NFSv3, zero macFUSE kernel extensions!
@@ -182,11 +203,11 @@ def mount_single_machine_root(
             sftp_opts.append(f"user={machine.user}")
         if machine.port and machine.port != 22:
             sftp_opts.append(f"port={machine.port}")
-        if os.environ.get("SSH_AUTH_SOCK"):
-            sftp_opts.append("key_use_agent=true")
         key_path = _detect_default_ssh_key(machine)
         if key_path:
             sftp_opts.append(f"key_file={key_path}")
+        elif _ssh_agent_has_keys():
+            sftp_opts.append("key_use_agent=true")
 
         # Windows OpenSSH SFTP paths start with `/C:/Users/...` when absolute
         rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
@@ -220,6 +241,23 @@ def mount_single_machine_root(
                 "remote_root": remote_home,
                 "endpoint": ep.to_dict(),
             }
+        # If key_file had a passphrase and ssh-agent has keys, retry with key_use_agent=true
+        if key_path and _ssh_agent_has_keys():
+            retry_opts = [o for o in sftp_opts if not o.startswith("key_file=")] + ["key_use_agent=true"]
+            cmd[2] = f":sftp,{','.join(retry_opts)}:{rclone_path}"
+            proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
+            if proc2.returncode == 0:
+                reg = load_mounts_registry()
+                reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+                save_mounts_registry(reg)
+                return {
+                    "ok": True,
+                    "machine_id": machine.id,
+                    "engine": f"rclone-{subcmd}",
+                    "mount_point": str(mount_point),
+                    "remote_root": remote_home,
+                    "endpoint": ep.to_dict(),
+                }
         err_msg = proc.stderr.strip() or proc.stdout.strip()
         if not sshfs_bin:
             return {"ok": False, "machine_id": machine.id, "error": f"rclone {subcmd} failed: {err_msg}"}
@@ -326,7 +364,7 @@ def install_macos_launch_agent(
         ],
         "EnvironmentVariables": {
             "PYTHONPATH": repo_src,
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,
         "StandardOutPath": str(home / ".cache" / "remote-fleet" / "automount.log"),
