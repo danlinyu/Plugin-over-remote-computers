@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import os
 from pathlib import Path
 import platform
 import plistlib
 import re
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 from remote_fleet.config import (
     FleetConfig,
@@ -24,7 +35,13 @@ from remote_fleet.config import (
     load_mounts_registry,
     save_mounts_registry,
 )
-from remote_fleet.mount import get_repo_root, is_mounted, unmount_sshfs
+from remote_fleet.mount import (
+    get_macos_mount_table,
+    get_repo_root,
+    is_mounted,
+    safe_lexical_resolve,
+    unmount_sshfs,
+)
 from remote_fleet.transport import FleetTransport
 
 
@@ -187,9 +204,29 @@ def build_rclone_sftp_ssh_command(machine: MachineConfig, host: str) -> str:
     return " ".join(f'"{p}"' if " " in p else p for p in parts)
 
 
+_RCLONE_FLAGS_CACHE: Dict[str, str] = {}
+
+
+def _rclone_supports_flag(rclone_bin: str, flag: str) -> bool:
+    """Check once per process whether `rclone_bin` supports a global CLI flag (e.g. `--max-connections`)."""
+    if rclone_bin not in _RCLONE_FLAGS_CACHE:
+        try:
+            proc = subprocess.run(
+                [rclone_bin, "help", "flags"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            _RCLONE_FLAGS_CACHE[rclone_bin] = proc.stdout if proc.returncode == 0 else ""
+        except (subprocess.TimeoutExpired, OSError):
+            _RCLONE_FLAGS_CACHE[rclone_bin] = ""
+    return flag in _RCLONE_FLAGS_CACHE[rclone_bin]
+
+
 def _cleanup_unmounted_empty_dir(mount_point: Path) -> None:
     """Remove an unmounted folder that only contains `.DS_Store` or nothing so Finder never shows dead empty folders."""
-    if not mount_point.is_dir() or is_mounted(mount_point):
+    if is_mounted(mount_point) or not mount_point.is_dir():
         return
     try:
         items = [p for p in mount_point.iterdir() if p.name != ".DS_Store"]
@@ -287,6 +324,130 @@ def _select_verified_rclone_sftp_flags(
     return rclone_path, None, "; ".join(errors)
 
 
+def _daemons_dir() -> Path:
+    d = Path.home() / ".cache" / "remote-fleet" / "daemons"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _allocate_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _wait_tcp_ready(port: int, proc: subprocess.Popen[Any], timeout_sec: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def _probe_mount_health(
+    mount_point: Path,
+    log_stem: str,
+    timeout_sec: float = 4.0,
+    expected_host: str = "",
+) -> str:
+    """Uncached NFS liveness probe using a random nonexistent filename (`ENOENT` = healthy).
+
+    Never rely on `os.listdir(mount_point)` or call `mount_point.is_dir()` on the main thread:
+    macOS NFS caches directory listings even after the server or SSH socket dies, and `stat` on a
+    legacy hard mount blocks without a thread deadline. Checking `is_mounted` (`MNT_NOWAIT`) +
+    daemon PID first, then `os.lstat('.fleet-probe-<uuid>')` on a daemon thread, forces a live LOOKUP RPC safely.
+    """
+    if not is_mounted(mount_point):
+        return "gone"
+
+    if platform.system().lower() == "darwin":
+        meta_file = _daemons_dir() / f"{log_stem}.json"
+        if not meta_file.is_file():
+            # Mounted by legacy `rclone nfsmount` (hard mount) — upgrade cleanly to soft `serve nfs`!
+            return "legacy_nfsmount"
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            if expected_host and meta.get("host") and meta.get("host") != expected_host:
+                return "endpoint_changed"
+            pid = int(meta.get("pid") or 0)
+            if pid <= 0:
+                return "dead_daemon"
+            os.kill(pid, 0)
+        except Exception:
+            return "dead_daemon"
+
+    probe_target = str(mount_point / f".fleet-probe-{uuid.uuid4().hex[:12]}")
+    outcome: Dict[str, int] = {}
+
+    def _stat_worker() -> None:
+        try:
+            os.lstat(probe_target)
+            outcome["errno"] = 0
+        except OSError as exc:
+            outcome["errno"] = int(exc.errno or errno.EIO)
+
+    t = threading.Thread(target=_stat_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive() or "errno" not in outcome:
+        return "unresponsive"
+
+    code = outcome["errno"]
+    if code in (0, errno.ENOENT):
+        return "healthy"
+    dead_codes = {
+        errno.ETIMEDOUT,
+        errno.ESTALE,
+        errno.EIO,
+        errno.ENOTCONN,
+        errno.ECONNREFUSED,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+        errno.ENXIO,
+    }
+    return "unresponsive" if code in dead_codes else "healthy"
+
+
+def _teardown_mount_and_daemon(mount_point: Path, log_stem: str) -> None:
+    """Unmount FIRST, then terminate the backing `rclone serve nfs` daemon (never kill before unmount!)."""
+    if is_mounted(mount_point):
+        unmount_sshfs(mount_point)
+
+    meta_file = _daemons_dir() / f"{log_stem}.json"
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            pid = int(meta.get("pid") or 0)
+            if pid > 0:
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            meta_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _safe_sample_entries(mount_point: Path, timeout_sec: float = 2.5) -> List[str]:
+    out: Dict[str, List[str]] = {}
+
+    def _list_worker() -> None:
+        try:
+            out["items"] = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
+        except OSError:
+            out["items"] = []
+
+    t = threading.Thread(target=_list_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    return out.get("items") or []
+
+
 def _mount_sftp_directory(
     machine: MachineConfig,
     ep_dict: Dict[str, Any],
@@ -296,28 +457,31 @@ def _mount_sftp_directory(
     vol_label: str,
     log_stem: str,
     allow_empty_fallback: bool = True,
+    preverified_sftp: Optional[Tuple[str, List[str]]] = None,
 ) -> Dict[str, Any]:
-    """Mount a single remote folder or drive (`remote_target`) onto `mount_point` and verify live entries."""
-    mount_point = mount_point.resolve()
+    """Mount a single remote folder or drive (`remote_target`) onto `mount_point` with soft-NFS self-healing."""
+    _ = vol_label
+    mount_point = safe_lexical_resolve(mount_point)
 
-    if mount_point.is_dir() and is_mounted(mount_point):
-        try:
-            visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
-            reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
-            save_mounts_registry(reg)
-            return {
-                "ok": True,
-                "machine_id": machine.id,
-                "mount_point": str(mount_point),
-                "remote_root": remote_target,
-                "already_mounted": True,
-                "visible_count": len(visible),
-                "sample_entries": visible[:6],
-                "endpoint": ep_dict,
-            }
-        except OSError:
-            unmount_sshfs(mount_point)
+    health = _probe_mount_health(mount_point, log_stem, timeout_sec=4.0, expected_host=host)
+    if health == "healthy":
+        visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
+        reg = load_mounts_registry()
+        reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+        save_mounts_registry(reg)
+        return {
+            "ok": True,
+            "machine_id": machine.id,
+            "mount_point": str(mount_point),
+            "remote_root": remote_target,
+            "already_mounted": True,
+            "visible_count": len(visible),
+            "sample_entries": visible[:6],
+            "endpoint": ep_dict,
+        }
+
+    # Tear down any dead, wedged, or legacy hard `nfsmount` cleanly BEFORE remounting
+    _teardown_mount_and_daemon(mount_point, log_stem)
 
     is_macos = platform.system().lower() == "darwin"
     rclone_bin = find_rclone_binary()
@@ -338,19 +502,27 @@ def _mount_sftp_directory(
     except OSError:
         pass
 
-    if rclone_bin and (is_macos or not sshfs_bin):
+    cache_root = Path.home() / ".cache" / "remote-fleet"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. macOS preferred path: `rclone serve nfs` on loopback + `/sbin/mount -t nfs` with soft,intr,nolocks,locallocks,nfc
+    if rclone_bin and is_macos and os.path.exists("/sbin/mount"):
         initial_rclone_path = (
             f"/{remote_target}"
             if (len(remote_target) >= 2 and remote_target[1] == ":")
             else remote_target
         )
-        verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
-            rclone_bin,
-            machine,
-            host,
-            initial_rclone_path,
-            allow_empty_fallback=allow_empty_fallback,
-        )
+        if preverified_sftp is not None:
+            verified_rclone_path, sftp_flags = preverified_sftp[0], list(preverified_sftp[1])
+            preflight_err = ""
+        else:
+            verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
+                rclone_bin,
+                machine,
+                host,
+                initial_rclone_path,
+                allow_empty_fallback=allow_empty_fallback,
+            )
         if not sftp_flags:
             _cleanup_unmounted_empty_dir(mount_point)
             return {
@@ -359,75 +531,146 @@ def _mount_sftp_directory(
                 "error": f"rclone SFTP preflight failed on {host} ({remote_target}): {preflight_err}",
             }
 
-        subcmd = "nfsmount" if is_macos else "mount"
-        log_dir = Path.home() / ".cache" / "remote-fleet"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"rclone-{log_stem}.log"
+        extra_conn_flags = (
+            ["--max-connections", "2"] if _rclone_supports_flag(rclone_bin, "--max-connections") else []
+        )
 
-        cmd = [
-            rclone_bin,
-            subcmd,
-            f":sftp:{verified_rclone_path}",
-            str(mount_point),
-            *sftp_flags,
-            "--allow-non-empty",
-            "--vfs-cache-mode",
-            "writes",
-            "--vfs-fast-fingerprint",
-            "--poll-interval",
-            "0",
-            "--dir-cache-time",
-            "5s",
-            "--volname",
-            vol_label,
-        ]
+        for _attempt in range(2 if preverified_sftp is not None else 1):
+            nfs_port = _allocate_loopback_port()
+            nfs_cache_dir = cache_root / "nfs-handles" / log_stem
+            vfs_cache_dir = cache_root / "vfs-cache" / log_stem
+            nfs_cache_dir.mkdir(parents=True, exist_ok=True)
+            vfs_cache_dir.mkdir(parents=True, exist_ok=True)
+            log_file = cache_root / f"rclone-{log_stem}.log"
 
-        with open(log_file, "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=lf,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
+            serve_cmd = [
+                rclone_bin,
+                "serve",
+                "nfs",
+                f":sftp:{verified_rclone_path}",
+                *sftp_flags,
+                "--addr",
+                f"127.0.0.1:{nfs_port}",
+                "--nfs-cache-type",
+                "disk",
+                "--nfs-cache-dir",
+                str(nfs_cache_dir),
+                "--cache-dir",
+                str(vfs_cache_dir),
+                "--vfs-cache-mode",
+                "writes",
+                "--vfs-fast-fingerprint",
+                "--dir-cache-time",
+                "45s",
+                "--poll-interval",
+                "0",
+                "--sftp-idle-timeout",
+                "4h",
+                "--contimeout",
+                "8s",
+                "--timeout",
+                "20s",
+                "--low-level-retries",
+                "2",
+                "--retries",
+                "2",
+                "--checkers",
+                "2",
+                "--transfers",
+                "2",
+                *extra_conn_flags,
+            ]
 
-        deadline = time.monotonic() + 12.0
-        mounted_ok = False
-        while time.monotonic() < deadline:
-            if is_mounted(mount_point):
-                mounted_ok = True
-                break
-            if proc.poll() is not None:
-                break
-            time.sleep(0.3)
+            with open(log_file, "w", encoding="utf-8") as lf:
+                proc = subprocess.Popen(
+                    serve_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=lf,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
 
-        if mounted_ok:
-            visible = []
-            try:
-                visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
-            except OSError:
-                pass
-            reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
-            save_mounts_registry(reg)
-            return {
-                "ok": True,
-                "machine_id": machine.id,
-                "engine": f"rclone-{subcmd}",
-                "mount_point": str(mount_point),
-                "remote_root": remote_target,
-                "visible_count": len(visible),
-                "sample_entries": visible[:6],
-                "endpoint": ep_dict,
-            }
+            mounted_ok = False
+            mount_err_detail = ""
+            if _wait_tcp_ready(nfs_port, proc, timeout_sec=10.0):
+                # Soft, interruptible, local-lock, NFC-normalized NFSv3 mount — never wedges Finder or pops hard-mount dialogs!
+                nfs_opts = (
+                    f"port={nfs_port},mountport={nfs_port},tcp,"
+                    "soft,intr,timeo=600,retrans=2,"
+                    "nolocks,locallocks,nfc,rsize=131072,wsize=131072"
+                )
+                try:
+                    mnt_proc = subprocess.run(
+                        ["/sbin/mount", "-t", "nfs", "-o", nfs_opts, "localhost:/", str(mount_point)],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    if mnt_proc.returncode == 0 and is_mounted(mount_point):
+                        mounted_ok = True
+                    else:
+                        mount_err_detail = mnt_proc.stderr.strip() or mnt_proc.stdout.strip()
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    mount_err_detail = str(exc)
 
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            if mounted_ok:
+                meta_file = _daemons_dir() / f"{log_stem}.json"
+                meta_file.write_text(
+                    json.dumps(
+                        {
+                            "pid": proc.pid,
+                            "port": nfs_port,
+                            "host": host,
+                            "machine_id": machine.id,
+                            "mount_point": str(mount_point),
+                            "remote_target": remote_target,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                if _probe_mount_health(mount_point, log_stem, timeout_sec=5.0, expected_host=host) == "healthy":
+                    visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
+                    reg = load_mounts_registry()
+                    reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+                    save_mounts_registry(reg)
+                    return {
+                        "ok": True,
+                        "machine_id": machine.id,
+                        "engine": "rclone-serve-nfs-soft",
+                        "mount_point": str(mount_point),
+                        "remote_root": remote_target,
+                        "visible_count": len(visible),
+                        "sample_entries": visible[:6],
+                        "endpoint": ep_dict,
+                        "verified_sftp_flags": sftp_flags,
+                        "verified_rclone_path": verified_rclone_path,
+                    }
+                _teardown_mount_and_daemon(mount_point, log_stem)
+
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+            if _attempt == 0 and preverified_sftp is not None:
+                verified_rclone_path, fallback_flags, preflight_err = _select_verified_rclone_sftp_flags(
+                    rclone_bin,
+                    machine,
+                    host,
+                    initial_rclone_path,
+                    allow_empty_fallback=allow_empty_fallback,
+                )
+                if not fallback_flags:
+                    mount_err_detail = preflight_err
+                    break
+                sftp_flags = fallback_flags
+
         log_tail = ""
+        log_file = cache_root / f"rclone-{log_stem}.log"
         if log_file.is_file():
             log_tail = "\n".join(log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-8:])
         if not sshfs_bin:
@@ -435,9 +678,62 @@ def _mount_sftp_directory(
             return {
                 "ok": False,
                 "machine_id": machine.id,
-                "error": f"rclone {subcmd} did not mount {mount_point}: {log_tail or 'timeout'}",
+                "error": f"rclone serve nfs mount failed on {mount_point}: {mount_err_detail or log_tail or 'timeout'}",
             }
 
+    # 2. Linux / non-macOS rclone FUSE fallback
+    if rclone_bin and not is_macos and not sshfs_bin:
+        initial_rclone_path = (
+            f"/{remote_target}"
+            if (len(remote_target) >= 2 and remote_target[1] == ":")
+            else remote_target
+        )
+        verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
+            rclone_bin, machine, host, initial_rclone_path, allow_empty_fallback=allow_empty_fallback
+        )
+        if sftp_flags:
+            log_file = cache_root / f"rclone-{log_stem}.log"
+            cmd = [
+                rclone_bin,
+                "mount",
+                f":sftp:{verified_rclone_path}",
+                str(mount_point),
+                *sftp_flags,
+                "--allow-non-empty",
+                "--vfs-cache-mode",
+                "writes",
+                "--vfs-fast-fingerprint",
+                "--poll-interval",
+                "0",
+                "--dir-cache-time",
+                "30s",
+            ]
+            with open(log_file, "w", encoding="utf-8") as lf:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True
+                )
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if is_mounted(mount_point):
+                    visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
+                    reg = load_mounts_registry()
+                    reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+                    save_mounts_registry(reg)
+                    return {
+                        "ok": True,
+                        "machine_id": machine.id,
+                        "engine": "rclone-mount",
+                        "mount_point": str(mount_point),
+                        "remote_root": remote_target,
+                        "visible_count": len(visible),
+                        "sample_entries": visible[:6],
+                        "endpoint": ep_dict,
+                    }
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.25)
+
+    # 3. `sshfs` fallback
     if sshfs_bin:
         target_spec = (
             f"{machine.user}@{host}:{remote_target}"
@@ -466,7 +762,7 @@ def _mount_sftp_directory(
                 "error": f"sshfs failed: {exc}",
             }
         if proc2.returncode == 0 and is_mounted(mount_point):
-            visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
+            visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
             reg = load_mounts_registry()
             reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
             save_mounts_registry(reg)
@@ -500,7 +796,7 @@ def _mount_windows_all_drives(
 ) -> Dict[str, Any]:
     """Mount EVERY drive (`C:/`, `D:/`, `E:/`, ...) on a Windows PC under `~/RemoteComputers/<id>/<Drive>`
     plus a `Home` shortcut pointing straight to `C/Users/<user>`."""
-    container_dir = container_dir.resolve()
+    container_dir = safe_lexical_resolve(container_dir)
 
     # Transition cleanly if `container_dir` (`~/RemoteComputers/pc`) was previously mounted directly to `C:\Users\<user>`
     if is_mounted(container_dir):
@@ -543,9 +839,17 @@ def _mount_windows_all_drives(
     drive_errors: List[str] = []
     total_visible = 0
     any_already = True
+    cached_sftp_flags: Optional[List[str]] = None
+    use_leading_slash = True
 
     for letter in drive_letters:
-        drive_mp = (container_dir / letter).resolve()
+        drive_mp = safe_lexical_resolve(container_dir / letter)
+        extra_kwargs: Dict[str, Any] = {}
+        if cached_sftp_flags is not None:
+            cand_rclone_path = f"/{letter}:/" if use_leading_slash else f"{letter}:/"
+            extra_kwargs["preverified_sftp"] = (cand_rclone_path, cached_sftp_flags)
+            time.sleep(0.15)
+
         res = _mount_sftp_directory(
             machine=machine,
             ep_dict=ep_dict,
@@ -555,12 +859,17 @@ def _mount_windows_all_drives(
             vol_label=f"Fleet-{machine.id}-{letter}",
             log_stem=f"{machine.id}-{letter}",
             allow_empty_fallback=False,
+            **extra_kwargs,
         )
         if res.get("ok"):
             mounted_drives.append(f"{letter}:/")
             total_visible += int(res.get("visible_count") or 0)
             if not res.get("already_mounted"):
                 any_already = False
+                if cached_sftp_flags is None and res.get("verified_sftp_flags"):
+                    cached_sftp_flags = list(res["verified_sftp_flags"])
+                    vpath = str(res.get("verified_rclone_path") or f"/{letter}:/")
+                    use_leading_slash = vpath.startswith("/")
         else:
             drive_errors.append(f"{letter}: {res.get('error')}")
 
@@ -584,10 +893,11 @@ def _mount_windows_all_drives(
                 pass
 
     # Clean up any stale unmounted empty drive directories from previously unplugged USB drives
+    mounted_names = {d[0] for d in mounted_drives}
     for child in list(container_dir.iterdir()):
-        if child.name == "Home" or child.is_symlink():
+        if child.name == "Home" or child.name in mounted_names:
             continue
-        if child.is_dir() and child.name not in [d[0] for d in mounted_drives]:
+        if not is_mounted(child) and not child.is_symlink() and child.is_dir():
             _cleanup_unmounted_empty_dir(child)
 
     if not mounted_drives:
@@ -605,7 +915,7 @@ def _mount_windows_all_drives(
     return {
         "ok": True,
         "machine_id": machine.id,
-        "engine": "rclone-nfsmount-drives" if platform.system().lower() == "darwin" else "rclone-mount-drives",
+        "engine": "rclone-serve-nfs-drives" if platform.system().lower() == "darwin" else "rclone-mount-drives",
         "mount_point": str(container_dir),
         "remote_root": ", ".join(mounted_drives),
         "drives": mounted_drives,
@@ -632,7 +942,7 @@ def _mount_posix_container(
     `"<name>" can't be opened because the original item can't be found.` (deadlocking Electron sheet modals!).
     Keeping `~/RemoteComputers/<id>` as an unmounted, permanent APFS folder makes Sidebar clicks 100% instant & immortal.
     """
-    container_dir = container_dir.resolve()
+    container_dir = safe_lexical_resolve(container_dir)
 
     # Transition cleanly if `container_dir` (`~/RemoteComputers/spark01`) was previously mounted directly
     if is_mounted(container_dir):
@@ -655,9 +965,9 @@ def _mount_posix_container(
     }
     save_mounts_registry(reg)
 
-    home_mp = (container_dir / "Home").resolve()
+    home_mp = safe_lexical_resolve(container_dir / "Home")
     # If `Home` was previously a symlink, remove the symlink before creating mount directory
-    if home_mp.is_symlink():
+    if not is_mounted(home_mp) and home_mp.is_symlink():
         try:
             home_mp.unlink()
         except OSError:
@@ -702,7 +1012,7 @@ def _mount_posix_container(
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ext_str.strip("/")).strip("-")
         if not slug or slug in ("Home", "Projects", "Workspace"):
             continue
-        ext_mp = (container_dir / slug).resolve()
+        ext_mp = safe_lexical_resolve(container_dir / slug)
         ext_res = _mount_sftp_directory(
             machine=machine,
             ep_dict=ep_dict,
@@ -903,7 +1213,11 @@ if changedAnyFile {
 '''
 
 
-def repair_macos_sidebar_favorites(base_dir: Path, machine_ids: List[str]) -> Dict[str, Any]:
+def repair_macos_sidebar_favorites(
+    base_dir: Path,
+    machine_ids: List[str],
+    dismiss_stuck_panels: bool = True,
+) -> Dict[str, Any]:
     """Repair stale macOS Finder & `NSOpenPanel` Sidebar Favorites (`FavoriteItems.sfl4` / `.sfl3`)
     so `pc`, `spark01`, `spark03`, `spark04` never trigger `'original item can't be found'` in Antigravity/Claude/Codex."""
     if platform.system().lower() != "darwin" or not machine_ids:
@@ -913,16 +1227,17 @@ def repair_macos_sidebar_favorites(base_dir: Path, machine_ids: List[str]) -> Di
     if not os.path.exists(swift_bin):
         return {"ok": False, "repaired": False, "error": "swift not found"}
 
-    # Always dismiss any stuck `openAndSavePanelService` sheet modal first if one is hung
-    try:
-        subprocess.run(
-            ["killall", "com.apple.appkit.xpc.openAndSavePanelService"],
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+    # Only dismiss hung `openAndSavePanelService` upfront during interactive `fleet mount-all` (never close an open dialog every 30s!)
+    if dismiss_stuck_panels:
+        try:
+            subprocess.run(
+                ["killall", "com.apple.appkit.xpc.openAndSavePanelService"],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
     cache_dir = Path.home() / ".cache" / "remote-fleet"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -978,13 +1293,36 @@ def repair_macos_sidebar_favorites(base_dir: Path, machine_ids: List[str]) -> Di
     return {"ok": proc.returncode == 0, "repaired": repaired, "stdout": proc.stdout.strip()}
 
 
+def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected_host: str) -> bool:
+    """Fast zero-SSH check for 30s LaunchAgent ticks: returns True iff `machine_id` already has
+    active soft-NFS daemons recorded and every one passes uncached `.fleet-probe-<uuid>` health on `expected_host`."""
+    if platform.system().lower() != "darwin" or is_mounted(container_dir):
+        return False
+    daemons = _daemons_dir()
+    meta_files = sorted(daemons.glob(f"{machine_id}-*.json"))
+    if not meta_files:
+        return False
+    for mf in meta_files:
+        try:
+            meta = json.loads(mf.read_text(encoding="utf-8"))
+            mp_str = str(meta.get("mount_point") or "")
+            if not mp_str:
+                return False
+        except Exception:
+            return False
+        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=4.0, expected_host=expected_host) != "healthy":
+            return False
+    return True
+
+
 def mount_single_machine_root(
     transport: FleetTransport,
     machine: MachineConfig,
     base_dir: Path,
+    from_launchd: bool = False,
 ) -> Dict[str, Any]:
     """Mount a remote computer inside permanent local APFS container `~/RemoteComputers/<machine.id>/`."""
-    mount_point = (base_dir / machine.id).resolve()
+    mount_point = safe_lexical_resolve(base_dir / machine.id)
 
     ep = transport.resolve_endpoint(machine)
     if ep.transport == "local":
@@ -998,6 +1336,17 @@ def mount_single_machine_root(
 
     if not ep.reachable:
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
+
+    # On 30s background ticks, if every recorded mount for `machine.id` is already healthy on `ep.host`,
+    # skip spawning SSH / PowerShell `ping` completely!
+    if from_launchd and _all_recorded_daemons_healthy(machine.id, mount_point, ep.host):
+        return {
+            "ok": True,
+            "machine_id": machine.id,
+            "mount_point": str(mount_point),
+            "already_mounted": True,
+            "endpoint": ep.to_dict(),
+        }
 
     ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
     if not ping.get("ok"):
@@ -1014,81 +1363,168 @@ def mount_single_machine_root(
     return _mount_posix_container(machine, ep.to_dict(), ep.host, ping, mount_point)
 
 
+def _cleanup_legacy_nfsmounts(root: Path) -> None:
+    """One-time seamless migration: detach any legacy hard-mount `rclone nfsmount` mounts FIRST
+    (via `MNT_NOWAIT` `/sbin/mount` even if `rclone nfsmount` already crashed!), then terminate leftover `nfsmount` daemons."""
+    if platform.system().lower() != "darwin":
+        return
+
+    root_str = str(safe_lexical_resolve(root))
+    table = get_macos_mount_table() or {}
+    # Unmount deepest paths first if any legacy non-soft NFS mounts exist under `~/RemoteComputers`
+    for mp_str in sorted(table.keys(), key=len, reverse=True):
+        if mp_str == root_str or mp_str.startswith(root_str + "/"):
+            opts_lower = table[mp_str].lower()
+            if "nfs" in opts_lower and "soft" not in opts_lower:
+                unmount_sshfs(Path(mp_str))
+
+    if not shutil.which("pgrep"):
+        return
+    try:
+        chk = subprocess.run(
+            ["pgrep", "-f", "rclone.*nfsmount"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if chk.returncode != 0 or not chk.stdout.strip():
+            return
+    except (subprocess.TimeoutExpired, OSError):
+        return
+
+    if shutil.which("pkill"):
+        try:
+            subprocess.run(["pkill", "-f", "rclone.*nfsmount"], capture_output=True, timeout=4, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
 def mount_all_machines(
     config: FleetConfig,
     transport: FleetTransport,
     base_dir: Optional[Path] = None,
+    from_launchd: bool = False,
 ) -> Dict[str, Any]:
-    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` and repair macOS Sidebar Favorites."""
-    root = (base_dir or (Path.home() / "RemoteComputers")).expanduser().resolve()
+    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` with mutex & self-healing."""
+    root = safe_lexical_resolve(base_dir or (Path.home() / "RemoteComputers"))
     root.mkdir(parents=True, exist_ok=True)
-    transport.resolve_all_endpoints(config.machines, force_refresh=True)
 
-    results = []
-    remote_ids: List[str] = []
-    for m in config.machines:
-        res = mount_single_machine_root(transport, m, root)
-        results.append(res)
-        if not res.get("skipped"):
-            remote_ids.append(m.id)
+    lock_dir = Path.home() / ".cache" / "remote-fleet"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file_path = lock_dir / "mount-all.lock"
+    lock_fp = open(lock_file_path, "w", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if from_launchd else 0)
+            try:
+                fcntl.flock(lock_fp.fileno(), flags)
+            except OSError:
+                return {"base_dir": str(root), "results": [], "skipped_locked": True}
 
-    sidebar_info: Dict[str, Any] = {"repaired": False}
-    if platform.system().lower() == "darwin" and remote_ids:
-        sidebar_info = repair_macos_sidebar_favorites(root, remote_ids)
+        _cleanup_legacy_nfsmounts(root)
+        transport.resolve_all_endpoints(config.machines, force_refresh=True)
 
-    newly_mounted = any(
-        r.get("ok") and not r.get("already_mounted") and not r.get("skipped")
-        for r in results
-    )
+        results = []
+        remote_ids: List[str] = []
+        for m in config.machines:
+            res = mount_single_machine_root(transport, m, root, from_launchd=from_launchd)
+            results.append(res)
+            if not res.get("skipped"):
+                remote_ids.append(m.id)
 
-    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) when new mounts appear
-    if (
-        platform.system().lower() == "darwin"
-        and shutil.which("osascript")
-        and newly_mounted
-        and not sidebar_info.get("repaired")
-    ):
-        refresh_targets = [root]
-        for mid in remote_ids:
-            cand = root / mid
-            if cand.is_dir():
-                refresh_targets.append(cand)
-        script_lines = [
-            f'tell application "Finder" to if exists (POSIX file "{p}" as alias) then update (POSIX file "{p}" as alias)'
-            for p in refresh_targets
-        ]
-        try:
-            subprocess.run(
-                ["osascript", "-e", "\n".join(script_lines)],
-                capture_output=True,
-                timeout=4,
-                check=False,
+        newly_mounted = any(
+            r.get("ok") and not r.get("already_mounted") and not r.get("skipped")
+            for r in results
+        )
+
+        sidebar_info: Dict[str, Any] = {"repaired": False}
+        if platform.system().lower() == "darwin" and remote_ids and (not from_launchd or newly_mounted):
+            sidebar_info = repair_macos_sidebar_favorites(
+                root,
+                remote_ids,
+                dismiss_stuck_panels=not from_launchd,
             )
-        except (subprocess.TimeoutExpired, OSError):
-            pass
 
-    return {
-        "base_dir": str(root),
-        "results": results,
-        "sidebar_repaired": bool(sidebar_info.get("repaired")),
-    }
+        # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) when new mounts appear
+        if (
+            platform.system().lower() == "darwin"
+            and shutil.which("osascript")
+            and newly_mounted
+            and not sidebar_info.get("repaired")
+        ):
+            refresh_targets = [root]
+            for mid in remote_ids:
+                cand = root / mid
+                if not is_mounted(cand) and cand.is_dir():
+                    refresh_targets.append(cand)
+            script_lines = [
+                f'tell application "Finder" to if exists (POSIX file "{p}" as alias) then update (POSIX file "{p}" as alias)'
+                for p in refresh_targets
+            ]
+            try:
+                subprocess.run(
+                    ["osascript", "-e", "\n".join(script_lines)],
+                    capture_output=True,
+                    timeout=4,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        return {
+            "base_dir": str(root),
+            "results": results,
+            "sidebar_repaired": bool(sidebar_info.get("repaired")),
+        }
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_fp.close()
 
 
 def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
-    root = (base_dir or (Path.home() / "RemoteComputers")).expanduser().resolve()
+    root = safe_lexical_resolve(base_dir or (Path.home() / "RemoteComputers"))
+    root_str = str(root)
     results = []
-    if root.is_dir():
+
+    table = get_macos_mount_table()
+    if table is not None:
+        for mp_str in sorted(table.keys(), key=len, reverse=True):
+            if mp_str == root_str or mp_str.startswith(root_str + "/"):
+                results.append({"path": mp_str, **unmount_sshfs(Path(mp_str))})
+    elif root.is_dir():
         for child in sorted(root.iterdir()):
             if child.is_symlink() or not child.is_dir():
                 continue
             if is_mounted(child):
                 results.append({"path": str(child), **unmount_sshfs(child)})
             else:
-                # Unmount nested multi-drive mounts (e.g. `~/RemoteComputers/pc/C`, `~/RemoteComputers/pc/D`)
+                # Unmount nested multi-drive mounts (e.g. `~/RemoteComputers/pc/C`, `~/RemoteComputers/spark01/Home`)
                 for sub in sorted(child.iterdir()):
                     if not sub.is_symlink() and sub.is_dir() and is_mounted(sub):
                         results.append({"path": str(sub), **unmount_sshfs(sub)})
-    return {"base_dir": str(root), "results": results}
+
+    # Stop all recorded `rclone serve nfs` daemons AFTER unmounting
+    daemons = _daemons_dir()
+    if daemons.is_dir():
+        for mf in sorted(daemons.glob("*.json")):
+            try:
+                meta = json.loads(mf.read_text(encoding="utf-8"))
+                pid = int(meta.get("pid") or 0)
+                if pid > 0:
+                    os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                mf.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return {"base_dir": root_str, "results": results}
 
 
 def install_macos_launch_agent(
@@ -1097,7 +1533,7 @@ def install_macos_launch_agent(
     base_dir: Optional[Path] = None,
     load_now: bool = True,
 ) -> Path:
-    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & every 60s."""
+    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & heal every 30s."""
     home = (home_dir or Path.home()).expanduser().resolve()
     py_exe = python_executable or sys.executable or "/usr/bin/python3"
     repo_src = str(get_repo_root() / "src")
@@ -1123,7 +1559,7 @@ def install_macos_launch_agent(
             "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,
-        "StartInterval": 60,
+        "StartInterval": 30,
         "AbandonProcessGroup": True,
         "StandardOutPath": str(home / ".cache" / "remote-fleet" / "automount.log"),
         "StandardErrorPath": str(home / ".cache" / "remote-fleet" / "automount.err.log"),

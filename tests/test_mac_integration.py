@@ -137,7 +137,7 @@ class TestMacIntegration(unittest.TestCase):
             self.assertIn("mount-all", data["ProgramArguments"])
             self.assertIn("--from-launchd", data["ProgramArguments"])
             self.assertTrue(data["AbandonProcessGroup"])
-            self.assertEqual(data["StartInterval"], 60)
+            self.assertEqual(data["StartInterval"], 30)
             self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
 
     def test_empty_unmounted_folder_cleanup(self) -> None:
@@ -527,6 +527,224 @@ class TestMacIntegration(unittest.TestCase):
                 s_root = load_active_project(cwd=spark_container)
                 assert s_root is not None
                 self.assertEqual((s_root.machine_id, s_root.remote_path), ("spark01", "/home/danlinyu"))
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
+    def test_probe_mount_health_and_safe_teardown_order(self) -> None:
+        """Verify `_probe_mount_health` catches hung/stale/legacy/roamed mounts via uncached `.fleet-probe-<uuid>`
+        and `_teardown_mount_and_daemon` ALWAYS unmounts BEFORE killing `rclone`."""
+        import errno
+        import json
+        import signal
+        import time
+        from unittest.mock import patch
+        from remote_fleet.mac_integration import _probe_mount_health, _teardown_mount_and_daemon
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            daemons = tmp_path / "daemons"
+            daemons.mkdir()
+            mp = tmp_path / "RemoteComputers" / "pc" / "C"
+            mp.mkdir(parents=True)
+
+            # 1. Unmounted -> "gone"
+            with patch("remote_fleet.mac_integration.is_mounted", return_value=False):
+                self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "gone")
+
+            # 2. Mounted on Darwin without daemon metadata -> "legacy_nfsmount"
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+            ):
+                self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "legacy_nfsmount")
+
+            # Write valid daemon metadata
+            meta_file = daemons / "pc-C.json"
+            meta_file.write_text(
+                json.dumps({"pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
+                encoding="utf-8",
+            )
+
+            # 3. Network roamed (LAN -> Tailscale) -> "endpoint_changed"
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch("remote_fleet.mac_integration.os.kill", return_value=None),
+            ):
+                self.assertEqual(
+                    _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="100.93.148.108"),
+                    "endpoint_changed",
+                )
+
+            # 4. Live LOOKUP returning ENOENT -> "healthy"
+            def lstat_enoent(p: str) -> object:
+                raise OSError(errno.ENOENT, "No such file")
+
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch("remote_fleet.mac_integration.os.kill", return_value=None),
+                patch("remote_fleet.mac_integration.os.lstat", side_effect=lstat_enoent),
+            ):
+                self.assertEqual(
+                    _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="192.168.68.70"),
+                    "healthy",
+                )
+
+            # 5. Live LOOKUP returning ESTALE / ETIMEDOUT -> "unresponsive"
+            def lstat_estale(p: str) -> object:
+                raise OSError(errno.ESTALE, "Stale NFS file handle")
+
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch("remote_fleet.mac_integration.os.kill", return_value=None),
+                patch("remote_fleet.mac_integration.os.lstat", side_effect=lstat_estale),
+            ):
+                self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "unresponsive")
+
+            # 6. Hung lstat past deadline -> returns "unresponsive" promptly without hanging caller
+            def lstat_hang(p: str) -> object:
+                time.sleep(2.0)
+                raise OSError(errno.ENOENT, "late")
+
+            t0 = time.monotonic()
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch("remote_fleet.mac_integration.os.kill", return_value=None),
+                patch("remote_fleet.mac_integration.os.lstat", side_effect=lstat_hang),
+            ):
+                status = _probe_mount_health(mp, "pc-C", timeout_sec=0.15)
+            self.assertEqual(status, "unresponsive")
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+            # 7. Safe teardown MUST call `unmount_sshfs` BEFORE `os.kill(pid, SIGTERM)`
+            order: list[str] = []
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch(
+                    "remote_fleet.mac_integration.unmount_sshfs",
+                    side_effect=lambda _p: order.append("unmount") or {"ok": True},
+                ),
+                patch(
+                    "remote_fleet.mac_integration.os.kill",
+                    side_effect=lambda pid, sig: order.append(f"kill:{pid}:{int(sig)}"),
+                ),
+            ):
+                _teardown_mount_and_daemon(mp, "pc-C")
+
+            self.assertEqual(order, ["unmount", f"kill:42424:{int(signal.SIGTERM)}"])
+            self.assertFalse(meta_file.exists())
+
+    def test_macos_mount_table_parser_and_legacy_hard_nfs_cleanup(self) -> None:
+        """Verify orphaned hard `rclone nfsmount` mounts are detected via `/sbin/mount` (`MNT_NOWAIT`) and
+        force-unmounted even if `rclone nfsmount` already crashed, without touching soft NFS mounts."""
+        from unittest.mock import patch
+        from remote_fleet.mac_integration import _cleanup_legacy_nfsmounts
+        from remote_fleet.mount import parse_macos_mount_output
+
+        raw_mount = "\n".join(
+            [
+                "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
+                "localhost:/ on /Users/danlinyu/RemoteComputers/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
+                "localhost:/ on /Users/danlinyu/RemoteComputers/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
+                "localhost:/ on /Users/danlinyu/RemoteComputers/spark01/Home (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
+            ]
+        )
+        parsed = parse_macos_mount_output(raw_mount)
+        self.assertIn("/Users/danlinyu/RemoteComputers/pc/C", parsed)
+        self.assertNotIn("soft", parsed["/Users/danlinyu/RemoteComputers/pc/C"])
+        self.assertIn("soft", parsed["/Users/danlinyu/RemoteComputers/spark01/Home"])
+
+        unmounted_paths: list[str] = []
+        with (
+            patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+            patch("remote_fleet.mac_integration.safe_lexical_resolve", side_effect=lambda p: p),
+            patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=parsed),
+            patch(
+                "remote_fleet.mac_integration.unmount_sshfs",
+                side_effect=lambda p: unmounted_paths.append(str(p)) or {"ok": True},
+            ),
+            patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+        ):
+            _cleanup_legacy_nfsmounts(Path("/Users/danlinyu/RemoteComputers"))
+
+        self.assertEqual(
+            set(unmounted_paths),
+            {
+                "/Users/danlinyu/RemoteComputers/pc/C",
+                "/Users/danlinyu/RemoteComputers/pc/D",
+            },
+        )
+
+    def test_windows_10_drives_reuses_verified_sftp_flags(self) -> None:
+        """Verify mounting 10 drives (`C:`..`L:`) on `danlin-hud` reuses verified SFTP flags after `C:`
+        so Windows `sshd` `MaxStartups` is never hit by 10 redundant preflight handshakes."""
+        from unittest.mock import patch
+        from remote_fleet.config import MachineConfig
+        from remote_fleet.mac_integration import _mount_windows_all_drives
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            pc_container = tmp_path / "RemoteComputers" / "pc"
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                pc = MachineConfig(
+                    id="pc",
+                    name="Home PC (danlin-hud)",
+                    lan_host="192.168.68.70",
+                    tailscale_host="100.93.148.108",
+                    user="danli",
+                    os="windows",
+                )
+                ten_drives = [f"{ch}:/" for ch in "CDEFGHIJKL"]
+                ping = {"ok": True, "os": "windows", "home": "C:\\Users\\danli", "drives": ten_drives}
+                seen_preverified: list[tuple[str, tuple[str, list[str]] | None]] = []
+
+                def fake_mount_dir(**kwargs: object) -> dict[str, object]:
+                    mp = kwargs["mount_point"]
+                    assert isinstance(mp, Path)
+                    mp.mkdir(parents=True, exist_ok=True)
+                    target = str(kwargs["remote_target"])
+                    pre = kwargs.get("preverified_sftp")
+                    seen_preverified.append((target, pre))  # type: ignore[arg-type]
+                    return {
+                        "ok": True,
+                        "visible_count": 3,
+                        "already_mounted": False,
+                        "verified_sftp_flags": ["--sftp-host", "192.168.68.70", "--sftp-skip-links"],
+                        "verified_rclone_path": f"/{target}",
+                    }
+
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_dir),
+                    patch("remote_fleet.mac_integration.time.sleep", return_value=None),
+                ):
+                    res = _mount_windows_all_drives(
+                        pc, {"transport": "lan", "host": "192.168.68.70"}, "192.168.68.70", ping, pc_container
+                    )
+
+                self.assertTrue(res["ok"])
+                self.assertEqual(len(res["drives"]), 10)
+                # Drive C probes once (`preverified_sftp is None`), drives D..L reuse `preverified_sftp`!
+                self.assertIsNone(seen_preverified[0][1])
+                for drv_target, pre_val in seen_preverified[1:]:
+                    self.assertIsNotNone(pre_val, f"Expected {drv_target} to reuse preverified SFTP flags")
+                    assert pre_val is not None
+                    self.assertEqual(pre_val[0], f"/{drv_target}")
             finally:
                 if old_cfg_dir is None:
                     os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)

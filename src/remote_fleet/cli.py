@@ -769,7 +769,10 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
     cfg, ts_self = load_fleet_config(include_tailscale=True)
     transport = FleetTransport(cfg, ts_self)
     base = Path(args.dir).expanduser().resolve() if args.dir else None
-    summary = mount_all_machines(cfg, transport, base_dir=base)
+    from_launchd = bool(getattr(args, "from_launchd", False))
+    summary = mount_all_machines(cfg, transport, base_dir=base, from_launchd=from_launchd)
+    if summary.get("skipped_locked"):
+        return 0
     if args.json:
         print(json.dumps(summary, indent=2))
         return 0

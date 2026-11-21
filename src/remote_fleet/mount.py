@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -94,12 +95,71 @@ def compute_local_workspace_dir(
     return base / machine.id / safe_leaf
 
 
-def is_mounted(path: Path) -> bool:
-    """Check whether `path` is currently an active OS mountpoint."""
+def safe_lexical_resolve(path: Path) -> Path:
+    """Resolve parent directory symlinks (e.g. `/tmp` -> `/private/tmp`) WITHOUT calling `stat`/`lstat` on `path` itself.
+
+    Crucial on macOS when `path` is a wedged hard NFS mountpoint: `Path.resolve()` calls `lstat(path)` which
+    blocks in kernel RPC wait, whereas resolving `path.parent` (local APFS) + `path.name` never touches the NFS mount.
+    """
+    expanded = Path(os.path.abspath(os.path.expanduser(str(path))))
+    if str(expanded) == expanded.anchor:
+        return expanded
     try:
-        return os.path.ismount(str(path))
-    except Exception:
-        return False
+        return expanded.parent.resolve() / expanded.name
+    except OSError:
+        return expanded
+
+
+def parse_macos_mount_output(raw: str) -> Dict[str, str]:
+    """Parse `/sbin/mount` (`MNT_NOWAIT`) output into `{mount_point: options_str}`."""
+    mounts: Dict[str, str] = {}
+    for line in raw.splitlines():
+        m = re.match(r"^.+?\s+on\s+(.+?)\s+\(([^)]*)\)\s*$", line.strip())
+        if m:
+            mounts[m.group(1)] = m.group(2)
+    return mounts
+
+
+def get_macos_mount_table() -> Optional[Dict[str, str]]:
+    """Read the macOS kernel mount table via `/sbin/mount` (`getmntinfo(MNT_NOWAIT)` — never blocks on dead NFS)."""
+    if platform.system().lower() != "darwin" or not os.path.exists("/sbin/mount"):
+        return None
+    try:
+        proc = subprocess.run(
+            ["/sbin/mount"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return parse_macos_mount_output(proc.stdout)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def is_mounted(path: Path) -> bool:
+    """Check whether `path` is currently an active OS mountpoint without ever hanging on a dead NFS mount."""
+    safe_path = safe_lexical_resolve(path)
+    expanded_str = os.path.abspath(os.path.expanduser(str(path)))
+
+    table = get_macos_mount_table()
+    if table is not None:
+        return str(safe_path) in table or expanded_str in table
+
+    out: Dict[str, bool] = {}
+
+    def _ismount_worker() -> None:
+        try:
+            out["mounted"] = os.path.ismount(str(safe_path))
+        except Exception:
+            out["mounted"] = False
+
+    t = threading.Thread(target=_ismount_worker, daemon=True)
+    t.start()
+    t.join(timeout=2.0)
+    return bool(out.get("mounted", False))
 
 
 def create_launchpad_workspace(
@@ -347,29 +407,48 @@ def mount_sshfs(
 
 
 def unmount_sshfs(local_dir: Path) -> Dict[str, Any]:
-    """Unmount an rclone/SSHFS-mounted workspace directory (even if open in macOS Finder)."""
-    resolved = local_dir.expanduser().resolve()
+    """Unmount an rclone/NFS/SSHFS-mounted directory immediately (even if wedged or open in macOS Finder)."""
+    resolved = safe_lexical_resolve(local_dir)
     if not is_mounted(resolved):
         return {"ok": True, "unmounted": False, "message": f"{resolved} is not currently mounted."}
 
-    for candidate_cmd in (
-        ["umount", str(resolved)],
-        ["diskutil", "unmount", str(resolved)],
-        ["diskutil", "unmount", "force", str(resolved)],
-        ["umount", "-f", str(resolved)],
-        ["fusermount", "-u", str(resolved)],
-        ["fusermount3", "-u", str(resolved)],
-    ):
-        if shutil.which(candidate_cmd[0]):
+    is_macos = platform.system().lower() == "darwin"
+    candidates = (
+        [
+            ["diskutil", "unmount", "force", str(resolved)],
+            ["/sbin/umount", "-f", str(resolved)],
+            ["umount", "-f", str(resolved)],
+        ]
+        if is_macos
+        else [
+            ["umount", str(resolved)],
+            ["fusermount", "-u", str(resolved)],
+            ["fusermount3", "-u", str(resolved)],
+            ["umount", "-f", str(resolved)],
+        ]
+    )
+
+    # Peel up to 3 layers in case multiple mounts were ever stacked on the same path
+    for _layer in range(3):
+        if not is_mounted(resolved):
+            return {"ok": True, "unmounted": True, "local_path": str(resolved)}
+        dislodged_layer = False
+        for candidate_cmd in candidates:
+            exe = candidate_cmd[0] if os.path.isabs(candidate_cmd[0]) else shutil.which(candidate_cmd[0])
+            if not exe:
+                continue
             try:
-                proc = subprocess.run(candidate_cmd, capture_output=True, text=True, timeout=10, check=False)
+                subprocess.run([exe, *candidate_cmd[1:]], capture_output=True, text=True, timeout=8, check=False)
             except (subprocess.TimeoutExpired, OSError):
                 continue
-            if proc.returncode == 0 or not is_mounted(resolved):
-                for _ in range(10):
-                    if not is_mounted(resolved):
-                        return {"ok": True, "unmounted": True, "local_path": str(resolved)}
-                    time.sleep(0.1)
+            for _ in range(8):
+                if not is_mounted(resolved):
+                    return {"ok": True, "unmounted": True, "local_path": str(resolved)}
+                time.sleep(0.08)
+            dislodged_layer = True
+            break
+        if not dislodged_layer:
+            break
 
     if not is_mounted(resolved):
         return {"ok": True, "unmounted": True, "local_path": str(resolved)}
