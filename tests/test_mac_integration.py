@@ -135,6 +135,9 @@ class TestMacIntegration(unittest.TestCase):
                 data = plistlib.load(fp)
             self.assertEqual(data["Label"], "com.remote-fleet.automount")
             self.assertIn("mount-all", data["ProgramArguments"])
+            self.assertIn("--from-launchd", data["ProgramArguments"])
+            self.assertTrue(data["AbandonProcessGroup"])
+            self.assertEqual(data["StartInterval"], 60)
             self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
 
     def test_empty_unmounted_folder_cleanup(self) -> None:

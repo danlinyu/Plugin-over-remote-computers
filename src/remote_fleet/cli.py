@@ -790,6 +790,9 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
             print(f"  [WARN] {mid:<12} -> {r.get('error')}")
     if summary.get("sidebar_repaired"):
         print("  [FIXED] Repaired macOS Finder & Open-Dialog Sidebar Favorites (`pc`, `spark01`, `spark03`, `spark04`)!")
+    if sys.platform == "darwin" and not getattr(args, "from_launchd", False):
+        plist = install_macos_launch_agent(base_dir=base, load_now=True)
+        print(f"  [AUTO]  Active across Mac restarts: {plist}")
     return 0
 
 
@@ -1011,6 +1014,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mall.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
     p_mall.add_argument("--json", action="store_true")
+    p_mall.add_argument("--from-launchd", action="store_true", help=argparse.SUPPRESS)
     p_mall.set_defaults(func=cmd_mount_all)
 
     p_umall = sub.add_parser("unmount-all", help="Unmount all ~/RemoteComputers/<machine> mounts")

@@ -1036,8 +1036,18 @@ def mount_all_machines(
     if platform.system().lower() == "darwin" and remote_ids:
         sidebar_info = repair_macos_sidebar_favorites(root, remote_ids)
 
-    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) so contents update live
-    if platform.system().lower() == "darwin" and shutil.which("osascript") and not sidebar_info.get("repaired"):
+    newly_mounted = any(
+        r.get("ok") and not r.get("already_mounted") and not r.get("skipped")
+        for r in results
+    )
+
+    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) when new mounts appear
+    if (
+        platform.system().lower() == "darwin"
+        and shutil.which("osascript")
+        and newly_mounted
+        and not sidebar_info.get("repaired")
+    ):
         refresh_targets = [root]
         for mid in remote_ids:
             cand = root / mid
@@ -1085,8 +1095,9 @@ def install_macos_launch_agent(
     home_dir: Optional[Path] = None,
     python_executable: Optional[str] = None,
     base_dir: Optional[Path] = None,
+    load_now: bool = True,
 ) -> Path:
-    """Create `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to mount computers at login."""
+    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & every 60s."""
     home = (home_dir or Path.home()).expanduser().resolve()
     py_exe = python_executable or sys.executable or "/usr/bin/python3"
     repo_src = str(get_repo_root() / "src")
@@ -1105,16 +1116,31 @@ def install_macos_launch_agent(
             "mount-all",
             "--dir",
             mount_root,
+            "--from-launchd",
         ],
         "EnvironmentVariables": {
             "PYTHONPATH": repo_src,
             "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,
+        "StartInterval": 60,
+        "AbandonProcessGroup": True,
         "StandardOutPath": str(home / ".cache" / "remote-fleet" / "automount.log"),
         "StandardErrorPath": str(home / ".cache" / "remote-fleet" / "automount.err.log"),
     }
     (home / ".cache" / "remote-fleet").mkdir(parents=True, exist_ok=True)
     with open(plist_path, "wb") as fp:
         plistlib.dump(plist_data, fp)
+
+    if load_now and home_dir is None and platform.system().lower() == "darwin" and shutil.which("launchctl"):
+        uid = os.getuid()
+        for lcmd in (
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+            ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+        ):
+            try:
+                subprocess.run(lcmd, capture_output=True, timeout=5, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
     return plist_path
