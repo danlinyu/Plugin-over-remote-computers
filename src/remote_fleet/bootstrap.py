@@ -52,7 +52,7 @@ CANDIDATE_LAN_HOSTS: Dict[str, List[str]] = {
     "spark01": ["spark01.local", "spark01"],
     "spark03": ["spark03.local", "spark03"],
     "spark04": ["spark04.local", "spark04"],
-    "pc": ["danlin-hud.local", "danlin-hud", "192.168.68.70", "pc.local", "pc"],
+    "pc": ["192.168.68.70", "danlin-hud", "danlin-hud.local", "pc.local", "pc"],
 }
 
 KNOWN_TAILSCALE_IPS: Dict[str, str] = {
@@ -662,7 +662,7 @@ def run_bootstrap(
     mount_dir: Optional[Path] = None,
 ) -> int:
     """Run full turnkey discovery, duplicate Tailscale cleanup, macOS Tailscale install, rclone install, and verified Mac mounting."""
-    effective_pc_user = (pc_user or ssh_user).strip()
+    effective_pc_user = (pc_user or ("danli" if ssh_user == "danlinyu" else ssh_user[:5])).strip()
     print("=== Remote Fleet Turnkey Bootstrap ===")
     print(f"Spark SSH user: {ssh_user} | Windows PC (`danlin-hud`) SSH user: {effective_pc_user}\n")
 
@@ -705,6 +705,11 @@ def run_bootstrap(
         if "pc" in lan_hits
         else (pc_alive_no_ssh[1] if pc_alive_no_ssh else "192.168.68.70")
     )
+    if not pc_user and "pc" in lan_hits:
+        for cand_u in (effective_pc_user, ssh_user):
+            if cand_u and check_batch_ssh(cand_u, pc_default_lan, 22):
+                effective_pc_user = cand_u
+                break
     machines: List[MachineConfig] = [
         MachineConfig(
             id="mac-mini",

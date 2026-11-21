@@ -259,6 +259,51 @@ class TestMacIntegration(unittest.TestCase):
 
         self.assertEqual(unprotected, [], f"Unprotected timed subprocess.run calls: {unprotected}")
 
+    def test_windows_powershell_encoded_cmd_and_sftp_preflight(self) -> None:
+        import base64
+        import subprocess as sp
+        from unittest.mock import patch
+        from remote_fleet.config import MachineConfig
+        from remote_fleet.mac_integration import _select_verified_rclone_sftp_flags
+        from remote_fleet.transport import FleetTransport
+
+        win_cmd = FleetTransport._build_windows_worker_cmd()
+        self.assertTrue(win_cmd.startswith("powershell -NoProfile -NonInteractive -EncodedCommand "))
+        b64_part = win_cmd.split()[-1]
+        # Must contain zero shell metacharacters so cmd.exe and PowerShell both pass it untouched
+        self.assertRegex(b64_part, r"^[A-Za-z0-9+/=]+$")
+        decoded = base64.b64decode(b64_part).decode("utf-16-le")
+        self.assertIn("WindowsApps", decoded)
+        self.assertIn("miniconda3", decoded)
+
+        pc = MachineConfig(
+            id="pc",
+            name="Home PC (danlin-hud)",
+            lan_host="192.168.68.70",
+            tailscale_host="100.93.148.108",
+            user="danli",
+            os="windows",
+        )
+        calls: list[list[str]] = []
+
+        def fake_rclone_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+            calls.append(cmd)
+            # Simulate `/C:/Users/danli` failing on Windows SFTP and `C:/Users/danli` (or `:sftp:`) succeeding
+            sftp_arg = cmd[2]
+            if sftp_arg == ":sftp:":
+                return sp.CompletedProcess(cmd, 0, "Desktop/\nDocuments/\n", "")
+            return sp.CompletedProcess(cmd, 1, "", "directory not found")
+
+        with patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_rclone_run):
+            chosen_path, chosen_flags, err = _select_verified_rclone_sftp_flags(
+                "/usr/local/bin/rclone", pc, "192.168.68.70", "/C:/Users/danli"
+            )
+        self.assertEqual(err, "")
+        self.assertEqual(chosen_path, "")
+        assert chosen_flags is not None
+        self.assertIn("--sftp-skip-links", chosen_flags)
+        self.assertIn("--sftp-shell-type", chosen_flags)
+
 
 if __name__ == "__main__":
     unittest.main()

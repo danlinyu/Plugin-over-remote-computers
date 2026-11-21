@@ -206,9 +206,20 @@ def _select_verified_rclone_sftp_flags(
     machine: MachineConfig,
     host: str,
     rclone_path: str,
-) -> Tuple[Optional[List[str]], str]:
-    """Run a fast `rclone lsf --max-depth 1` preflight to pick working SFTP flags before mounting."""
-    candidates: List[Tuple[str, List[str]]] = []
+) -> Tuple[str, Optional[List[str]], str]:
+    """Run a fast `rclone lsf --max-depth 1` preflight to pick working SFTP path & flags before mounting."""
+    flag_candidates: List[Tuple[str, List[str]]] = []
+    common_sftp_opts = [
+        "--sftp-shell-type",
+        "none",
+        "--sftp-md5sum-command",
+        "none",
+        "--sftp-sha1sum-command",
+        "none",
+    ]
+    if machine.os == "windows":
+        # Skip legacy NTFS junction traps in C:\Users\<user> (Cookies, My Documents, Local Settings, etc.)
+        common_sftp_opts.append("--sftp-skip-links")
 
     key_path = _detect_default_ssh_key(machine)
     if key_path:
@@ -219,46 +230,50 @@ def _select_verified_rclone_sftp_flags(
             str(machine.port or 22),
             "--sftp-key-file",
             key_path,
-            "--sftp-md5sum-command",
-            "none",
-            "--sftp-sha1sum-command",
-            "none",
+            *common_sftp_opts,
         ]
         if machine.user:
             native_flags.extend(["--sftp-user", machine.user])
-        candidates.append(("native-key", native_flags))
+        flag_candidates.append(("native-key", native_flags))
 
     ssh_ext = build_rclone_sftp_ssh_command(machine, host)
     ext_flags = [
         "--sftp-ssh",
         ssh_ext,
-        "--sftp-md5sum-command",
-        "none",
-        "--sftp-sha1sum-command",
-        "none",
+        *common_sftp_opts,
     ]
-    candidates.append(("external-ssh", ext_flags))
+    flag_candidates.append(("external-ssh", ext_flags))
+
+    # Candidate SFTP root paths (Windows OpenSSH `sftp-server.exe` starts in C:\Users\<user>, so `:sftp:` empty path also maps directly to home)
+    raw_paths: List[str] = [rclone_path]
+    if machine.os == "windows":
+        stripped = rclone_path.lstrip("/")
+        if stripped and stripped not in raw_paths:
+            raw_paths.append(stripped)
+    if "" not in raw_paths:
+        raw_paths.append("")
 
     errors: List[str] = []
-    for label, flags in candidates:
-        cmd = [
-            rclone_bin,
-            "lsf",
-            f":sftp:{rclone_path}",
-            *flags,
-            "--max-depth",
-            "1",
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            errors.append(f"{label}: {exc}")
-            continue
-        if proc.returncode == 0:
-            return flags, ""
-        errors.append(f"{label}: {proc.stderr.strip() or proc.stdout.strip()}")
+    for cand_path in raw_paths:
+        for label, flags in flag_candidates:
+            cmd = [
+                rclone_bin,
+                "lsf",
+                f":sftp:{cand_path}",
+                *flags,
+                "--max-depth",
+                "1",
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                errors.append(f"{label}({cand_path or '.'}): {exc}")
+                continue
+            if proc.returncode == 0:
+                return cand_path, flags, ""
+            errors.append(f"{label}({cand_path or '.'}): {proc.stderr.strip() or proc.stdout.strip()}")
 
-    return None, "; ".join(errors)
+    return rclone_path, None, "; ".join(errors)
 
 
 def mount_single_machine_root(
@@ -276,7 +291,7 @@ def mount_single_machine_root(
         _cleanup_unmounted_empty_dir(mount_point)
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
-    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=8)
+    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
     if not ping.get("ok"):
         _cleanup_unmounted_empty_dir(mount_point)
         return {
@@ -329,9 +344,9 @@ def mount_single_machine_root(
 
     # 1. Preferred on macOS: `rclone nfsmount` spawned cleanly in detached session + verified via `ismount()` & `os.listdir()`
     if rclone_bin and (is_macos or not sshfs_bin):
-        rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
-        sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
-            rclone_bin, machine, ep.host, rclone_path
+        initial_rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
+        verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
+            rclone_bin, machine, ep.host, initial_rclone_path
         )
         if not sftp_flags:
             _cleanup_unmounted_empty_dir(mount_point)
@@ -349,7 +364,7 @@ def mount_single_machine_root(
         cmd = [
             rclone_bin,
             subcmd,
-            f":sftp:{rclone_path}",
+            f":sftp:{verified_rclone_path}",
             str(mount_point),
             *sftp_flags,
             "--allow-non-empty",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import difflib
@@ -879,12 +880,9 @@ class FleetTransport:
 
         envelope = json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req})
 
-        # Bootstrap command compatible with POSIX shells (Linux/macOS) and Windows (CMD/PowerShell)
+        # Bootstrap command compatible with POSIX shells (Linux/macOS) and Windows OpenSSH (cmd.exe / PowerShell)
         if machine.os == "windows":
-            remote_py_cmd = (
-                'python -c "import json,sys; d=json.loads(sys.stdin.read()); '
-                'ns={}; exec(d[\'code\'], ns); print(json.dumps(ns[\'handle\'](d[\'req\'])))"'
-            )
+            remote_py_cmd = self._build_windows_worker_cmd()
         else:
             py_snippet = (
                 "import json,sys; d=json.loads(sys.stdin.read()); "
@@ -915,11 +913,7 @@ class FleetTransport:
 
         # If POSIX shell lookup failed on an `os="auto"` host that turns out to be Windows OpenSSH:
         if proc.returncode != 0 and machine.os == "auto":
-            win_cmd = (
-                'python -c "import json,sys; d=json.loads(sys.stdin.read()); '
-                'ns={}; exec(d[\'code\'], ns); print(json.dumps(ns[\'handle\'](d[\'req\'])))"'
-            )
-            ssh_win = [*self.build_ssh_args(machine, ep.host), win_cmd]
+            ssh_win = [*self.build_ssh_args(machine, ep.host), self._build_windows_worker_cmd()]
             try:
                 proc2 = subprocess.run(
                     ssh_win,
@@ -955,6 +949,53 @@ class FleetTransport:
                 "error": f"Unexpected non-JSON response from '{machine.id}': {stdout[:400]}",
                 "endpoint": ep.to_dict(),
             }
+
+    @staticmethod
+    def _encode_windows_powershell(ps_script: str) -> str:
+        """Encode a PowerShell script as `-EncodedCommand` (UTF-16LE Base64) so `cmd.exe` and `powershell.exe` never mangle quotes."""
+        b64 = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+        return f"powershell -NoProfile -NonInteractive -EncodedCommand {b64}"
+
+    @classmethod
+    def _build_windows_worker_cmd(cls) -> str:
+        """Build a self-contained Windows PowerShell launcher that locates real Python (skipping WindowsApps Store stubs)
+        and gracefully answers `ping` with `$HOME` even if Python is not yet installed on Windows."""
+        ps_script = (
+            "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            "$raw = [Console]::In.ReadToEnd()\n"
+            "$py = $null\n"
+            "foreach ($c in @(Get-Command python, python3 -ErrorAction SilentlyContinue)) {\n"
+            "  if ($c.Source -and ($c.Source -notlike '*\\WindowsApps\\*')) { $py = $c.Source; break }\n"
+            "}\n"
+            "if (-not $py -and (Get-Command py -ErrorAction SilentlyContinue)) {\n"
+            "  $p = (& py -3 -c \"import sys; print(sys.executable)\" 2>$null)\n"
+            "  if ($LASTEXITCODE -eq 0 -and $p) { $py = ($p | Select-Object -Last 1).ToString().Trim() }\n"
+            "}\n"
+            "if (-not $py) {\n"
+            "  $cands = @(\n"
+            "    \"$HOME\\miniconda3\\python.exe\",\n"
+            "    \"$HOME\\anaconda3\\python.exe\",\n"
+            "    \"$HOME\\miniforge3\\python.exe\",\n"
+            "    \"C:\\ProgramData\\miniconda3\\python.exe\",\n"
+            "    \"C:\\ProgramData\\anaconda3\\python.exe\"\n"
+            "  )\n"
+            "  $cands += @(Get-ChildItem \"$env:LOCALAPPDATA\\Programs\\Python\\Python*\\python.exe\", \"C:\\Python*\\python.exe\", \"$env:APPDATA\\uv\\python\\*\\python.exe\" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { $_.FullName })\n"
+            "  foreach ($p in $cands) { if ($p -and (Test-Path $p)) { $py = $p; break } }\n"
+            "}\n"
+            "if ($py) {\n"
+            "  $env:PYTHONIOENCODING = 'utf-8'\n"
+            "  $raw | & $py -c \"import json,sys; d=json.loads(sys.stdin.read()); ns={}; exec(d['code'], ns); print(json.dumps(ns['handle'](d['req'])))\"\n"
+            "  exit $LASTEXITCODE\n"
+            "}\n"
+            "$d = $raw | ConvertFrom-Json\n"
+            "if ($d.req.op -eq 'ping') {\n"
+            "  @{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; python = 'not-installed'; home = $HOME; cwd = (Get-Location).Path } | ConvertTo-Json -Compress\n"
+            "  exit 0\n"
+            "}\n"
+            "@{ ok = $false; error = \"Python 3 not found on Windows ($env:COMPUTERNAME); install Python or Miniconda on Windows for remote worker ops.\" } | ConvertTo-Json -Compress\n"
+            "exit 0\n"
+        )
+        return cls._encode_windows_powershell(ps_script)
 
     def run_command(
         self,
@@ -1020,16 +1061,25 @@ class FleetTransport:
             }
 
         if machine.os == "windows":
-            env_prefix = ""
+            env_lines = [
+                "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+                "foreach ($d in @(\"$HOME\\.local\\bin\", \"$HOME\\miniconda3\", \"$HOME\\miniconda3\\Scripts\", \"$HOME\\anaconda3\", \"$HOME\\anaconda3\\Scripts\")) { if (Test-Path $d) { $env:PATH = \"$d;$env:PATH\" } }",
+            ]
             if env:
-                assignments = [
-                    f"$env:{k}='{str(v).replace(chr(39), chr(39)*2)}'"
-                    for k, v in env.items()
-                ]
-                env_prefix = "; ".join(assignments) + "; "
-            target_cwd = cwd.replace("~", "$HOME") if cwd.startswith("~") else cwd
-            ps_script = f"Set-Location -Path \"{target_cwd}\"; {env_prefix}{command}"
-            remote_cmd = f"powershell -NoProfile -NonInteractive -Command {shlex.quote(ps_script)}"
+                for k, v in env.items():
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(k)):
+                        escaped_val = str(v).replace("'", "''")
+                        env_lines.append(f"$env:{k} = '{escaped_val}'")
+            if cwd in ("", "~"):
+                cd_line = "Set-Location -LiteralPath $HOME"
+            elif cwd.startswith("~/") or cwd.startswith("~\\"):
+                rel_win = cwd[2:].replace("'", "''")
+                cd_line = f"Set-Location -LiteralPath (Join-Path $HOME '{rel_win}')"
+            else:
+                lit_win = cwd.replace("'", "''")
+                cd_line = f"Set-Location -LiteralPath '{lit_win}'"
+            ps_script = "\n".join([*env_lines, cd_line, command])
+            remote_cmd = self._encode_windows_powershell(ps_script)
         else:
             env_prefix = ""
             if env:
