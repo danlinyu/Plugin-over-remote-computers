@@ -155,6 +155,110 @@ class TestMacIntegration(unittest.TestCase):
             _cleanup_unmounted_empty_dir(real_dir)
             self.assertTrue(real_dir.is_dir())
 
+    def test_subnet_scan_survives_stalled_ssh_device_like_192_168_68_100(self) -> None:
+        """Regression test for `192.168.68.100:22` stalling SSH past 4s (`subprocess.TimeoutExpired`)."""
+        import subprocess as sp
+        from unittest.mock import patch
+        from remote_fleet import bootstrap
+
+        def fake_create_connection(addr: tuple[str, int], timeout: float = 0.25) -> object:
+            ip, port = addr
+            if ip == "192.168.68.100" and port == 22:
+                class _DummySock:
+                    def __enter__(self) -> "_DummySock":
+                        return self
+
+                    def __exit__(self, *args: object) -> None:
+                        return None
+
+                return _DummySock()
+            raise OSError("closed")
+
+        with (
+            patch("remote_fleet.bootstrap.socket.create_connection", side_effect=fake_create_connection),
+            patch("remote_fleet.bootstrap.socket.gethostbyaddr", side_effect=OSError("no rdns")),
+            patch("remote_fleet.bootstrap._query_netbios_name", return_value=""),
+            patch(
+                "remote_fleet.bootstrap.subprocess.run",
+                side_effect=sp.TimeoutExpired(cmd=["ssh"], timeout=4),
+            ),
+        ):
+            discovered, win_no_ssh = bootstrap._scan_subnet_for_missing_hosts(
+                "192.168.68", "192.168.68.50", set(), "danlinyu"
+            )
+            self.assertEqual(discovered, {})
+            self.assertIsNone(win_no_ssh)
+
+    def test_probe_home_lan_skips_subnet_scan_when_sparks_and_pc_already_found(self) -> None:
+        from unittest.mock import patch
+        from remote_fleet import bootstrap
+
+        def fake_tcp_open(host: str, port: int = 22, timeout: float = 0.8) -> str | None:
+            mapping = {
+                "spark01.local": "192.168.68.67",
+                "spark03.local": "192.168.68.89",
+                "spark04.local": "192.168.68.91",
+            }
+            return mapping.get(host)
+
+        with (
+            patch("remote_fleet.bootstrap._tcp_open", side_effect=fake_tcp_open),
+            patch("remote_fleet.bootstrap.scan_arp_neighbors", return_value=[]),
+            patch("remote_fleet.bootstrap._host_resolves_or_pings", return_value="192.168.68.70"),
+            patch("remote_fleet.bootstrap._scan_subnet_for_missing_hosts") as mock_scan,
+        ):
+            found, pc_no_ssh = bootstrap.probe_home_lan_candidates("danlinyu", tailscale_running=False)
+            self.assertEqual(set(found.keys()), {"spark01", "spark03", "spark04"})
+            self.assertEqual(pc_no_ssh, ("192.168.68.70", "192.168.68.70"))
+            mock_scan.assert_not_called()
+
+    def test_all_timed_subprocess_calls_are_protected_and_py39_compatible(self) -> None:
+        """AST guard: every `subprocess.run(..., timeout=...)` in `src/` (including embedded `REMOTE_WORKER_SOURCE`)
+        MUST be inside a `try` block, and everything must parse under Python 3.9."""
+        import ast
+        from remote_fleet.transport import REMOTE_WORKER_SOURCE
+
+        src_root = Path(__file__).resolve().parents[1] / "src" / "remote_fleet"
+        py_files = sorted(src_root.glob("*.py"))
+        self.assertGreaterEqual(len(py_files), 8)
+
+        sources: list[tuple[str, str]] = [(p.name, p.read_text(encoding="utf-8")) for p in py_files]
+        sources.append(("REMOTE_WORKER_SOURCE", REMOTE_WORKER_SOURCE))
+
+        unprotected: list[str] = []
+        for label, source in sources:
+            tree = ast.parse(source, filename=label, feature_version=(3, 9))
+
+            parent_map: dict[ast.AST, ast.AST] = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parent_map[child] = node
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    is_subproc_run = (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "run"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                    )
+                    has_timeout = any(kw.arg == "timeout" for kw in node.keywords)
+                    if is_subproc_run and has_timeout:
+                        cur: ast.AST | None = node
+                        inside_try = False
+                        while cur in parent_map:
+                            parent = parent_map[cur]
+                            if isinstance(parent, ast.Try) and any(
+                                cur is stmt or cur in ast.walk(stmt) for stmt in parent.body
+                            ):
+                                inside_try = True
+                                break
+                            cur = parent
+                        if not inside_try:
+                            unprotected.append(f"{label}:{node.lineno}")
+
+        self.assertEqual(unprotected, [], f"Unprotected timed subprocess.run calls: {unprotected}")
+
 
 if __name__ == "__main__":
     unittest.main()

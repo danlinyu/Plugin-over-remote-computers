@@ -249,7 +249,11 @@ def _select_verified_rclone_sftp_flags(
             "--max-depth",
             "1",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            errors.append(f"{label}: {exc}")
+            continue
         if proc.returncode == 0:
             return flags, ""
         errors.append(f"{label}: {proc.stderr.strip() or proc.stdout.strip()}")
@@ -436,7 +440,15 @@ def mount_single_machine_root(
         key_path = _detect_default_ssh_key(machine)
         if key_path:
             cmd.extend(["-o", f"IdentityFile={key_path}"])
-        proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        try:
+            proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _cleanup_unmounted_empty_dir(mount_point)
+            return {
+                "ok": False,
+                "machine_id": machine.id,
+                "error": f"sshfs failed: {exc}",
+            }
         if proc2.returncode == 0 and is_mounted(mount_point):
             visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
             reg = load_mounts_registry()
@@ -479,16 +491,19 @@ def mount_all_machines(
 
     # Refresh macOS Finder window if open so newly mounted folders show contents immediately
     if platform.system().lower() == "darwin" and shutil.which("osascript"):
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                f'tell application "Finder" to if exists (POSIX file "{root}" as alias) then update (POSIX file "{root}" as alias)',
-            ],
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "Finder" to if exists (POSIX file "{root}" as alias) then update (POSIX file "{root}" as alias)',
+                ],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
     return {"base_dir": str(root), "results": results}
 

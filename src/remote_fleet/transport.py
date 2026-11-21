@@ -231,27 +231,36 @@ def handle(req: dict) -> dict:
         git_branch = ""
         git_status = ""
         if is_git and shutil.which("git"):
-            b = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=str(target), capture_output=True, text=True, timeout=3, check=False
-            )
-            if b.returncode == 0:
-                git_branch = b.stdout.strip()
-            s = subprocess.run(
-                ["git", "status", "--short"],
-                cwd=str(target), capture_output=True, text=True, timeout=3, check=False
-            )
-            if s.returncode == 0:
-                git_status = "\n".join(s.stdout.splitlines()[:20])
+            try:
+                b = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(target), capture_output=True, text=True, timeout=3, check=False
+                )
+                if b.returncode == 0:
+                    git_branch = b.stdout.strip()
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            try:
+                s = subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=str(target), capture_output=True, text=True, timeout=3, check=False
+                )
+                if s.returncode == 0:
+                    git_status = "\n".join(s.stdout.splitlines()[:20])
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
         gpu_info = []
         if shutil.which("nvidia-smi"):
-            g = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=3, check=False
-            )
-            if g.returncode == 0 and g.stdout.strip():
-                gpu_info = [line.strip() for line in g.stdout.splitlines() if line.strip()]
+            try:
+                g = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=3, check=False
+                )
+                if g.returncode == 0 and g.stdout.strip():
+                    gpu_info = [line.strip() for line in g.stdout.splitlines() if line.strip()]
+            except (subprocess.TimeoutExpired, OSError):
+                gpu_info = ["GPU busy (nvidia-smi timed out)"]
 
         entries = []
         for e in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:40]:
@@ -404,19 +413,22 @@ def handle(req: dict) -> dict:
             if file_pattern:
                 cmd.extend(["--glob", file_pattern])
             cmd.extend([query, str(root)])
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
-            for line in proc.stdout.splitlines():
-                if len(matches) >= max_results:
-                    break
-                parts = line.split(":", 2)
-                if len(parts) == 3:
-                    fpath, lno, snippet = parts
-                    try:
-                        rel = str(Path(fpath).resolve().relative_to(root)).replace("\\", "/")
-                    except Exception:
-                        rel = fpath
-                    matches.append({"file": rel, "line": int(lno) if lno.isdigit() else 1, "text": snippet[:300]})
-            return {"ok": True, "root": str(root), "matches": matches, "engine": "ripgrep"}
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+                for line in proc.stdout.splitlines():
+                    if len(matches) >= max_results:
+                        break
+                    parts = line.split(":", 2)
+                    if len(parts) == 3:
+                        fpath, lno, snippet = parts
+                        try:
+                            rel = str(Path(fpath).resolve().relative_to(root)).replace("\\", "/")
+                        except Exception:
+                            rel = fpath
+                        matches.append({"file": rel, "line": int(lno) if lno.isdigit() else 1, "text": snippet[:300]})
+                return {"ok": True, "root": str(root), "matches": matches, "engine": "ripgrep"}
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
         try:
             pattern = re.compile(query)
@@ -478,21 +490,24 @@ def handle(req: dict) -> dict:
         disk = shutil.disk_usage(str(Path.home()))
         gpus = []
         if shutil.which("nvidia-smi"):
-            g = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
-                    "--format=csv,noheader",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if g.returncode == 0:
-                for line in g.stdout.splitlines():
-                    if line.strip():
-                        gpus.append(line.strip())
+            try:
+                g = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+                if g.returncode == 0:
+                    for line in g.stdout.splitlines():
+                        if line.strip():
+                            gpus.append(line.strip())
+            except (subprocess.TimeoutExpired, OSError):
+                gpus.append("GPU busy (nvidia-smi timed out)")
         return {
             "ok": True,
             "hostname": socket.gethostname(),
@@ -882,14 +897,21 @@ class FleetTransport:
             )
 
         ssh_cmd = [*self.build_ssh_args(machine, ep.host), remote_py_cmd]
-        proc = subprocess.run(
-            ssh_cmd,
-            input=envelope,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                ssh_cmd,
+                input=envelope,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "ok": False,
+                "error": f"SSH execution timed out/failed on '{machine.id}' ({ep.transport}:{ep.host}): {exc}",
+                "endpoint": ep.to_dict(),
+            }
 
         # If POSIX shell lookup failed on an `os="auto"` host that turns out to be Windows OpenSSH:
         if proc.returncode != 0 and machine.os == "auto":
@@ -898,17 +920,20 @@ class FleetTransport:
                 'ns={}; exec(d[\'code\'], ns); print(json.dumps(ns[\'handle\'](d[\'req\'])))"'
             )
             ssh_win = [*self.build_ssh_args(machine, ep.host), win_cmd]
-            proc2 = subprocess.run(
-                ssh_win,
-                input=envelope,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
-            )
-            if proc2.returncode == 0 and proc2.stdout.strip():
-                proc = proc2
-                machine.os = "windows"
+            try:
+                proc2 = subprocess.run(
+                    ssh_win,
+                    input=envelope,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    check=False,
+                )
+                if proc2.returncode == 0 and proc2.stdout.strip():
+                    proc = proc2
+                    machine.os = "windows"
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
         if proc.returncode != 0:
             stderr = proc.stderr.strip() or proc.stdout.strip()

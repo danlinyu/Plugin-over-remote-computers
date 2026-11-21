@@ -282,8 +282,13 @@ def mount_sshfs(
             "writes",
             "--vfs-fast-fingerprint",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
-        if proc.returncode == 0 or is_mounted(local_dir):
+        try:
+            proc: Optional[subprocess.CompletedProcess[str]] = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=25, check=False
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            proc = None
+        if (proc is not None and proc.returncode == 0) or is_mounted(local_dir):
             return {
                 "ok": True,
                 "mode": f"rclone-{mount_subcmd}",
@@ -311,8 +316,15 @@ def mount_sshfs(
         if machine.ssh_identity_file:
             cmd.extend(["-o", f"IdentityFile={os.path.expanduser(machine.ssh_identity_file)}"])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        if proc.returncode == 0:
+        try:
+            proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "ok": False,
+                "error": f"sshfs mount failed: {exc}",
+                "endpoint": ep.to_dict(),
+            }
+        if proc2.returncode == 0:
             return {
                 "ok": True,
                 "mode": "sshfs",
@@ -322,7 +334,7 @@ def mount_sshfs(
             }
         return {
             "ok": False,
-            "error": f"sshfs mount failed: {proc.stderr.strip() or proc.stdout.strip()}",
+            "error": f"sshfs mount failed: {proc2.stderr.strip() or proc2.stdout.strip()}",
             "endpoint": ep.to_dict(),
         }
 
@@ -347,7 +359,10 @@ def unmount_sshfs(local_dir: Path) -> Dict[str, Any]:
         ["fusermount3", "-u", str(resolved)],
     ):
         if shutil.which(candidate_cmd[0]):
-            proc = subprocess.run(candidate_cmd, capture_output=True, text=True, timeout=10, check=False)
+            try:
+                proc = subprocess.run(candidate_cmd, capture_output=True, text=True, timeout=10, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                continue
             if proc.returncode == 0:
                 return {"ok": True, "unmounted": True, "local_path": str(resolved)}
 
@@ -434,8 +449,13 @@ def sync_workspace(
         else:
             cmd.extend([local_spec, remote_spec])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
-        if proc.returncode == 0:
+        try:
+            rsync_proc: Optional[subprocess.CompletedProcess[str]] = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=180, check=False
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            rsync_proc = None
+        if rsync_proc is not None and rsync_proc.returncode == 0:
             _write_harness_bridge_files(local_dir, machine, resolved_remote)
             return {
                 "ok": True,

@@ -182,15 +182,33 @@ def _scan_subnet_for_missing_hosts(
                 if nb:
                     name_guess = nb.lower()
             if not name_guess:
-                proc = subprocess.run(
-                    [
-                        "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
-                        "-o", "StrictHostKeyChecking=accept-new", f"{ssh_user}@{ip}", "hostname",
-                    ],
-                    capture_output=True, text=True, timeout=4, check=False,
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    name_guess = proc.stdout.strip().lower()
+                try:
+                    proc = subprocess.run(
+                        [
+                            "ssh",
+                            "-T",
+                            "-o",
+                            "BatchMode=yes",
+                            "-o",
+                            "ConnectTimeout=2",
+                            "-o",
+                            "ServerAliveInterval=2",
+                            "-o",
+                            "ServerAliveCountMax=1",
+                            "-o",
+                            "StrictHostKeyChecking=accept-new",
+                            f"{ssh_user}@{ip}",
+                            "hostname",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=4,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        name_guess = proc.stdout.strip().lower()
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
 
             for slot in ("spark01", "spark03", "spark04"):
                 if slot in name_guess and slot not in discovered:
@@ -215,16 +233,21 @@ def _scan_subnet_for_missing_hosts(
 def resolve_latest_macos_tailscale_pkg_url() -> str:
     """Resolve the exact latest `Tailscale-<ver>-macos.pkg` URL using macOS `/usr/bin/curl` (never blocked by WAF)."""
     index_url = "https://pkgs.tailscale.com/stable/"
-    proc = subprocess.run(
-        ["curl", "-fsSL", "--max-time", "12", index_url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode == 0 and proc.stdout:
-        matches = re.findall(r"Tailscale-[0-9.]+-macos\.pkg", proc.stdout)
-        if matches:
-            return f"{index_url}{matches[0]}"
+    try:
+        proc = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "12", index_url],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            matches = re.findall(r"Tailscale-([0-9]+(?:\.[0-9]+)+)-macos\.pkg", proc.stdout)
+            if matches:
+                best_ver = max(matches, key=lambda v: tuple(int(p) for p in v.split(".")))
+                return f"{index_url}Tailscale-{best_ver}-macos.pkg"
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     return f"{index_url}Tailscale-1.104.7-macos.pkg"
 
 
@@ -379,12 +402,15 @@ def probe_home_lan_candidates(
                 pc_alive_no_ssh = (pc_cand, ip)
                 break
 
-    missing_slots = {s for s in ("spark01", "spark03", "spark04", "pc") if s not in found}
-    if missing_slots:
+    missing_sparks = {s for s in ("spark01", "spark03", "spark04") if s not in found}
+    need_pc_scan = ("pc" not in found) and (pc_alive_no_ssh is None)
+    if missing_sparks or need_pc_scan:
         local_ip = _get_local_private_ipv4()
         if local_ip:
             prefix = ".".join(local_ip.split(".")[:3])
             known_ips = {ip for _, ip in found.values()}
+            if pc_alive_no_ssh is not None:
+                known_ips.add(pc_alive_no_ssh[1])
             sub_found, sub_win = _scan_subnet_for_missing_hosts(prefix, local_ip, known_ips, ssh_user)
             for slot, val in sub_found.items():
                 if slot not in found:
@@ -414,17 +440,30 @@ def ensure_local_ssh_key() -> Path:
 
 def check_batch_ssh(user: str, host: str, port: int = 22) -> bool:
     target = f"{user}@{host}" if user else host
-    proc = subprocess.run(
-        [
-            "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
-            "-o", "StrictHostKeyChecking=accept-new", "-p", str(port), target, "echo ok",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=8,
-        check=False,
-    )
-    return proc.returncode == 0 and "ok" in proc.stdout
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=4",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-p",
+                str(port),
+                target,
+                "echo ok",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        return proc.returncode == 0 and "ok" in proc.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def copy_ssh_key_interactive(
@@ -479,13 +518,27 @@ def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
         "[ -e \"$HOME/qwen38-service/tailscale\" ] "
         ") && echo DUPLICATE || echo CLEAN"
     )
-    proc = subprocess.run(
-        ["ssh", "-T", "-o", "BatchMode=yes", target, check_cmd],
-        capture_output=True,
-        text=True,
-        timeout=8,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=4",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                target,
+                check_cmd,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return
     if "DUPLICATE" not in proc.stdout:
         return
 
@@ -521,17 +574,18 @@ def ensure_rclone_installed_macos() -> Optional[str]:
 
     # Resolve latest release tag from GitHub API via curl (fallback v1.76.0)
     tag = "v1.76.0"
-    api_proc = subprocess.run(
-        ["curl", "-fsSL", "--max-time", "10", "https://api.github.com/repos/rclone/rclone/releases/latest"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if api_proc.returncode == 0 and api_proc.stdout.strip():
-        try:
+    try:
+        api_proc = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "10", "https://api.github.com/repos/rclone/rclone/releases/latest"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        if api_proc.returncode == 0 and api_proc.stdout.strip():
             tag = str(json.loads(api_proc.stdout).get("tag_name") or tag)
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     candidate_urls = [
         f"https://github.com/rclone/rclone/releases/download/{tag}/rclone-{tag}-osx-{zip_arch}.zip",
