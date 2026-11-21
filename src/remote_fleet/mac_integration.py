@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -518,6 +519,14 @@ def _mount_windows_all_drives(
         save_mounts_registry(reg)
 
     container_dir.mkdir(parents=True, exist_ok=True)
+    remote_home = str(ping.get("home") or "C:/").replace("\\", "/")
+    reg = load_mounts_registry()
+    reg[str(container_dir)] = {
+        "machine_id": machine.id,
+        "remote_root": remote_home,
+        "container_only": "1",
+    }
+    save_mounts_registry(reg)
 
     raw_drives = ping.get("drives") or ["C:/"]
     drive_letters: List[str] = []
@@ -556,7 +565,6 @@ def _mount_windows_all_drives(
             drive_errors.append(f"{letter}: {res.get('error')}")
 
     # Create/refresh `Home` shortcut (`~/RemoteComputers/pc/Home -> C/Users/danli`) for 1-click access to user profile
-    remote_home = str(ping.get("home") or "").replace("\\", "/")
     home_link = container_dir / "Home"
     home_created = False
     hm = re.match(r"^([A-Za-z]):/(.+)$", remote_home)
@@ -583,18 +591,16 @@ def _mount_windows_all_drives(
             _cleanup_unmounted_empty_dir(child)
 
     if not mounted_drives:
-        _cleanup_unmounted_empty_dir(container_dir)
+        # Never delete `container_dir` itself — keep its APFS inode permanent for macOS Sidebar Favorites!
         return {
             "ok": False,
             "machine_id": machine.id,
             "error": "; ".join(drive_errors) or "No Windows drives could be mounted.",
         }
 
-    entries_summary = [*([f"{d[0]} ({d})"] for d in mounted_drives)]
     flat_entries = [d[0] for d in mounted_drives]
     if home_created:
         flat_entries.insert(0, "Home")
-    _ = entries_summary
 
     return {
         "ok": True,
@@ -610,24 +616,391 @@ def _mount_windows_all_drives(
     }
 
 
+def _mount_posix_container(
+    machine: MachineConfig,
+    ep_dict: Dict[str, Any],
+    host: str,
+    ping: Dict[str, Any],
+    container_dir: Path,
+) -> Dict[str, Any]:
+    """Mount a Linux/POSIX computer inside a permanent local APFS container (`~/RemoteComputers/<id>/Home`, etc.).
+
+    Why a local APFS container folder instead of mounting NFS directly on `~/RemoteComputers/<id>`:
+    macOS 15 Sequoia & macOS 26 Tahoe `NSOpenPanel` (`openAndSavePanelService` in Antigravity, Claude, Codex)
+    resolves Sidebar Favorites strictly via APFS `Bookmark` `(Volume UUID + FileID)`. Mounting synthetic NFS
+    directly onto the Favorited folder masks its APFS FileID and triggers
+    `"<name>" can't be opened because the original item can't be found.` (deadlocking Electron sheet modals!).
+    Keeping `~/RemoteComputers/<id>` as an unmounted, permanent APFS folder makes Sidebar clicks 100% instant & immortal.
+    """
+    container_dir = container_dir.resolve()
+
+    # Transition cleanly if `container_dir` (`~/RemoteComputers/spark01`) was previously mounted directly
+    if is_mounted(container_dir):
+        unmount_sshfs(container_dir)
+    if is_mounted(container_dir):
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "error": f"Could not detach previous direct mount at {container_dir}; close any terminal inside {container_dir} and retry.",
+        }
+
+    container_dir.mkdir(parents=True, exist_ok=True)
+    remote_home = str(ping.get("home") or "/").replace("\\", "/")
+
+    reg = load_mounts_registry()
+    reg[str(container_dir)] = {
+        "machine_id": machine.id,
+        "remote_root": remote_home,
+        "container_only": "1",
+    }
+    save_mounts_registry(reg)
+
+    home_mp = (container_dir / "Home").resolve()
+    # If `Home` was previously a symlink, remove the symlink before creating mount directory
+    if home_mp.is_symlink():
+        try:
+            home_mp.unlink()
+        except OSError:
+            pass
+
+    home_res = _mount_sftp_directory(
+        machine=machine,
+        ep_dict=ep_dict,
+        host=host,
+        remote_target=remote_home,
+        mount_point=home_mp,
+        vol_label=f"Fleet-{machine.id}-Home",
+        log_stem=f"{machine.id}-Home",
+        allow_empty_fallback=True,
+    )
+    if not home_res.get("ok"):
+        return home_res
+
+    sample_entries = ["Home"]
+
+    # Convenience 1-click symlink `Projects -> Home/projects` (or `Workspace -> Home/workspace`) if present on remote
+    for label, sub_name in (("Projects", "projects"), ("Workspace", "workspace")):
+        link_path = container_dir / label
+        try:
+            if (home_mp / sub_name).is_dir():
+                if link_path.is_symlink() or link_path.is_file():
+                    link_path.unlink()
+                if not link_path.exists():
+                    link_path.symlink_to(f"Home/{sub_name}")
+                sample_entries.append(label)
+            elif link_path.is_symlink():
+                link_path.unlink()
+        except OSError:
+            pass
+
+    # Also auto-mount any non-empty external/data drives on Linux Sparks right inside `~/RemoteComputers/<id>/<slug>`
+    extra_mounted: List[str] = []
+    for ext_root in ping.get("extra_roots") or []:
+        ext_str = str(ext_root).strip()
+        if not ext_str or ext_str == remote_home or ext_str.startswith(remote_home.rstrip("/") + "/"):
+            continue
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ext_str.strip("/")).strip("-")
+        if not slug or slug in ("Home", "Projects", "Workspace"):
+            continue
+        ext_mp = (container_dir / slug).resolve()
+        ext_res = _mount_sftp_directory(
+            machine=machine,
+            ep_dict=ep_dict,
+            host=host,
+            remote_target=ext_str,
+            mount_point=ext_mp,
+            vol_label=f"Fleet-{machine.id}-{slug}",
+            log_stem=f"{machine.id}-{slug}",
+            allow_empty_fallback=False,
+        )
+        if ext_res.get("ok"):
+            extra_mounted.append(f"{ext_str} -> {slug}")
+            sample_entries.append(slug)
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "machine_id": machine.id,
+        "engine": home_res.get("engine"),
+        "mount_point": str(container_dir),
+        "home_mount": str(home_mp),
+        "remote_root": remote_home,
+        "already_mounted": bool(home_res.get("already_mounted")),
+        "visible_count": int(home_res.get("visible_count") or 0),
+        "sample_entries": sample_entries,
+        "endpoint": ep_dict,
+    }
+    if extra_mounted:
+        out["extra_mounts"] = extra_mounted
+    return out
+
+
+_SWIFT_REPAIR_SIDEBAR_SOURCE = r'''
+import Foundation
+
+let args = CommandLine.arguments
+guard args.count >= 3 else { exit(0) }
+let targetDir = args[1]
+let machineIds = Array(args.dropFirst(2))
+
+let home = NSHomeDirectory()
+let sflDir = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/com.apple.sharedfilelist")
+let favCandidates = [
+    sflDir.appendingPathComponent("com.apple.LSSharedFileList.FavoriteItems.sfl4"),
+    sflDir.appendingPathComponent("com.apple.LSSharedFileList.FavoriteItems.sfl3")
+]
+let volCandidates = [
+    sflDir.appendingPathComponent("com.apple.LSSharedFileList.FavoriteVolumes.sfl4"),
+    sflDir.appendingPathComponent("com.apple.LSSharedFileList.FavoriteVolumes.sfl3")
+]
+
+let classes: [AnyClass] = [
+    NSDictionary.self, NSMutableDictionary.self,
+    NSArray.self, NSMutableArray.self,
+    NSString.self, NSMutableString.self,
+    NSNumber.self, NSData.self, NSMutableData.self,
+    NSUUID.self, NSURL.self, NSDate.self
+]
+
+var changedAnyFile = false
+
+for sflURL in favCandidates {
+    guard FileManager.default.fileExists(atPath: sflURL.path),
+          let raw = try? Data(contentsOf: sflURL),
+          let unarchived = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: classes, from: raw),
+          var rootDict = unarchived as? [String: Any],
+          let oldItems = rootDict["items"] as? [[String: Any]]
+    else { continue }
+
+    var fileChanged = false
+    var newItems: [[String: Any]] = []
+    var seenIds = Set<String>()
+
+    for var item in oldItems {
+        if let bm = item["Bookmark"] as? Data {
+            let vals = URL.resourceValues(forKeys: [.pathKey, .nameKey, .localizedNameKey], fromBookmarkData: bm)
+            let bmPath = vals?.path ?? ""
+            let bmName = vals?.name ?? vals?.localizedName ?? (bmPath as NSString).lastPathComponent
+
+            if bmName == "spark02" || bmName == "Fleet-spark02" || bmPath.hasSuffix("/RemoteComputers/spark02") {
+                fileChanged = true
+                continue
+            }
+
+            var matchedId: String? = nil
+            for mid in machineIds {
+                if bmPath == "\(targetDir)/\(mid)" || bmName == mid || bmName == "Fleet-\(mid)" {
+                    matchedId = mid
+                    break
+                }
+            }
+
+            if let mid = matchedId {
+                if seenIds.contains(mid) {
+                    fileChanged = true
+                    continue
+                }
+                seenIds.insert(mid)
+                let freshURL = URL(fileURLWithPath: "\(targetDir)/\(mid)", isDirectory: true)
+                if FileManager.default.fileExists(atPath: freshURL.path) {
+                    var isStale = false
+                    let resolved = try? URL(
+                        resolvingBookmarkData: bm,
+                        options: [.withoutUI, .withoutMounting],
+                        relativeTo: nil,
+                        bookmarkDataIsStale: &isStale
+                    )
+                    let resolvedID = (try? resolved?.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier) as? NSObject
+                    let freshID = (try? freshURL.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier) as? NSObject
+                    let sameResource = (resolvedID != nil && freshID != nil && resolvedID!.isEqual(freshID!))
+
+                    if resolved == nil || isStale || !sameResource {
+                        if let freshBM = try? freshURL.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                            item["Bookmark"] = freshBM
+                            fileChanged = true
+                        }
+                    }
+                }
+            }
+        }
+        newItems.append(item)
+    }
+
+    for mid in machineIds where !seenIds.contains(mid) {
+        let freshURL = URL(fileURLWithPath: "\(targetDir)/\(mid)", isDirectory: true)
+        if FileManager.default.fileExists(atPath: freshURL.path),
+           let freshBM = try? freshURL.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+            newItems.append([
+                "visibility": 0,
+                "CustomItemProperties": [String: Any](),
+                "uuid": UUID().uuidString,
+                "Bookmark": freshBM
+            ])
+            fileChanged = true
+        }
+    }
+
+    if fileChanged {
+        rootDict["items"] = newItems
+        if let outData = try? NSKeyedArchiver.archivedData(withRootObject: rootDict, requiringSecureCoding: false) {
+            let bakURL = sflURL.appendingPathExtension("remote-fleet.bak")
+            if !FileManager.default.fileExists(atPath: bakURL.path) {
+                try? raw.write(to: bakURL)
+            }
+            if (try? outData.write(to: sflURL, options: .atomic)) != nil {
+                changedAnyFile = true
+            }
+        }
+    }
+}
+
+// Also remove any broken synthetic `Fleet-*` volume ghosts from `FavoriteVolumes.sfl4/.sfl3`
+for volURL in volCandidates {
+    guard FileManager.default.fileExists(atPath: volURL.path),
+          let raw = try? Data(contentsOf: volURL),
+          let unarchived = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: classes, from: raw),
+          var rootDict = unarchived as? [String: Any],
+          let oldItems = rootDict["items"] as? [[String: Any]]
+    else { continue }
+
+    var volChanged = false
+    var keptItems: [[String: Any]] = []
+    for item in oldItems {
+        if let bm = item["Bookmark"] as? Data {
+            let vals = URL.resourceValues(forKeys: [.pathKey, .nameKey, .localizedNameKey], fromBookmarkData: bm)
+            let bmName = vals?.name ?? vals?.localizedName ?? ""
+            let bmPath = vals?.path ?? ""
+            if bmName.hasPrefix("Fleet-") || bmPath.contains("/RemoteComputers/") {
+                var isStale = false
+                let resolved = try? URL(
+                    resolvingBookmarkData: bm,
+                    options: [.withoutUI, .withoutMounting],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &isStale
+                )
+                if resolved == nil || isStale {
+                    volChanged = true
+                    continue
+                }
+            }
+        }
+        keptItems.append(item)
+    }
+    if volChanged {
+        rootDict["items"] = keptItems
+        if let outData = try? NSKeyedArchiver.archivedData(withRootObject: rootDict, requiringSecureCoding: false) {
+            if (try? outData.write(to: volURL, options: .atomic)) != nil {
+                changedAnyFile = true
+            }
+        }
+    }
+}
+
+if changedAnyFile {
+    print("SIDEBAR_REPAIRED")
+} else {
+    print("SIDEBAR_OK")
+}
+'''
+
+
+def repair_macos_sidebar_favorites(base_dir: Path, machine_ids: List[str]) -> Dict[str, Any]:
+    """Repair stale macOS Finder & `NSOpenPanel` Sidebar Favorites (`FavoriteItems.sfl4` / `.sfl3`)
+    so `pc`, `spark01`, `spark03`, `spark04` never trigger `'original item can't be found'` in Antigravity/Claude/Codex."""
+    if platform.system().lower() != "darwin" or not machine_ids:
+        return {"ok": True, "repaired": False, "skipped": True}
+
+    swift_bin = shutil.which("swift") or "/usr/bin/swift"
+    if not os.path.exists(swift_bin):
+        return {"ok": False, "repaired": False, "error": "swift not found"}
+
+    # Always dismiss any stuck `openAndSavePanelService` sheet modal first if one is hung
+    try:
+        subprocess.run(
+            ["killall", "com.apple.appkit.xpc.openAndSavePanelService"],
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    cache_dir = Path.home() / ".cache" / "remote-fleet"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    helper_bin = cache_dir / "repair-sidebar-v1"
+    swift_file = cache_dir / "repair_sidebar_v1.swift"
+
+    cmd: List[str]
+    if helper_bin.is_file() and os.access(helper_bin, os.X_OK):
+        cmd = [str(helper_bin), str(base_dir.resolve()), *machine_ids]
+    else:
+        swift_file.write_text(_SWIFT_REPAIR_SIDEBAR_SOURCE, encoding="utf-8")
+        swiftc_bin = shutil.which("swiftc") or "/usr/bin/swiftc"
+        compiled = False
+        if os.path.exists(swiftc_bin):
+            try:
+                comp = subprocess.run(
+                    [swiftc_bin, "-O", str(swift_file), "-o", str(helper_bin)],
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                    check=False,
+                )
+                compiled = comp.returncode == 0 and helper_bin.is_file()
+            except (subprocess.TimeoutExpired, OSError):
+                compiled = False
+        if compiled:
+            cmd = [str(helper_bin), str(base_dir.resolve()), *machine_ids]
+        else:
+            cmd = [swift_bin, str(swift_file), str(base_dir.resolve()), *machine_ids]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"ok": False, "repaired": False, "error": str(exc)}
+
+    repaired = "SIDEBAR_REPAIRED" in proc.stdout
+    if repaired:
+        # SIGKILL `sharedfilelistd` so it reloads our newly written `.sfl4`/`.sfl3` from disk without overwriting on exit
+        for kill_cmd in (
+            ["killall", "-9", "sharedfilelistd"],
+            ["killall", "com.apple.appkit.xpc.openAndSavePanelService"],
+        ):
+            try:
+                subprocess.run(kill_cmd, capture_output=True, timeout=3, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        time.sleep(0.35)
+        try:
+            subprocess.run(["killall", "Finder"], capture_output=True, timeout=4, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return {"ok": proc.returncode == 0, "repaired": repaired, "stdout": proc.stdout.strip()}
+
+
 def mount_single_machine_root(
     transport: FleetTransport,
     machine: MachineConfig,
     base_dir: Path,
 ) -> Dict[str, Any]:
-    """Mount a remote computer onto `~/RemoteComputers/<machine.id>` (all drives on Windows; home + extra mounts on Linux)."""
+    """Mount a remote computer inside permanent local APFS container `~/RemoteComputers/<machine.id>/`."""
     mount_point = (base_dir / machine.id).resolve()
 
     ep = transport.resolve_endpoint(machine)
     if ep.transport == "local":
         return {"ok": True, "skipped": True, "reason": "self (local computer)", "machine_id": machine.id}
+
+    # Ensure any legacy direct mount on `mount_point` is detached and keep `mount_point` permanent on APFS!
+    if is_mounted(mount_point):
+        unmount_sshfs(mount_point)
+    if not is_mounted(mount_point):
+        mount_point.mkdir(parents=True, exist_ok=True)
+
     if not ep.reachable:
-        _cleanup_unmounted_empty_dir(mount_point)
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
     ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
     if not ping.get("ok"):
-        _cleanup_unmounted_empty_dir(mount_point)
         return {
             "ok": False,
             "machine_id": machine.id,
@@ -638,44 +1011,7 @@ def mount_single_machine_root(
         machine.os = "windows"
         return _mount_windows_all_drives(machine, ep.to_dict(), ep.host, ping, mount_point)
 
-    remote_home = str(ping.get("home") or "/").replace("\\", "/")
-    primary_res = _mount_sftp_directory(
-        machine=machine,
-        ep_dict=ep.to_dict(),
-        host=ep.host,
-        remote_target=remote_home,
-        mount_point=mount_point,
-        vol_label=f"Fleet-{machine.id}",
-        log_stem=machine.id,
-        allow_empty_fallback=True,
-    )
-
-    # Also auto-mount any non-empty external/data drives on Linux Sparks (e.g. /data, /raid, /scratch, /mnt/*, /media/*)
-    extra_mounted: List[str] = []
-    for ext_root in ping.get("extra_roots") or []:
-        ext_str = str(ext_root).strip()
-        if not ext_str or ext_str == remote_home or ext_str.startswith(remote_home.rstrip("/") + "/"):
-            continue
-        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ext_str.strip("/")).strip("-")
-        if not slug:
-            continue
-        ext_mp = (base_dir / f"{machine.id}-{slug}").resolve()
-        ext_res = _mount_sftp_directory(
-            machine=machine,
-            ep_dict=ep.to_dict(),
-            host=ep.host,
-            remote_target=ext_str,
-            mount_point=ext_mp,
-            vol_label=f"Fleet-{machine.id}-{slug}",
-            log_stem=f"{machine.id}-{slug}",
-            allow_empty_fallback=False,
-        )
-        if ext_res.get("ok"):
-            extra_mounted.append(f"{ext_str} -> {ext_mp.name}")
-
-    if extra_mounted and primary_res.get("ok"):
-        primary_res["extra_mounts"] = extra_mounted
-    return primary_res
+    return _mount_posix_container(machine, ep.to_dict(), ep.host, ping, mount_point)
 
 
 def mount_all_machines(
@@ -683,20 +1019,28 @@ def mount_all_machines(
     transport: FleetTransport,
     base_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>` and refresh Finder."""
+    """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` and repair macOS Sidebar Favorites."""
     root = (base_dir or (Path.home() / "RemoteComputers")).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     transport.resolve_all_endpoints(config.machines, force_refresh=True)
 
     results = []
+    remote_ids: List[str] = []
     for m in config.machines:
-        results.append(mount_single_machine_root(transport, m, root))
+        res = mount_single_machine_root(transport, m, root)
+        results.append(res)
+        if not res.get("skipped"):
+            remote_ids.append(m.id)
 
-    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/pc`, etc.) so contents update live
-    if platform.system().lower() == "darwin" and shutil.which("osascript"):
+    sidebar_info: Dict[str, Any] = {"repaired": False}
+    if platform.system().lower() == "darwin" and remote_ids:
+        sidebar_info = repair_macos_sidebar_favorites(root, remote_ids)
+
+    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) so contents update live
+    if platform.system().lower() == "darwin" and shutil.which("osascript") and not sidebar_info.get("repaired"):
         refresh_targets = [root]
-        for m in config.machines:
-            cand = root / m.id
+        for mid in remote_ids:
+            cand = root / mid
             if cand.is_dir():
                 refresh_targets.append(cand)
         script_lines = [
@@ -713,7 +1057,11 @@ def mount_all_machines(
         except (subprocess.TimeoutExpired, OSError):
             pass
 
-    return {"base_dir": str(root), "results": results}
+    return {
+        "base_dir": str(root),
+        "results": results,
+        "sidebar_repaired": bool(sidebar_info.get("repaired")),
+    }
 
 
 def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:

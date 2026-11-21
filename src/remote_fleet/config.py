@@ -599,6 +599,8 @@ def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[Ac
         if not machine_id:
             continue
         rel_posix = str(rel).replace("\\", "/")
+        if info.get("container_only") == "1" and rel_posix not in ("", "."):
+            continue
         if rel_posix in ("", "."):
             is_win_drive = len(trimmed_root) == 2 and trimmed_root[0].isalpha() and trimmed_root[1] == ":"
             if is_win_drive or raw_remote_root == "/":

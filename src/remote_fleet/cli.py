@@ -783,11 +783,13 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
                 drv_list = ", ".join(r["drives"])
                 print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} (drives: {drv_list} + Home shortcut)")
             else:
+                entries = ", ".join(r.get("sample_entries") or ["Home"])
                 state = "already mounted" if r.get("already_mounted") else f"mounted via {r.get('engine')}"
-                extra_note = f" | extra: {', '.join(r['extra_mounts'])}" if r.get("extra_mounts") else ""
-                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({state}{extra_note})")
+                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({entries} | {state})")
         else:
             print(f"  [WARN] {mid:<12} -> {r.get('error')}")
+    if summary.get("sidebar_repaired"):
+        print("  [FIXED] Repaired macOS Finder & Open-Dialog Sidebar Favorites (`pc`, `spark01`, `spark03`, `spark04`)!")
     return 0
 
 

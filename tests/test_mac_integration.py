@@ -425,6 +425,111 @@ class TestMacIntegration(unittest.TestCase):
                 else:
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
+    def test_posix_spark_apfs_container_mount_and_inode_persistence(self) -> None:
+        """Verify `spark01` uses an unmounted local APFS container (`~/RemoteComputers/spark01/{Home,Projects}`)
+        whose inode NEVER changes even when unreachable — preventing macOS NSOpenPanel 'original item can't be found'."""
+        from unittest.mock import patch
+        from remote_fleet.config import FleetConfig, MachineConfig
+        from remote_fleet.mac_integration import _mount_posix_container, mount_single_machine_root
+        from remote_fleet.transport import EndpointStatus, FleetTransport
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            base_dir = tmp_path / "RemoteComputers"
+            spark_container = base_dir / "spark01"
+            spark_container.mkdir(parents=True)
+            original_inode = spark_container.stat().st_ino
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                spark = MachineConfig(
+                    id="spark01",
+                    name="DGX Spark 01",
+                    lan_host="spark01.local",
+                    tailscale_host="100.85.241.120",
+                    user="danlinyu",
+                    os="linux",
+                )
+                tr = FleetTransport(FleetConfig(machines=[spark]))
+
+                # 1. Even if temporarily offline, `spark01` APFS directory & inode must NEVER be deleted!
+                offline_ep = EndpointStatus(
+                    machine_id="spark01", transport="none", host="", port=22, reachable=False, error="offline"
+                )
+                with patch.object(tr, "resolve_endpoint", return_value=offline_ep):
+                    off_res = mount_single_machine_root(tr, spark, base_dir)
+                self.assertFalse(off_res["ok"])
+                self.assertTrue(spark_container.is_dir())
+                self.assertEqual(spark_container.stat().st_ino, original_inode)
+
+                # 2. When online, detaches any legacy direct mount, keeps same container inode, mounts `Home` + `Projects`
+                legacy_mounted = {"state": True}
+
+                def fake_is_mounted(p: Path) -> bool:
+                    return legacy_mounted["state"] if p.resolve() == spark_container.resolve() else False
+
+                def fake_unmount(p: Path) -> dict[str, object]:
+                    if p.resolve() == spark_container.resolve():
+                        legacy_mounted["state"] = False
+                    return {"ok": True}
+
+                def fake_mount_sftp_dir(
+                    machine: MachineConfig,
+                    ep_dict: dict[str, object],
+                    host: str,
+                    remote_target: str,
+                    mount_point: Path,
+                    vol_label: str,
+                    log_stem: str,
+                    allow_empty_fallback: bool = True,
+                ) -> dict[str, object]:
+                    mount_point.mkdir(parents=True, exist_ok=True)
+                    if remote_target == "/home/danlinyu":
+                        (mount_point / "projects" / "qwen38").mkdir(parents=True, exist_ok=True)
+                    from remote_fleet.config import load_mounts_registry, save_mounts_registry
+                    reg = load_mounts_registry()
+                    reg[str(mount_point.resolve())] = {"machine_id": machine.id, "remote_root": remote_target}
+                    save_mounts_registry(reg)
+                    return {"ok": True, "engine": "rclone-nfsmount", "visible_count": 3, "already_mounted": False}
+
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", side_effect=fake_is_mounted),
+                    patch("remote_fleet.mac_integration.unmount_sshfs", side_effect=fake_unmount),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_sftp_dir),
+                ):
+                    res = _mount_posix_container(
+                        spark,
+                        {"transport": "lan", "host": "spark01.local"},
+                        "spark01.local",
+                        {"ok": True, "os": "linux", "home": "/home/danlinyu", "extra_roots": ["/data"]},
+                        spark_container,
+                    )
+
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(spark_container.stat().st_ino, original_inode)
+                self.assertTrue((spark_container / "Projects").is_symlink())
+                self.assertIn("data", res["sample_entries"])
+
+                # Path resolution from `Home/...`, `Projects/...`, extra drive `data/...`, and container root itself
+                s_home = load_active_project(cwd=spark_container / "Home" / "projects" / "qwen38")
+                assert s_home is not None
+                self.assertEqual((s_home.machine_id, s_home.remote_path), ("spark01", "/home/danlinyu/projects/qwen38"))
+
+                s_proj = load_active_project(cwd=spark_container / "Projects" / "qwen38")
+                assert s_proj is not None
+                self.assertEqual((s_proj.machine_id, s_proj.remote_path), ("spark01", "/home/danlinyu/projects/qwen38"))
+
+                s_root = load_active_project(cwd=spark_container)
+                assert s_root is not None
+                self.assertEqual((s_root.machine_id, s_root.remote_path), ("spark01", "/home/danlinyu"))
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
 
 if __name__ == "__main__":
     unittest.main()
