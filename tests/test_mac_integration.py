@@ -304,6 +304,127 @@ class TestMacIntegration(unittest.TestCase):
         self.assertIn("--sftp-skip-links", chosen_flags)
         self.assertIn("--sftp-shell-type", chosen_flags)
 
+        # Drive root preflight (`allow_empty_fallback=False`) must NEVER fall back to `:sftp:` (home dir)
+        drive_calls: list[str] = []
+
+        def fake_drive_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+            drive_calls.append(cmd[2])
+            if cmd[2] == ":sftp:D:/":
+                return sp.CompletedProcess(cmd, 0, "Datasets/\nModels/\n", "")
+            return sp.CompletedProcess(cmd, 1, "", "bad path")
+
+        with patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_drive_run):
+            drv_path, drv_flags, drv_err = _select_verified_rclone_sftp_flags(
+                "/usr/local/bin/rclone", pc, "192.168.68.70", "/D:/", allow_empty_fallback=False
+            )
+        self.assertEqual(drv_err, "")
+        self.assertEqual(drv_path, "D:/")
+        self.assertIsNotNone(drv_flags)
+        self.assertNotIn(":sftp:", drive_calls)
+
+    def test_windows_multi_drive_mounts_and_path_mapping(self) -> None:
+        """Verify Windows `pc` mounts EVERY drive (`C`, `D`, `E`) + `Home -> C/Users/danli`
+        and maps paths from any drive or `Home` back to the exact Windows path."""
+        from unittest.mock import patch
+        from remote_fleet.config import MachineConfig
+        from remote_fleet.mac_integration import _mount_windows_all_drives
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            pc_container = tmp_path / "RemoteComputers" / "pc"
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                pc = MachineConfig(
+                    id="pc",
+                    name="Home PC (danlin-hud)",
+                    lan_host="192.168.68.70",
+                    tailscale_host="100.93.148.108",
+                    user="danli",
+                    os="windows",
+                )
+                ping = {
+                    "ok": True,
+                    "os": "windows",
+                    "home": "C:\\Users\\danli",
+                    "drives": ["C:/", "D:/", "E:/"],
+                }
+
+                # Simulate legacy direct mount on `pc_container` being cleanly unmounted first
+                legacy_mounted = {"state": True}
+
+                def fake_is_mounted(p: Path) -> bool:
+                    if p.resolve() == pc_container.resolve():
+                        return legacy_mounted["state"]
+                    return False
+
+                def fake_unmount(p: Path) -> dict[str, object]:
+                    if p.resolve() == pc_container.resolve():
+                        legacy_mounted["state"] = False
+                    return {"ok": True, "unmounted": True}
+
+                def fake_mount_sftp_dir(
+                    machine: MachineConfig,
+                    ep_dict: dict[str, object],
+                    host: str,
+                    remote_target: str,
+                    mount_point: Path,
+                    vol_label: str,
+                    log_stem: str,
+                    allow_empty_fallback: bool = True,
+                ) -> dict[str, object]:
+                    mount_point.mkdir(parents=True, exist_ok=True)
+                    if remote_target == "C:/":
+                        (mount_point / "Users" / "danli" / "CodeBuddy").mkdir(parents=True, exist_ok=True)
+                        (mount_point / "Projects" / "win-app").mkdir(parents=True, exist_ok=True)
+                    elif remote_target == "D:/":
+                        (mount_point / "Datasets" / "climate").mkdir(parents=True, exist_ok=True)
+                    elif remote_target == "E:/":
+                        (mount_point / "Scratch").mkdir(parents=True, exist_ok=True)
+                    from remote_fleet.config import load_mounts_registry, save_mounts_registry
+                    reg = load_mounts_registry()
+                    reg[str(mount_point.resolve())] = {"machine_id": machine.id, "remote_root": remote_target}
+                    save_mounts_registry(reg)
+                    return {"ok": True, "visible_count": 2, "already_mounted": False}
+
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", side_effect=fake_is_mounted),
+                    patch("remote_fleet.mac_integration.unmount_sshfs", side_effect=fake_unmount),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_sftp_dir),
+                ):
+                    res = _mount_windows_all_drives(pc, {"transport": "lan", "host": "192.168.68.70"}, "192.168.68.70", ping, pc_container)
+
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(res["drives"], ["C:/", "D:/", "E:/"])
+                self.assertTrue((pc_container / "Home").is_symlink())
+
+                # 1. Folder on D: drive -> D:/Datasets/climate
+                s_d = load_active_project(cwd=pc_container / "D" / "Datasets" / "climate")
+                assert s_d is not None
+                self.assertEqual((s_d.machine_id, s_d.remote_path), ("pc", "D:/Datasets/climate"))
+
+                # 2. Root of E: drive -> E:/
+                s_e = load_active_project(cwd=pc_container / "E")
+                assert s_e is not None
+                self.assertEqual((s_e.machine_id, s_e.remote_path), ("pc", "E:/"))
+
+                # 3. Folder on C: outside Users\danli -> C:/Projects/win-app
+                s_c = load_active_project(cwd=pc_container / "C" / "Projects" / "win-app")
+                assert s_c is not None
+                self.assertEqual((s_c.machine_id, s_c.remote_path), ("pc", "C:/Projects/win-app"))
+
+                # 4. Folder opened through `Home` shortcut -> C:/Users/danli/CodeBuddy
+                s_h = load_active_project(cwd=pc_container / "Home" / "CodeBuddy")
+                assert s_h is not None
+                self.assertEqual((s_h.machine_id, s_h.remote_path), ("pc", "C:/Users/danli/CodeBuddy"))
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
 
 if __name__ == "__main__":
     unittest.main()

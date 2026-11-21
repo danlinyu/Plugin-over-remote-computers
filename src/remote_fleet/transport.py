@@ -108,11 +108,56 @@ def _windows_drives():
     if os.name != "nt":
         return []
     drives = []
-    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-        root = f"{letter}:\\"
-        if os.path.exists(root):
-            drives.append(root)
-    return drives
+    try:
+        import ctypes
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if not (bitmask & (1 << i)):
+                continue
+            letter = chr(ord("A") + i)
+            if letter in ("A", "B"):
+                continue
+            root = f"{letter}:\\"
+            dtype = ctypes.windll.kernel32.GetDriveTypeW(root)
+            # 2=REMOVABLE (USB/SD), 3=FIXED (NVMe/SSD/HDD/External USB SSD), 4=REMOTE, 6=RAMDISK (skip 5=CDROM)
+            if dtype in (2, 3, 6) and os.path.isdir(root):
+                drives.append(f"{letter}:/")
+            elif dtype == 4:
+                drives.append(f"{letter}:/")
+    except Exception:
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            if os.path.isdir(f"{letter}:\\"):
+                drives.append(f"{letter}:/")
+    return drives or ["C:/"]
+
+def _posix_extra_roots():
+    if os.name == "nt":
+        return []
+    extra = []
+    seen = set()
+    for p_str in ("/data", "/raid", "/scratch", "/datasets"):
+        p_obj = Path(p_str)
+        if p_obj.is_dir():
+            extra.append(p_str)
+            seen.add(p_str)
+    uname = Path.home().name
+    for base_str in ("/mnt", "/media", f"/media/{uname}", f"/run/media/{uname}"):
+        b_obj = Path(base_str)
+        if b_obj.is_dir():
+            try:
+                for child in sorted(b_obj.iterdir()):
+                    if child.is_dir() and not child.name.startswith(".") and str(child) not in seen:
+                        if str(child) in (f"/media/{uname}", f"/run/media/{uname}"):
+                            continue
+                        try:
+                            if any(child.iterdir()):
+                                extra.append(str(child))
+                                seen.add(str(child))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    return extra
 
 def handle(req: dict) -> dict:
     op = req.get("op")
@@ -124,6 +169,8 @@ def handle(req: dict) -> dict:
             "arch": platform.machine(),
             "python": platform.python_version(),
             "home": str(Path.home()),
+            "drives": _windows_drives(),
+            "extra_roots": _posix_extra_roots(),
         }
 
     if op == "browse_folders":
@@ -136,6 +183,10 @@ def handle(req: dict) -> dict:
             resolved_roots.append({"label": r, "path": str(rp), "exists": rp.is_dir()})
         for drv in _windows_drives():
             resolved_roots.append({"label": drv, "path": drv, "exists": True})
+        for ext_r in _posix_extra_roots():
+            resolved_roots.append({"label": ext_r, "path": ext_r, "exists": True})
+        if os.name != "nt":
+            resolved_roots.append({"label": "/", "path": "/", "exists": True})
 
         if not raw_path:
             # Pick first existing default root or home
@@ -989,7 +1040,9 @@ class FleetTransport:
             "}\n"
             "$d = $raw | ConvertFrom-Json\n"
             "if ($d.req.op -eq 'ping') {\n"
-            "  @{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; python = 'not-installed'; home = $HOME; cwd = (Get-Location).Path } | ConvertTo-Json -Compress\n"
+            "  $drvs = @(Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[C-Z]:\\\\$' -and (Test-Path $_.Root) } | ForEach-Object { \"$($_.Name):/\" })\n"
+            "  if (-not $drvs -or $drvs.Count -eq 0) { $drvs = @('C:/') }\n"
+            "  @{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; python = 'not-installed'; home = $HOME; drives = $drvs; cwd = (Get-Location).Path } | ConvertTo-Json -Compress\n"
             "  exit 0\n"
             "}\n"
             "@{ ok = $false; error = \"Python 3 not found on Windows ($env:COMPUTERNAME); install Python or Miniconda on Windows for remote worker ops.\" } | ConvertTo-Json -Compress\n"

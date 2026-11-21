@@ -582,21 +582,31 @@ def save_mounts_registry(mapping: Dict[str, Dict[str, str]]) -> Path:
 
 
 def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[ActiveProjectState]:
-    """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/spark-1/foo`), map it back."""
+    """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/pc/D/foo`), map it back."""
     cur = (start_dir or Path.cwd()).resolve()
     registry = load_mounts_registry()
-    for local_mount_str, info in registry.items():
+    # Sort longest mount paths first so nested drive mounts (`~/RemoteComputers/pc/D`) take precedence
+    sorted_entries = sorted(registry.items(), key=lambda kv: len(kv[0]), reverse=True)
+    for local_mount_str, info in sorted_entries:
         try:
             mount_root = Path(local_mount_str).expanduser().resolve()
             rel = cur.relative_to(mount_root)
         except Exception:
             continue
         machine_id = str(info.get("machine_id") or "").strip()
-        remote_root = str(info.get("remote_root") or "~").rstrip("/")
+        raw_remote_root = str(info.get("remote_root") or "~")
+        trimmed_root = raw_remote_root.rstrip("/")
         if not machine_id:
             continue
         rel_posix = str(rel).replace("\\", "/")
-        remote_path = remote_root if rel_posix in ("", ".") else f"{remote_root}/{rel_posix}"
+        if rel_posix in ("", "."):
+            is_win_drive = len(trimmed_root) == 2 and trimmed_root[0].isalpha() and trimmed_root[1] == ":"
+            if is_win_drive or raw_remote_root == "/":
+                remote_path = f"{trimmed_root}/"
+            else:
+                remote_path = trimmed_root
+        else:
+            remote_path = f"/{rel_posix}" if trimmed_root == "" else f"{trimmed_root}/{rel_posix}"
         return ActiveProjectState(
             machine_id=machine_id,
             remote_path=remote_path,

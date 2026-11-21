@@ -859,9 +859,13 @@ def run_bootstrap(
             continue
         if r.get("ok"):
             mounted_count += 1
-            samples = ", ".join(r.get("sample_entries") or [])
-            cnt = r.get("visible_count", 0)
-            print(f"  [MOUNTED] {mid:<10} -> {r.get('mount_point')} ({cnt} items visible: {samples})")
+            if r.get("drives"):
+                drv_str = ", ".join(r["drives"])
+                print(f"  [MOUNTED] {mid:<10} -> {r.get('mount_point')} (all drives: {drv_str} + Home)")
+            else:
+                samples = ", ".join(r.get("sample_entries") or [])
+                cnt = r.get("visible_count", 0)
+                print(f"  [MOUNTED] {mid:<10} -> {r.get('mount_point')} ({cnt} items visible: {samples})")
         else:
             print(f"  [SKIP]    {mid:<10} -> {r.get('error')}")
 

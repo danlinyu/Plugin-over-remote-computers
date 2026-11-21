@@ -347,7 +347,7 @@ def mount_sshfs(
 
 
 def unmount_sshfs(local_dir: Path) -> Dict[str, Any]:
-    """Unmount an rclone/SSHFS-mounted workspace directory."""
+    """Unmount an rclone/SSHFS-mounted workspace directory (even if open in macOS Finder)."""
     resolved = local_dir.expanduser().resolve()
     if not is_mounted(resolved):
         return {"ok": True, "unmounted": False, "message": f"{resolved} is not currently mounted."}
@@ -355,6 +355,8 @@ def unmount_sshfs(local_dir: Path) -> Dict[str, Any]:
     for candidate_cmd in (
         ["umount", str(resolved)],
         ["diskutil", "unmount", str(resolved)],
+        ["diskutil", "unmount", "force", str(resolved)],
+        ["umount", "-f", str(resolved)],
         ["fusermount", "-u", str(resolved)],
         ["fusermount3", "-u", str(resolved)],
     ):
@@ -363,9 +365,14 @@ def unmount_sshfs(local_dir: Path) -> Dict[str, Any]:
                 proc = subprocess.run(candidate_cmd, capture_output=True, text=True, timeout=10, check=False)
             except (subprocess.TimeoutExpired, OSError):
                 continue
-            if proc.returncode == 0:
-                return {"ok": True, "unmounted": True, "local_path": str(resolved)}
+            if proc.returncode == 0 or not is_mounted(resolved):
+                for _ in range(10):
+                    if not is_mounted(resolved):
+                        return {"ok": True, "unmounted": True, "local_path": str(resolved)}
+                    time.sleep(0.1)
 
+    if not is_mounted(resolved):
+        return {"ok": True, "unmounted": True, "local_path": str(resolved)}
     return {"ok": False, "error": f"Failed to unmount {resolved}"}
 
 

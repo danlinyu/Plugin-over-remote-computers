@@ -779,8 +779,13 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
         if r.get("skipped"):
             print(f"  [SKIP] {mid:<12} ({r.get('reason')})")
         elif r.get("ok"):
-            state = "already mounted" if r.get("already_mounted") else f"mounted via {r.get('engine')}"
-            print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({state})")
+            if r.get("drives"):
+                drv_list = ", ".join(r["drives"])
+                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} (drives: {drv_list} + Home shortcut)")
+            else:
+                state = "already mounted" if r.get("already_mounted") else f"mounted via {r.get('engine')}"
+                extra_note = f" | extra: {', '.join(r['extra_mounts'])}" if r.get("extra_mounts") else ""
+                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({state}{extra_note})")
         else:
             print(f"  [WARN] {mid:<12} -> {r.get('error')}")
     return 0

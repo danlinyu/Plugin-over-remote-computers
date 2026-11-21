@@ -206,6 +206,7 @@ def _select_verified_rclone_sftp_flags(
     machine: MachineConfig,
     host: str,
     rclone_path: str,
+    allow_empty_fallback: bool = True,
 ) -> Tuple[str, Optional[List[str]], str]:
     """Run a fast `rclone lsf --max-depth 1` preflight to pick working SFTP path & flags before mounting."""
     flag_candidates: List[Tuple[str, List[str]]] = []
@@ -218,7 +219,7 @@ def _select_verified_rclone_sftp_flags(
         "none",
     ]
     if machine.os == "windows":
-        # Skip legacy NTFS junction traps in C:\Users\<user> (Cookies, My Documents, Local Settings, etc.)
+        # Skip legacy NTFS junction traps in C:\Users\<user> and C:\ (Cookies, My Documents, Documents and Settings, etc.)
         common_sftp_opts.append("--sftp-skip-links")
 
     key_path = _detect_default_ssh_key(machine)
@@ -244,14 +245,23 @@ def _select_verified_rclone_sftp_flags(
     ]
     flag_candidates.append(("external-ssh", ext_flags))
 
-    # Candidate SFTP root paths (Windows OpenSSH `sftp-server.exe` starts in C:\Users\<user>, so `:sftp:` empty path also maps directly to home)
-    raw_paths: List[str] = [rclone_path]
+    raw_paths: List[str] = []
     if machine.os == "windows":
-        stripped = rclone_path.lstrip("/")
-        if stripped and stripped not in raw_paths:
-            raw_paths.append(stripped)
-    if "" not in raw_paths:
-        raw_paths.append("")
+        drv_match = re.match(r"^/?([A-Za-z]):/?$", rclone_path.strip())
+        if drv_match and not allow_empty_fallback:
+            letter = drv_match.group(1).upper()
+            raw_paths = [f"/{letter}:/", f"{letter}:/", f"/{letter}:", f"{letter}:"]
+        else:
+            raw_paths.append(rclone_path)
+            stripped = rclone_path.lstrip("/")
+            if stripped and stripped not in raw_paths:
+                raw_paths.append(stripped)
+            if allow_empty_fallback and "" not in raw_paths:
+                raw_paths.append("")
+    else:
+        raw_paths.append(rclone_path)
+        if allow_empty_fallback and "" not in raw_paths:
+            raw_paths.append("")
 
     errors: List[str] = []
     for cand_path in raw_paths:
@@ -276,48 +286,34 @@ def _select_verified_rclone_sftp_flags(
     return rclone_path, None, "; ".join(errors)
 
 
-def mount_single_machine_root(
-    transport: FleetTransport,
+def _mount_sftp_directory(
     machine: MachineConfig,
-    base_dir: Path,
+    ep_dict: Dict[str, Any],
+    host: str,
+    remote_target: str,
+    mount_point: Path,
+    vol_label: str,
+    log_stem: str,
+    allow_empty_fallback: bool = True,
 ) -> Dict[str, Any]:
-    """Mount a remote computer's home directory onto `~/RemoteComputers/<machine.id>` and verify real files appear."""
-    mount_point = (base_dir / machine.id).resolve()
+    """Mount a single remote folder or drive (`remote_target`) onto `mount_point` and verify live entries."""
+    mount_point = mount_point.resolve()
 
-    ep = transport.resolve_endpoint(machine)
-    if ep.transport == "local":
-        return {"ok": True, "skipped": True, "reason": "self (local computer)", "machine_id": machine.id}
-    if not ep.reachable:
-        _cleanup_unmounted_empty_dir(mount_point)
-        return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
-
-    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
-    if not ping.get("ok"):
-        _cleanup_unmounted_empty_dir(mount_point)
-        return {
-            "ok": False,
-            "machine_id": machine.id,
-            "error": f"SSH auth failed on {ep.host}: {ping.get('error')}",
-        }
-
-    remote_home = str(ping.get("home") or "/").replace("\\", "/")
-
-    # Already mounted: verify we can actually list entries inside it!
     if mount_point.is_dir() and is_mounted(mount_point):
         try:
             visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
             reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
             save_mounts_registry(reg)
             return {
                 "ok": True,
                 "machine_id": machine.id,
                 "mount_point": str(mount_point),
-                "remote_root": remote_home,
+                "remote_root": remote_target,
                 "already_mounted": True,
                 "visible_count": len(visible),
                 "sample_entries": visible[:6],
-                "endpoint": ep.to_dict(),
+                "endpoint": ep_dict,
             }
         except OSError:
             unmount_sshfs(mount_point)
@@ -336,30 +332,36 @@ def mount_single_machine_root(
         }
 
     mount_point.mkdir(parents=True, exist_ok=True)
-    # Remove any stray Finder `.DS_Store` before mounting
     try:
         (mount_point / ".DS_Store").unlink(missing_ok=True)
     except OSError:
         pass
 
-    # 1. Preferred on macOS: `rclone nfsmount` spawned cleanly in detached session + verified via `ismount()` & `os.listdir()`
     if rclone_bin and (is_macos or not sshfs_bin):
-        initial_rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
+        initial_rclone_path = (
+            f"/{remote_target}"
+            if (len(remote_target) >= 2 and remote_target[1] == ":")
+            else remote_target
+        )
         verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
-            rclone_bin, machine, ep.host, initial_rclone_path
+            rclone_bin,
+            machine,
+            host,
+            initial_rclone_path,
+            allow_empty_fallback=allow_empty_fallback,
         )
         if not sftp_flags:
             _cleanup_unmounted_empty_dir(mount_point)
             return {
                 "ok": False,
                 "machine_id": machine.id,
-                "error": f"rclone SFTP preflight failed on {ep.host}: {preflight_err}",
+                "error": f"rclone SFTP preflight failed on {host} ({remote_target}): {preflight_err}",
             }
 
         subcmd = "nfsmount" if is_macos else "mount"
         log_dir = Path.home() / ".cache" / "remote-fleet"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"rclone-{machine.id}.log"
+        log_file = log_dir / f"rclone-{log_stem}.log"
 
         cmd = [
             rclone_bin,
@@ -376,7 +378,7 @@ def mount_single_machine_root(
             "--dir-cache-time",
             "5s",
             "--volname",
-            f"Fleet-{machine.id}",
+            vol_label,
         ]
 
         with open(log_file, "w", encoding="utf-8") as lf:
@@ -406,20 +408,19 @@ def mount_single_machine_root(
             except OSError:
                 pass
             reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
             save_mounts_registry(reg)
             return {
                 "ok": True,
                 "machine_id": machine.id,
                 "engine": f"rclone-{subcmd}",
                 "mount_point": str(mount_point),
-                "remote_root": remote_home,
+                "remote_root": remote_target,
                 "visible_count": len(visible),
                 "sample_entries": visible[:6],
-                "endpoint": ep.to_dict(),
+                "endpoint": ep_dict,
             }
 
-        # Clean up child if still hanging without mounting
         if proc.poll() is None:
             try:
                 proc.terminate()
@@ -436,12 +437,11 @@ def mount_single_machine_root(
                 "error": f"rclone {subcmd} did not mount {mount_point}: {log_tail or 'timeout'}",
             }
 
-    # 2. Fallback: `sshfs`
     if sshfs_bin:
         target_spec = (
-            f"{machine.user}@{ep.host}:{remote_home}"
+            f"{machine.user}@{host}:{remote_target}"
             if machine.user
-            else f"{ep.host}:{remote_home}"
+            else f"{host}:{remote_target}"
         )
         cmd = [
             sshfs_bin,
@@ -467,17 +467,17 @@ def mount_single_machine_root(
         if proc2.returncode == 0 and is_mounted(mount_point):
             visible = [x for x in sorted(os.listdir(mount_point)) if not x.startswith(".")]
             reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
             save_mounts_registry(reg)
             return {
                 "ok": True,
                 "machine_id": machine.id,
                 "engine": "sshfs",
                 "mount_point": str(mount_point),
-                "remote_root": remote_home,
+                "remote_root": remote_target,
                 "visible_count": len(visible),
                 "sample_entries": visible[:6],
-                "endpoint": ep.to_dict(),
+                "endpoint": ep_dict,
             }
         _cleanup_unmounted_empty_dir(mount_point)
         return {
@@ -488,6 +488,194 @@ def mount_single_machine_root(
 
     _cleanup_unmounted_empty_dir(mount_point)
     return {"ok": False, "machine_id": machine.id, "error": "Mount failed."}
+
+
+def _mount_windows_all_drives(
+    machine: MachineConfig,
+    ep_dict: Dict[str, Any],
+    host: str,
+    ping: Dict[str, Any],
+    container_dir: Path,
+) -> Dict[str, Any]:
+    """Mount EVERY drive (`C:/`, `D:/`, `E:/`, ...) on a Windows PC under `~/RemoteComputers/<id>/<Drive>`
+    plus a `Home` shortcut pointing straight to `C/Users/<user>`."""
+    container_dir = container_dir.resolve()
+
+    # Transition cleanly if `container_dir` (`~/RemoteComputers/pc`) was previously mounted directly to `C:\Users\<user>`
+    if is_mounted(container_dir):
+        unmount_sshfs(container_dir)
+    if is_mounted(container_dir):
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "error": f"Could not detach previous single-folder mount at {container_dir}; close any terminal inside {container_dir} and retry.",
+        }
+
+    # Remove legacy direct container key from mounts.json so nested `<container>/<Drive>` entries govern path resolution
+    reg = load_mounts_registry()
+    if str(container_dir) in reg:
+        reg.pop(str(container_dir), None)
+        save_mounts_registry(reg)
+
+    container_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_drives = ping.get("drives") or ["C:/"]
+    drive_letters: List[str] = []
+    for drv in raw_drives:
+        s = str(drv).strip().replace("\\", "/")
+        if s and s[0].isalpha():
+            letter = s[0].upper()
+            if letter not in drive_letters:
+                drive_letters.append(letter)
+    if not drive_letters:
+        drive_letters = ["C"]
+
+    mounted_drives: List[str] = []
+    drive_errors: List[str] = []
+    total_visible = 0
+    any_already = True
+
+    for letter in drive_letters:
+        drive_mp = (container_dir / letter).resolve()
+        res = _mount_sftp_directory(
+            machine=machine,
+            ep_dict=ep_dict,
+            host=host,
+            remote_target=f"{letter}:/",
+            mount_point=drive_mp,
+            vol_label=f"Fleet-{machine.id}-{letter}",
+            log_stem=f"{machine.id}-{letter}",
+            allow_empty_fallback=False,
+        )
+        if res.get("ok"):
+            mounted_drives.append(f"{letter}:/")
+            total_visible += int(res.get("visible_count") or 0)
+            if not res.get("already_mounted"):
+                any_already = False
+        else:
+            drive_errors.append(f"{letter}: {res.get('error')}")
+
+    # Create/refresh `Home` shortcut (`~/RemoteComputers/pc/Home -> C/Users/danli`) for 1-click access to user profile
+    remote_home = str(ping.get("home") or "").replace("\\", "/")
+    home_link = container_dir / "Home"
+    home_created = False
+    hm = re.match(r"^([A-Za-z]):/(.+)$", remote_home)
+    if hm:
+        h_letter = hm.group(1).upper()
+        h_sub = hm.group(2).strip("/")
+        if f"{h_letter}:/" in mounted_drives and h_sub:
+            rel_target = f"{h_letter}/{h_sub}"
+            try:
+                if home_link.is_symlink() or home_link.exists():
+                    if home_link.is_symlink() or home_link.is_file():
+                        home_link.unlink()
+                if not home_link.exists():
+                    home_link.symlink_to(rel_target)
+                home_created = True
+            except OSError:
+                pass
+
+    # Clean up any stale unmounted empty drive directories from previously unplugged USB drives
+    for child in list(container_dir.iterdir()):
+        if child.name == "Home" or child.is_symlink():
+            continue
+        if child.is_dir() and child.name not in [d[0] for d in mounted_drives]:
+            _cleanup_unmounted_empty_dir(child)
+
+    if not mounted_drives:
+        _cleanup_unmounted_empty_dir(container_dir)
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "error": "; ".join(drive_errors) or "No Windows drives could be mounted.",
+        }
+
+    entries_summary = [*([f"{d[0]} ({d})"] for d in mounted_drives)]
+    flat_entries = [d[0] for d in mounted_drives]
+    if home_created:
+        flat_entries.insert(0, "Home")
+    _ = entries_summary
+
+    return {
+        "ok": True,
+        "machine_id": machine.id,
+        "engine": "rclone-nfsmount-drives" if platform.system().lower() == "darwin" else "rclone-mount-drives",
+        "mount_point": str(container_dir),
+        "remote_root": ", ".join(mounted_drives),
+        "drives": mounted_drives,
+        "already_mounted": any_already,
+        "visible_count": total_visible,
+        "sample_entries": flat_entries,
+        "endpoint": ep_dict,
+    }
+
+
+def mount_single_machine_root(
+    transport: FleetTransport,
+    machine: MachineConfig,
+    base_dir: Path,
+) -> Dict[str, Any]:
+    """Mount a remote computer onto `~/RemoteComputers/<machine.id>` (all drives on Windows; home + extra mounts on Linux)."""
+    mount_point = (base_dir / machine.id).resolve()
+
+    ep = transport.resolve_endpoint(machine)
+    if ep.transport == "local":
+        return {"ok": True, "skipped": True, "reason": "self (local computer)", "machine_id": machine.id}
+    if not ep.reachable:
+        _cleanup_unmounted_empty_dir(mount_point)
+        return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
+
+    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
+    if not ping.get("ok"):
+        _cleanup_unmounted_empty_dir(mount_point)
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "error": f"SSH auth failed on {ep.host}: {ping.get('error')}",
+        }
+
+    if machine.os == "windows" or str(ping.get("os") or "").lower() == "windows":
+        machine.os = "windows"
+        return _mount_windows_all_drives(machine, ep.to_dict(), ep.host, ping, mount_point)
+
+    remote_home = str(ping.get("home") or "/").replace("\\", "/")
+    primary_res = _mount_sftp_directory(
+        machine=machine,
+        ep_dict=ep.to_dict(),
+        host=ep.host,
+        remote_target=remote_home,
+        mount_point=mount_point,
+        vol_label=f"Fleet-{machine.id}",
+        log_stem=machine.id,
+        allow_empty_fallback=True,
+    )
+
+    # Also auto-mount any non-empty external/data drives on Linux Sparks (e.g. /data, /raid, /scratch, /mnt/*, /media/*)
+    extra_mounted: List[str] = []
+    for ext_root in ping.get("extra_roots") or []:
+        ext_str = str(ext_root).strip()
+        if not ext_str or ext_str == remote_home or ext_str.startswith(remote_home.rstrip("/") + "/"):
+            continue
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ext_str.strip("/")).strip("-")
+        if not slug:
+            continue
+        ext_mp = (base_dir / f"{machine.id}-{slug}").resolve()
+        ext_res = _mount_sftp_directory(
+            machine=machine,
+            ep_dict=ep.to_dict(),
+            host=ep.host,
+            remote_target=ext_str,
+            mount_point=ext_mp,
+            vol_label=f"Fleet-{machine.id}-{slug}",
+            log_stem=f"{machine.id}-{slug}",
+            allow_empty_fallback=False,
+        )
+        if ext_res.get("ok"):
+            extra_mounted.append(f"{ext_str} -> {ext_mp.name}")
+
+    if extra_mounted and primary_res.get("ok"):
+        primary_res["extra_mounts"] = extra_mounted
+    return primary_res
 
 
 def mount_all_machines(
@@ -504,17 +692,22 @@ def mount_all_machines(
     for m in config.machines:
         results.append(mount_single_machine_root(transport, m, root))
 
-    # Refresh macOS Finder window if open so newly mounted folders show contents immediately
+    # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/pc`, etc.) so contents update live
     if platform.system().lower() == "darwin" and shutil.which("osascript"):
+        refresh_targets = [root]
+        for m in config.machines:
+            cand = root / m.id
+            if cand.is_dir():
+                refresh_targets.append(cand)
+        script_lines = [
+            f'tell application "Finder" to if exists (POSIX file "{p}" as alias) then update (POSIX file "{p}" as alias)'
+            for p in refresh_targets
+        ]
         try:
             subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    f'tell application "Finder" to if exists (POSIX file "{root}" as alias) then update (POSIX file "{root}" as alias)',
-                ],
+                ["osascript", "-e", "\n".join(script_lines)],
                 capture_output=True,
-                timeout=3,
+                timeout=4,
                 check=False,
             )
         except (subprocess.TimeoutExpired, OSError):
@@ -528,8 +721,15 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     results = []
     if root.is_dir():
         for child in sorted(root.iterdir()):
-            if child.is_dir():
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if is_mounted(child):
                 results.append({"path": str(child), **unmount_sshfs(child)})
+            else:
+                # Unmount nested multi-drive mounts (e.g. `~/RemoteComputers/pc/C`, `~/RemoteComputers/pc/D`)
+                for sub in sorted(child.iterdir()):
+                    if not sub.is_symlink() and sub.is_dir() and is_mounted(sub):
+                        results.append({"path": str(sub), **unmount_sshfs(sub)})
     return {"base_dir": str(root), "results": results}
 
 
