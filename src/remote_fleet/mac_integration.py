@@ -16,7 +16,9 @@ from remote_fleet.config import (
     FleetConfig,
     MachineConfig,
     TailscaleNodeInfo,
+    is_local_tailscale_running,
     is_self_machine,
+    is_tailscale_only_host,
     load_mounts_registry,
     save_mounts_registry,
 )
@@ -33,35 +35,52 @@ LAUNCH_AGENT_LABEL = "com.remote-fleet.automount"
 def render_ssh_config_block(
     config: FleetConfig,
     tailscale_self: Optional[TailscaleNodeInfo] = None,
+    tailscale_available: Optional[bool] = None,
 ) -> str:
-    """Render `~/.ssh/config` entries with automatic Home-LAN-first -> Tailscale fallback.
+    """Render `~/.ssh/config` entries.
 
-    Harnesses with built-in SSH host pickers (like OpenAI Codex Desktop and Antigravity Remote-SSH)
-    automatically read `~/.ssh/config` and show `spark-1`, `spark-2`, `spark-3`, `pc` in their UI!
+    - When Tailscale IS installed/running locally: emits automatic Home-LAN-first -> Tailscale fallback.
+    - When Tailscale is NOT installed on this Mac: emits clean, direct Home LAN `HostName` entries
+      so SSH never falls through to an unroutable `100.x.y.z` IP!
     """
+    ts_active = (
+        tailscale_available
+        if tailscale_available is not None
+        else ((tailscale_self is not None) or is_local_tailscale_running())
+    )
+    mode_note = (
+        "Automatic Home LAN -> Tailscale failover."
+        if ts_active
+        else "Home LAN direct mode (Tailscale not currently installed/running on this computer)."
+    )
     lines: List[str] = [
         SSH_BEGIN_MARKER,
-        "# Managed by remote-fleet (`fleet ssh-config`). Automatic Home LAN -> Tailscale failover.",
+        f"# Managed by remote-fleet (`fleet ssh-config`). {mode_note}",
     ]
-    probe_sec = max(0.2, round(config.lan_probe_timeout_ms / 1000.0, 2))
+    base_probe = max(0.3, round(config.lan_probe_timeout_ms / 1000.0, 2))
 
     for m in config.machines:
         if is_self_machine(m, tailscale_self):
             continue
         primary_lan = m.lan_host.strip()
-        fallback_ts = (m.tailscale_host or m.lan_host or m.id).strip()
+        raw_ts = (m.tailscale_host or "").strip()
+        ts_usable = bool(raw_ts) and (ts_active or not is_tailscale_only_host(raw_ts))
         port = m.port or 22
 
-        if config.prefer_lan and primary_lan and fallback_ts and primary_lan != fallback_ts:
+        if config.prefer_lan and primary_lan and ts_usable and primary_lan != raw_ts:
+            probe_sec = max(1.2, base_probe) if primary_lan.lower().endswith(".local") else base_probe
             probe_py = (
                 f"python3 -c 'import socket; s=socket.create_connection((\"{primary_lan}\",{port}),{probe_sec}); s.close()' 2>/dev/null"
             )
             lines.append(f'Match host {m.id} exec "{probe_py}"')
             lines.append(f"    HostName {primary_lan}")
             lines.append("")
+            default_hostname = raw_ts
+        else:
+            default_hostname = primary_lan or (raw_ts if ts_usable else primary_lan) or m.id
 
         lines.append(f"Host {m.id}")
-        lines.append(f"    HostName {fallback_ts if (primary_lan != fallback_ts and fallback_ts) else (primary_lan or fallback_ts)}")
+        lines.append(f"    HostName {default_hostname}")
         if m.user:
             lines.append(f"    User {m.user}")
         if port != 22:
@@ -80,6 +99,7 @@ def sync_ssh_config(
     config: FleetConfig,
     tailscale_self: Optional[TailscaleNodeInfo] = None,
     ssh_config_path: Optional[Path] = None,
+    tailscale_available: Optional[bool] = None,
 ) -> Path:
     """Idempotently write `remote-fleet` hosts into `~/.ssh/config` with safe 0600 permissions."""
     target = (ssh_config_path or (Path.home() / ".ssh" / "config")).expanduser().resolve()
@@ -91,7 +111,7 @@ def sync_ssh_config(
             pass
 
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
-    block = render_ssh_config_block(config, tailscale_self)
+    block = render_ssh_config_block(config, tailscale_self, tailscale_available=tailscale_available)
 
     pattern = re.compile(
         re.escape(SSH_BEGIN_MARKER) + r".*?" + re.escape(SSH_END_MARKER) + r"\n?",
@@ -100,7 +120,6 @@ def sync_ssh_config(
     if pattern.search(existing):
         updated = pattern.sub(block, existing)
     else:
-        # Insert before `Host *` if present so user catch-all defaults stay at bottom
         wildcard_match = re.search(r"(?m)^Host\s+\*\s*$", existing)
         if wildcard_match:
             idx = wildcard_match.start()
@@ -155,6 +174,24 @@ def _detect_default_ssh_key(machine: MachineConfig) -> Optional[str]:
     return None
 
 
+def build_rclone_sftp_ssh_command(machine: MachineConfig, host: str) -> str:
+    """Build `--sftp-ssh` string so rclone uses `/usr/bin/ssh` directly (inheriting ~/.ssh/config, NVIDIA Sync, Keychain)."""
+    parts = [
+        shutil.which("ssh") or "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if machine.port and machine.port != 22:
+        parts.extend(["-p", str(machine.port)])
+    if machine.ssh_identity_file:
+        parts.extend(["-i", os.path.expanduser(machine.ssh_identity_file)])
+    target = f"{machine.user}@{host}" if machine.user else host
+    parts.append(target)
+    return " ".join(f'"{p}"' if " " in p else p for p in parts)
+
+
 def mount_single_machine_root(
     transport: FleetTransport,
     machine: MachineConfig,
@@ -198,38 +235,32 @@ def mount_single_machine_root(
 
     # Prefer `rclone nfsmount` on macOS: native macOS user-space NFSv3, zero macFUSE kernel extensions!
     if rclone_bin and (is_macos or not sshfs_bin):
-        sftp_opts = [f"host={ep.host}"]
-        if machine.user:
-            sftp_opts.append(f"user={machine.user}")
-        if machine.port and machine.port != 22:
-            sftp_opts.append(f"port={machine.port}")
-        key_path = _detect_default_ssh_key(machine)
-        if key_path:
-            sftp_opts.append(f"key_file={key_path}")
-        elif _ssh_agent_has_keys():
-            sftp_opts.append("key_use_agent=true")
-
         # Windows OpenSSH SFTP paths start with `/C:/Users/...` when absolute
         rclone_path = f"/{remote_home}" if (len(remote_home) > 2 and remote_home[1] == ":") else remote_home
-        remote_spec = f":sftp,{','.join(sftp_opts)}:{rclone_path}"
         subcmd = "nfsmount" if is_macos else "mount"
+        ssh_ext = build_rclone_sftp_ssh_command(machine, ep.host)
+
+        # Important on macOS: `--daemon-wait 5s` avoids rclone's 60s default fixed sleep on Darwin!
         cmd = [
             rclone_bin,
             subcmd,
-            remote_spec,
+            f":sftp:{rclone_path}",
             str(mount_point),
+            "--sftp-ssh",
+            ssh_ext,
             "--daemon",
+            "--daemon-wait",
+            "5s",
             "--vfs-cache-mode",
             "writes",
+            "--vfs-fast-fingerprint",
             "--dir-cache-time",
             "5s",
-            "--attr-timeout",
-            "3s",
             "--volname",
             f"Fleet-{machine.id}",
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
-        if proc.returncode == 0:
+        if proc.returncode == 0 or is_mounted(mount_point):
             reg = load_mounts_registry()
             reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
             save_mounts_registry(reg)
@@ -241,24 +272,49 @@ def mount_single_machine_root(
                 "remote_root": remote_home,
                 "endpoint": ep.to_dict(),
             }
-        # If key_file had a passphrase and ssh-agent has keys, retry with key_use_agent=true
-        if key_path and _ssh_agent_has_keys():
-            retry_opts = [o for o in sftp_opts if not o.startswith("key_file=")] + ["key_use_agent=true"]
-            cmd[2] = f":sftp,{','.join(retry_opts)}:{rclone_path}"
-            proc2 = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
-            if proc2.returncode == 0:
-                reg = load_mounts_registry()
-                reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
-                save_mounts_registry(reg)
-                return {
-                    "ok": True,
-                    "machine_id": machine.id,
-                    "engine": f"rclone-{subcmd}",
-                    "mount_point": str(mount_point),
-                    "remote_root": remote_home,
-                    "endpoint": ep.to_dict(),
-                }
-        err_msg = proc.stderr.strip() or proc.stdout.strip()
+
+        # Fallback to native rclone SFTP Go client with key_file if `--sftp-ssh` failed
+        sftp_opts = [f"host={ep.host}"]
+        if machine.user:
+            sftp_opts.append(f"user={machine.user}")
+        if machine.port and machine.port != 22:
+            sftp_opts.append(f"port={machine.port}")
+        key_path = _detect_default_ssh_key(machine)
+        if key_path:
+            sftp_opts.append(f"key_file={key_path}")
+        elif _ssh_agent_has_keys():
+            sftp_opts.append("key_use_agent=true")
+
+        cmd_fallback = [
+            rclone_bin,
+            subcmd,
+            f":sftp,{','.join(sftp_opts)}:{rclone_path}",
+            str(mount_point),
+            "--daemon",
+            "--daemon-wait",
+            "5s",
+            "--vfs-cache-mode",
+            "writes",
+            "--vfs-fast-fingerprint",
+            "--dir-cache-time",
+            "5s",
+            "--volname",
+            f"Fleet-{machine.id}",
+        ]
+        proc2 = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=25, check=False)
+        if proc2.returncode == 0 or is_mounted(mount_point):
+            reg = load_mounts_registry()
+            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_home}
+            save_mounts_registry(reg)
+            return {
+                "ok": True,
+                "machine_id": machine.id,
+                "engine": f"rclone-{subcmd}",
+                "mount_point": str(mount_point),
+                "remote_root": remote_home,
+                "endpoint": ep.to_dict(),
+            }
+        err_msg = proc2.stderr.strip() or proc.stderr.strip() or proc2.stdout.strip()
         if not sshfs_bin:
             return {"ok": False, "machine_id": machine.id, "error": f"rclone {subcmd} failed: {err_msg}"}
 

@@ -67,11 +67,12 @@ KNOWN_TAILSCALE_IPS: Dict[str, str] = {
 }
 
 
-def _tcp_open(host: str, port: int = 22, timeout: float = 0.65) -> Optional[str]:
+def _tcp_open(host: str, port: int = 22, timeout: float = 0.8) -> Optional[str]:
     """Return resolved IP if `host:port` accepts TCP within `timeout`, else None."""
+    effective_timeout = max(1.3, timeout) if host.lower().endswith(".local") else timeout
     try:
         ip = socket.gethostbyname(host)
-        with socket.create_connection((ip, port), timeout=timeout):
+        with socket.create_connection((ip, port), timeout=effective_timeout):
             return ip
     except Exception:
         return None
@@ -92,11 +93,138 @@ def _host_resolves_or_pings(host: str) -> Optional[str]:
     return ip
 
 
-def ensure_macos_tailscale_connected() -> None:
-    """Check if Tailscale on macOS is stopped/disconnected and prompt/start it."""
+def _get_local_private_ipv4() -> Optional[str]:
+    """Detect this Mac's primary Home LAN IPv4 address (e.g. `192.168.68.x`) without sending traffic."""
+    for target in ("192.168.68.1", "8.8.8.8"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((target, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip.startswith(("192.168.", "10.", "172.")):
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+def _query_netbios_name(ip: str, timeout: float = 0.35) -> str:
+    """Send a standard 50-byte UDP 137 NetBIOS NBSTAT query to identify a Windows 11 PC by name on Home LAN."""
+    packet = (
+        b"\x82\x28\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01"
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (ip, 137))
+        resp, _ = sock.recvfrom(1024)
+        if len(resp) > 57:
+            num_names = resp[56]
+            offset = 57
+            for _ in range(num_names):
+                if offset + 18 > len(resp):
+                    break
+                raw_name = resp[offset : offset + 15].decode("ascii", errors="ignore").strip()
+                suffix = resp[offset + 15]
+                flags = (resp[offset + 16] << 8) | resp[offset + 17]
+                is_group = bool(flags & 0x8000)
+                if suffix == 0x00 and not is_group and raw_name:
+                    return raw_name
+                offset += 18
+    except Exception:
+        pass
+    finally:
+        sock.close()
+    return ""
+
+
+def _scan_subnet_for_missing_hosts(
+    subnet_prefix: str,
+    local_ip: str,
+    already_found_ips: set[str],
+    ssh_user: str,
+) -> Tuple[Dict[str, Tuple[str, str]], Optional[Tuple[str, str]]]:
+    """Scan `<subnet_prefix>.1..254` in ~1.2s to find `spark04` or Windows PC `danlin-hud` even without mDNS or Tailscale."""
+    discovered: Dict[str, Tuple[str, str]] = {}
+    win_no_ssh: Optional[Tuple[str, str]] = None
+
+    def _probe_single_ip(ip: str) -> Tuple[str, bool, bool]:
+        if ip == local_ip or ip in already_found_ips:
+            return ip, False, False
+        ssh_ok = False
+        try:
+            with socket.create_connection((ip, 22), timeout=0.28):
+                ssh_ok = True
+        except Exception:
+            pass
+        win_ok = False
+        if not ssh_ok:
+            for wp in (445, 3389, 135):
+                try:
+                    with socket.create_connection((ip, wp), timeout=0.22):
+                        win_ok = True
+                        break
+                except Exception:
+                    continue
+        return ip, ssh_ok, win_ok
+
+    all_ips = [f"{subnet_prefix}.{i}" for i in range(1, 255)]
+    with ThreadPoolExecutor(max_workers=64) as pool:
+        scan_results = list(pool.map(_probe_single_ip, all_ips))
+
+    for ip, ssh_ok, win_ok in scan_results:
+        if ssh_ok:
+            # Identify hostname via reverse DNS, NetBIOS, or quick BatchMode SSH `hostname`
+            name_guess = ""
+            try:
+                name_guess = socket.gethostbyaddr(ip)[0].lower()
+            except Exception:
+                pass
+            if not name_guess:
+                nb = _query_netbios_name(ip)
+                if nb:
+                    name_guess = nb.lower()
+            if not name_guess:
+                proc = subprocess.run(
+                    [
+                        "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+                        "-o", "StrictHostKeyChecking=accept-new", f"{ssh_user}@{ip}", "hostname",
+                    ],
+                    capture_output=True, text=True, timeout=4, check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    name_guess = proc.stdout.strip().lower()
+
+            for slot in ("spark01", "spark03", "spark04"):
+                if slot in name_guess and slot not in discovered:
+                    discovered[slot] = (ip, ip)
+            if ("danlin-hud" in name_guess or "danlindep" in name_guess) and "pc" not in discovered:
+                discovered["pc"] = (ip, ip)
+
+        elif win_ok and win_no_ssh is None:
+            nb = _query_netbios_name(ip).lower()
+            rdns = ""
+            try:
+                rdns = socket.gethostbyaddr(ip)[0].lower()
+            except Exception:
+                pass
+            label = nb or rdns
+            if "danlin-hud" in label or "danlin" in label or not label:
+                win_no_ssh = (label or ip, ip)
+
+    return discovered, win_no_ssh
+
+
+def ensure_macos_tailscale_connected() -> bool:
+    """Check if Tailscale is installed & running on this Mac. Returns True if running."""
     ts_bin = find_tailscale_binary()
     if not ts_bin:
-        return
+        print(
+            "  [HOME LAN MODE] Tailscale is not installed on this Mac Mini — using pure Home LAN "
+            "(Tailscale is completely optional while at home)."
+        )
+        return False
     try:
         proc = subprocess.run(
             [ts_bin, "status", "--json"],
@@ -110,14 +238,11 @@ def ensure_macos_tailscale_connected() -> None:
             state = str(data.get("BackendState") or "")
             if state == "Running":
                 print("  [TAILSCALE] Local Tailscale is connected and running.")
-                return
-            print(f"  [TAILSCALE] Local Tailscale state is '{state}'; attempting to connect...")
-            subprocess.run([ts_bin, "up"], timeout=8, check=False)
+                return True
+            print(f"  [TAILSCALE] Local Tailscale state is '{state}' — using Home LAN.")
     except Exception:
-        print(
-            "  [TAILSCALE] Tip: Click the Tailscale icon in your top-right macOS menu bar -> Connect "
-            "so Tailscale IPs (100.x.x.x) work alongside Home LAN!"
-        )
+        pass
+    return False
 
 
 def scan_arp_neighbors() -> List[Tuple[str, str]]:
@@ -137,11 +262,10 @@ def scan_arp_neighbors() -> List[Tuple[str, str]]:
     return out
 
 
-def probe_home_lan_candidates() -> Tuple[Dict[str, Tuple[str, str]], Optional[Tuple[str, str]]]:
-    """Probe `spark01`, `spark03`, `spark04`, and `danlin-hud` (`pc`) on Home LAN.
-
-    Returns `(ssh_open_map, pc_alive_without_ssh)`.
-    """
+def probe_home_lan_candidates(
+    ssh_user: str = "danlinyu", tailscale_running: bool = False
+) -> Tuple[Dict[str, Tuple[str, str]], Optional[Tuple[str, str]]]:
+    """Probe `spark01`, `spark03`, `spark04`, and `danlin-hud` (`pc`) on Home LAN."""
     found: Dict[str, Tuple[str, str]] = {}
     tasks: List[Tuple[str, str]] = []
     for slot, names in CANDIDATE_LAN_HOSTS.items():
@@ -149,13 +273,12 @@ def probe_home_lan_candidates() -> Tuple[Dict[str, Tuple[str, str]], Optional[Tu
             tasks.append((slot, name))
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = [(slot, name, pool.submit(_tcp_open, name, 22, 0.65)) for slot, name in tasks]
+        futs = [(slot, name, pool.submit(_tcp_open, name, 22, 0.8)) for slot, name in tasks]
         for slot, name, fut in futs:
             ip = fut.result()
             if ip and slot not in found:
                 found[slot] = (name, ip)
 
-    # Check ARP table for spark01 / spark03 / spark04 / danlin-hud
     for hname, ip in scan_arp_neighbors():
         low = hname.lower()
         for slot in ("spark01", "spark03", "spark04"):
@@ -167,11 +290,28 @@ def probe_home_lan_candidates() -> Tuple[Dict[str, Tuple[str, str]], Optional[Tu
 
     pc_alive_no_ssh: Optional[Tuple[str, str]] = None
     if "pc" not in found:
-        for pc_cand in ("danlin-hud.local", "danlin-hud", KNOWN_TAILSCALE_IPS["pc"]):
+        pc_cands = ["danlin-hud.local", "danlin-hud"]
+        if tailscale_running:
+            pc_cands.append(KNOWN_TAILSCALE_IPS["pc"])
+        for pc_cand in pc_cands:
             ip = _host_resolves_or_pings(pc_cand)
             if ip:
                 pc_alive_no_ssh = (pc_cand, ip)
                 break
+
+    # If spark04 or pc wasn't found via mDNS/ARP yet, do a fast 1.2s /24 Home LAN subnet scan!
+    missing_slots = {s for s in ("spark01", "spark03", "spark04", "pc") if s not in found}
+    if missing_slots:
+        local_ip = _get_local_private_ipv4()
+        if local_ip:
+            prefix = ".".join(local_ip.split(".")[:3])
+            known_ips = {ip for _, ip in found.values()}
+            sub_found, sub_win = _scan_subnet_for_missing_hosts(prefix, local_ip, known_ips, ssh_user)
+            for slot, val in sub_found.items():
+                if slot not in found:
+                    found[slot] = val
+            if pc_alive_no_ssh is None and sub_win is not None:
+                pc_alive_no_ssh = sub_win
 
     return found, pc_alive_no_ssh
 
@@ -380,16 +520,24 @@ def run_bootstrap(
     print("=== Remote Fleet Turnkey Bootstrap ===")
     print(f"Spark SSH user: {ssh_user} | Windows PC (`danlin-hud`) SSH user: {effective_pc_user}\n")
 
-    # 1. Ensure macOS Tailscale is connected + scan Home LAN
-    print("[1/5] Checking local Tailscale & scanning Home Network (spark01, spark03, spark04, danlin-hud)...")
-    if platform.system().lower() == "darwin":
-        ensure_macos_tailscale_connected()
+    # 1. Check local Tailscale + scan Home LAN (mDNS + ARP + /24 subnet)
+    print("[1/5] Scanning Home Network (spark01, spark03, spark04, danlin-hud)...")
+    ts_running = ensure_macos_tailscale_connected() if platform.system().lower() == "darwin" else False
 
-    lan_hits, pc_alive_no_ssh = probe_home_lan_candidates()
+    lan_hits, pc_alive_no_ssh = probe_home_lan_candidates(
+        ssh_user=ssh_user, tailscale_running=ts_running
+    )
     for slot, (h, ip) in sorted(lan_hits.items()):
         print(f"  [LAN FOUND] {slot:<10} -> {h} ({ip}:22)")
+    if pc_alive_no_ssh and "pc" not in lan_hits:
+        print(f"  [LAN PC]    danlin-hud -> {pc_alive_no_ssh[1]} (online on Home LAN; Windows SSH port 22 not yet enabled)")
 
     local_hostname = socket.gethostname().removesuffix(".local")
+    pc_default_lan = (
+        lan_hits["pc"][0]
+        if "pc" in lan_hits
+        else (pc_alive_no_ssh[1] if pc_alive_no_ssh else "danlin-hud.local")
+    )
     machines: List[MachineConfig] = [
         MachineConfig(
             id="mac-mini",
@@ -438,7 +586,7 @@ def run_bootstrap(
         MachineConfig(
             id="pc",
             name="Home PC (danlin-hud)",
-            lan_host=lan_hits.get("pc", ("danlin-hud.local", ""))[0],
+            lan_host=pc_default_lan,
             tailscale_host=KNOWN_TAILSCALE_IPS["pc"],
             user=effective_pc_user,
             os="windows",

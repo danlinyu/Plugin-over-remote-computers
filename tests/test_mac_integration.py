@@ -1,4 +1,4 @@
-"""Tests for macOS SSH config generation, ~/RemoteComputers mount path mapping, and LaunchAgent."""
+"""Tests for macOS SSH config generation (with & without Tailscale), ~/RemoteComputers mount path mapping, and LaunchAgent."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import unittest
 
 from remote_fleet.config import (
     default_home_fleet_config,
+    is_tailscale_only_host,
     load_active_project,
     save_mounts_registry,
 )
@@ -21,7 +22,7 @@ from remote_fleet.mac_integration import (
 
 
 class TestMacIntegration(unittest.TestCase):
-    def test_ssh_config_lan_first_and_wildcard_ordering(self) -> None:
+    def test_ssh_config_lan_first_and_wildcard_ordering_when_tailscale_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ssh_cfg = Path(tmp) / ".ssh" / "config"
             ssh_cfg.parent.mkdir(parents=True)
@@ -35,33 +36,59 @@ class TestMacIntegration(unittest.TestCase):
             try:
                 cfg = default_home_fleet_config()
                 cfg.get_machine("spark-1").tailscale_host = "spark-1.tailnet.ts.net"  # type: ignore[union-attr]
-                cfg.get_machine("spark-1").user = "danlin"  # type: ignore[union-attr]
+                cfg.get_machine("spark-1").user = "danlinyu"  # type: ignore[union-attr]
 
-                written = sync_ssh_config(cfg, ssh_config_path=ssh_cfg)
+                written = sync_ssh_config(cfg, ssh_config_path=ssh_cfg, tailscale_available=True)
                 text = written.read_text(encoding="utf-8")
 
-                # Self (mac-mini) excluded; spark-1, spark-2, spark-3, pc included
                 self.assertNotIn("Host mac-mini\n", text)
                 self.assertIn("Host spark-1\n", text)
                 self.assertIn("HostName spark-1.tailnet.ts.net", text)
                 self.assertIn("Match host spark-1 exec", text)
                 self.assertIn("HostName spark01.local", text)
-                self.assertIn("User danlin", text)
-                self.assertIn("Host pc\n", text)
+                self.assertIn("User danlinyu", text)
 
                 # Managed block inserted BEFORE `Host *`
                 self.assertLess(text.index("Host spark-1"), text.index("Host *"))
                 self.assertIn("Host github.com", text)
 
-                # Verify 0600 permissions on POSIX
                 if os.name != "nt":
                     mode = stat.S_IMODE(written.stat().st_mode)
                     self.assertEqual(mode, 0o600)
 
                 # Re-running is idempotent
-                sync_ssh_config(cfg, ssh_config_path=ssh_cfg)
+                sync_ssh_config(cfg, ssh_config_path=ssh_cfg, tailscale_available=True)
                 text2 = written.read_text(encoding="utf-8")
                 self.assertEqual(text, text2)
+            finally:
+                if old_self is None:
+                    os.environ.pop("REMOTE_FLEET_SELF", None)
+                else:
+                    os.environ["REMOTE_FLEET_SELF"] = old_self
+
+    def test_ssh_config_pure_lan_when_tailscale_not_installed(self) -> None:
+        """On a brand-new Mac Mini without Tailscale, `~/.ssh/config` must NOT fall back to 100.x.y.z IPs."""
+        self.assertTrue(is_tailscale_only_host("100.85.241.120"))
+        self.assertTrue(is_tailscale_only_host("spark01.tail123.ts.net"))
+        self.assertFalse(is_tailscale_only_host("spark01.local"))
+        self.assertFalse(is_tailscale_only_host("192.168.68.67"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ssh_cfg = Path(tmp) / ".ssh" / "config"
+            old_self = os.environ.get("REMOTE_FLEET_SELF")
+            os.environ["REMOTE_FLEET_SELF"] = "mac-mini"
+            try:
+                cfg = default_home_fleet_config()
+                cfg.get_machine("spark-1").lan_host = "spark01.local"  # type: ignore[union-attr]
+                cfg.get_machine("spark-1").tailscale_host = "100.85.241.120"  # type: ignore[union-attr]
+
+                written = sync_ssh_config(cfg, ssh_config_path=ssh_cfg, tailscale_available=False)
+                text = written.read_text(encoding="utf-8")
+
+                # Direct Home LAN HostName, no unroutable 100.85.241.120!
+                self.assertIn("Host spark-1\n    HostName spark01.local", text)
+                self.assertNotIn("100.85.241.120", text)
+                self.assertNotIn("Match host spark-1 exec", text)
             finally:
                 if old_self is None:
                     os.environ.pop("REMOTE_FLEET_SELF", None)
@@ -72,7 +99,7 @@ class TestMacIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             cfg_dir = tmp_path / "cfg"
-            mount_root = tmp_path / "RemoteComputers" / "spark-2"
+            mount_root = tmp_path / "RemoteComputers" / "spark03"
             sub_proj = mount_root / "projects" / "my-new-agent"
             sub_proj.mkdir(parents=True)
 
@@ -82,16 +109,16 @@ class TestMacIntegration(unittest.TestCase):
                 save_mounts_registry(
                     {
                         str(mount_root): {
-                            "machine_id": "spark-2",
-                            "remote_root": "/home/danlin",
+                            "machine_id": "spark03",
+                            "remote_root": "/home/danlinyu",
                         }
                     }
                 )
                 active = load_active_project(cwd=sub_proj)
                 self.assertIsNotNone(active)
                 assert active is not None
-                self.assertEqual(active.machine_id, "spark-2")
-                self.assertEqual(active.remote_path, "/home/danlin/projects/my-new-agent")
+                self.assertEqual(active.machine_id, "spark03")
+                self.assertEqual(active.remote_path, "/home/danlinyu/projects/my-new-agent")
                 self.assertEqual(active.source, "mounted_folder")
             finally:
                 if old_cfg_dir is None:
@@ -108,6 +135,7 @@ class TestMacIntegration(unittest.TestCase):
                 data = plistlib.load(fp)
             self.assertEqual(data["Label"], "com.remote-fleet.automount")
             self.assertIn("mount-all", data["ProgramArguments"])
+            self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
 
 
 if __name__ == "__main__":

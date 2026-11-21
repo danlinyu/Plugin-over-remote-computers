@@ -239,32 +239,51 @@ def mount_sshfs(
 
     # 1. On macOS (or if sshfs is absent), prefer `rclone nfsmount` — uses native macOS NFSv3, zero kernel extensions!
     rclone_bin = shutil.which("rclone")
+    if not rclone_bin:
+        for cand in (
+            Path.home() / ".local" / "bin" / "rclone",
+            Path("/opt/homebrew/bin/rclone"),
+            Path("/usr/local/bin/rclone"),
+        ):
+            if cand.is_file() and os.access(cand, os.X_OK):
+                rclone_bin = str(cand)
+                break
     is_macos = platform.system().lower() == "darwin"
     sshfs_bin = shutil.which("sshfs")
 
     if rclone_bin and (is_macos or not sshfs_bin):
-        sftp_opts = [f"host={ep.host}"]
-        if machine.user:
-            sftp_opts.append(f"user={machine.user}")
+        ssh_parts = [
+            shutil.which("ssh") or "/usr/bin/ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+        ]
         if machine.port and machine.port != 22:
-            sftp_opts.append(f"port={machine.port}")
+            ssh_parts.extend(["-p", str(machine.port)])
         if machine.ssh_identity_file:
-            sftp_opts.append(f"key_file={os.path.expanduser(machine.ssh_identity_file)}")
-        else:
-            sftp_opts.append("use_insecure_cipher=false")
-        remote_spec = f":sftp,{','.join(sftp_opts)}:{resolved_remote}"
+            ssh_parts.extend(["-i", os.path.expanduser(machine.ssh_identity_file)])
+        ssh_parts.append(f"{machine.user}@{ep.host}" if machine.user else ep.host)
+        ssh_ext = " ".join(f'"{p}"' if " " in p else p for p in ssh_parts)
+
+        rclone_path = f"/{resolved_remote}" if (len(resolved_remote) > 2 and resolved_remote[1] == ":") else resolved_remote
         mount_subcmd = "nfsmount" if is_macos else "mount"
         cmd = [
             rclone_bin,
             mount_subcmd,
-            remote_spec,
+            f":sftp:{rclone_path}",
             str(local_dir),
+            "--sftp-ssh",
+            ssh_ext,
             "--daemon",
+            "--daemon-wait",
+            "5s",
             "--vfs-cache-mode",
             "writes",
+            "--vfs-fast-fingerprint",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        if proc.returncode == 0:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
+        if proc.returncode == 0 or is_mounted(local_dir):
             return {
                 "ok": True,
                 "mode": f"rclone-{mount_subcmd}",

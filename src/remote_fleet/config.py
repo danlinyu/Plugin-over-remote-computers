@@ -334,6 +334,42 @@ def parse_tailscale_status_json(payload: Dict[str, Any]) -> List[TailscaleNodeIn
     return nodes
 
 
+def is_tailscale_only_host(host: str) -> bool:
+    """Return True if `host` is a Tailscale MagicDNS (`.ts.net`) or Tailscale CGNAT (`100.64.0.0/10`) address."""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return False
+    if h.endswith(".ts.net"):
+        return True
+    parts = h.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        first, second = int(parts[0]), int(parts[1])
+        if first == 100 and 64 <= second <= 127:
+            return True
+    return False
+
+
+def is_local_tailscale_running(timeout_sec: float = 1.5) -> bool:
+    """Return True only if Tailscale is installed on THIS computer and `BackendState == 'Running'`."""
+    ts_bin = find_tailscale_binary()
+    if not ts_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [ts_bin, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return False
+        data = json.loads(proc.stdout)
+        return str(data.get("BackendState") or "") == "Running"
+    except Exception:
+        return False
+
+
 def query_tailscale_nodes(timeout_sec: float = 2.5) -> List[TailscaleNodeInfo]:
     """Query `tailscale status --json` if Tailscale is installed and running."""
     ts_bin = find_tailscale_binary()
@@ -350,6 +386,8 @@ def query_tailscale_nodes(timeout_sec: float = 2.5) -> List[TailscaleNodeInfo]:
         if proc.returncode != 0 or not proc.stdout.strip():
             return []
         data = json.loads(proc.stdout)
+        if str(data.get("BackendState") or "") not in ("Running", ""):
+            return []
         return parse_tailscale_status_json(data)
     except Exception:
         return []

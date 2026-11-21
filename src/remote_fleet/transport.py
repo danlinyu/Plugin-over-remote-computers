@@ -22,7 +22,9 @@ from remote_fleet.config import (
     FleetConfig,
     MachineConfig,
     TailscaleNodeInfo,
+    is_local_tailscale_running,
     is_self_machine,
+    is_tailscale_only_host,
 )
 
 
@@ -730,7 +732,13 @@ class FleetTransport:
             return ep
 
         candidates: List[Tuple[str, str, float]] = []
-        lan_timeout = max(0.15, self.config.lan_probe_timeout_ms / 1000.0)
+        base_lan_timeout = max(0.25, self.config.lan_probe_timeout_ms / 1000.0)
+        # macOS Bonjour multicast DNS (`.local`) can take ~0.5-1.1s on a cold cache lookup
+        lan_timeout = (
+            max(1.25, base_lan_timeout)
+            if (machine.lan_host and machine.lan_host.lower().endswith(".local"))
+            else base_lan_timeout
+        )
         ts_timeout = max(0.5, float(self.config.ssh_connect_timeout_sec))
 
         if self.config.prefer_lan:
@@ -745,7 +753,16 @@ class FleetTransport:
                 candidates.append(("lan", machine.lan_host, lan_timeout))
 
         errors: List[str] = []
+        local_ts_checked = False
+        local_ts_running = False
         for transport_name, host, timeout_s in candidates:
+            if is_tailscale_only_host(host):
+                if not local_ts_checked:
+                    local_ts_running = (self.tailscale_self is not None) or is_local_tailscale_running()
+                    local_ts_checked = True
+                if not local_ts_running:
+                    errors.append(f"{transport_name}({host}): skipped (Tailscale not installed/running on this computer)")
+                    continue
             ok, latency_ms, err = self._tcp_probe(host, machine.port, timeout_s)
             if ok:
                 ep = EndpointStatus(
@@ -760,7 +777,7 @@ class FleetTransport:
                 return ep
             errors.append(f"{transport_name}({host}:{machine.port}): {err}")
 
-        fallback_host = machine.tailscale_host or machine.lan_host or machine.id
+        fallback_host = machine.lan_host or machine.tailscale_host or machine.id
         ep = EndpointStatus(
             machine_id=machine.id,
             transport="unreachable",
