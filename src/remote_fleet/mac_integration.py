@@ -463,9 +463,9 @@ def _mount_sftp_directory(
     _ = vol_label
     mount_point = safe_lexical_resolve(mount_point)
 
-    health = _probe_mount_health(mount_point, log_stem, timeout_sec=4.0, expected_host=host)
+    health = _probe_mount_health(mount_point, log_stem, timeout_sec=12.0, expected_host=host)
     if health == "healthy":
-        visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
+        visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
         reg = load_mounts_registry()
         reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
         save_mounts_registry(reg)
@@ -569,7 +569,7 @@ def _mount_sftp_directory(
                 "--contimeout",
                 "8s",
                 "--timeout",
-                "20s",
+                "30s",
                 "--low-level-retries",
                 "2",
                 "--retries",
@@ -631,8 +631,8 @@ def _mount_sftp_directory(
                     ),
                     encoding="utf-8",
                 )
-                if _probe_mount_health(mount_point, log_stem, timeout_sec=5.0, expected_host=host) == "healthy":
-                    visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
+                if _probe_mount_health(mount_point, log_stem, timeout_sec=15.0, expected_host=host) == "healthy":
+                    visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
                     reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
                     save_mounts_registry(reg)
@@ -1310,9 +1310,58 @@ def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected
                 return False
         except Exception:
             return False
-        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=4.0, expected_host=expected_host) != "healthy":
+        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=12.0, expected_host=expected_host) != "healthy":
             return False
     return True
+
+
+def _fallback_windows_ping_via_sftp(
+    machine: MachineConfig,
+    host: str,
+    container_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Pure-SFTP fallback for Windows `pc` when PowerShell SSH shell is slow or blocked:
+    verifies SFTP on `C:/` via `rclone` (`--sftp-shell-type none`) and recovers drive letters from
+    `mounts.json` + existing `<container>/<Drive>` folders (or `C:/`)."""
+    rclone_bin = find_rclone_binary()
+    if not rclone_bin:
+        return None
+    _, sftp_flags, _ = _select_verified_rclone_sftp_flags(
+        rclone_bin, machine, host, "/C:/", allow_empty_fallback=False
+    )
+    if not sftp_flags:
+        return None
+
+    known_letters: List[str] = ["C"]
+    default_home = f"C:/Users/{machine.user}" if machine.user else "C:/"
+    reg = load_mounts_registry()
+    for info in reg.values():
+        if str(info.get("machine_id") or "") != machine.id:
+            continue
+        rroot = str(info.get("remote_root") or "").strip().replace("\\", "/")
+        if info.get("container_only") == "1" and len(rroot) > 3 and rroot[1] == ":":
+            default_home = rroot
+        elif len(rroot) >= 2 and rroot[0].isalpha() and rroot[1] == ":":
+            letter = rroot[0].upper()
+            if letter not in known_letters:
+                known_letters.append(letter)
+
+    if not is_mounted(container_dir) and container_dir.is_dir():
+        try:
+            for child in sorted(container_dir.iterdir()):
+                if len(child.name) == 1 and child.name.isalpha() and child.name.isupper():
+                    if child.name not in known_letters:
+                        known_letters.append(child.name)
+        except OSError:
+            pass
+
+    return {
+        "ok": True,
+        "os": "windows",
+        "home": default_home,
+        "drives": [f"{ch}:/" for ch in known_letters],
+        "sftp_fallback": True,
+    }
 
 
 def mount_single_machine_root(
@@ -1348,34 +1397,96 @@ def mount_single_machine_root(
             "endpoint": ep.to_dict(),
         }
 
-    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=10)
+    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=20)
+    active_ep_dict = ping.get("endpoint") if isinstance(ping.get("endpoint"), dict) else ep.to_dict()
+    active_host = str(active_ep_dict.get("host") or ep.host)
+
+    if not ping.get("ok") and machine.os == "windows":
+        # Pure-SFTP fallback: even if Windows PowerShell shell timed out, mount all drives directly over SFTP!
+        cand_hosts = [ep.host]
+        if machine.tailscale_host and machine.tailscale_host not in cand_hosts:
+            if not is_tailscale_only_host(machine.tailscale_host) or is_local_tailscale_running():
+                cand_hosts.append(machine.tailscale_host)
+        for chost in cand_hosts:
+            sftp_ping = _fallback_windows_ping_via_sftp(machine, chost, mount_point)
+            if sftp_ping is not None:
+                ping = sftp_ping
+                active_host = chost
+                active_ep_dict = {
+                    **ep.to_dict(),
+                    "host": chost,
+                    "transport": "tailscale" if chost == machine.tailscale_host else ep.transport,
+                }
+                break
+
     if not ping.get("ok"):
         return {
             "ok": False,
             "machine_id": machine.id,
-            "error": f"SSH auth failed on {ep.host}: {ping.get('error')}",
+            "error": f"SSH auth failed on {active_host}: {ping.get('error')}",
         }
 
     if machine.os == "windows" or str(ping.get("os") or "").lower() == "windows":
         machine.os = "windows"
-        return _mount_windows_all_drives(machine, ep.to_dict(), ep.host, ping, mount_point)
+        return _mount_windows_all_drives(machine, active_ep_dict, active_host, ping, mount_point)
 
-    return _mount_posix_container(machine, ep.to_dict(), ep.host, ping, mount_point)
+    return _mount_posix_container(machine, active_ep_dict, active_host, ping, mount_point)
 
 
-def _cleanup_legacy_nfsmounts(root: Path) -> None:
-    """One-time seamless migration: detach any legacy hard-mount `rclone nfsmount` mounts FIRST
-    (via `MNT_NOWAIT` `/sbin/mount` even if `rclone nfsmount` already crashed!), then terminate leftover `nfsmount` daemons."""
+def _cleanup_stale_ssh_mux_sockets() -> None:
+    """Remove any wedged `/tmp/rf-ssh-*` OpenSSH ControlMaster sockets & background mux processes."""
+    if os.name != "posix":
+        return
+    if shutil.which("pkill"):
+        try:
+            subprocess.run(["pkill", "-f", "ssh: /tmp/rf-ssh-"], capture_output=True, timeout=3, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    try:
+        for sock in Path("/tmp").glob("rf-ssh-*"):
+            try:
+                sock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _cleanup_legacy_nfsmounts(root: Path, raw_root: Optional[Path] = None) -> None:
+    """Seamless migration & orphan cleanup: detach any legacy hard `rclone nfsmount` or dead-daemon NFS mounts
+    under `root` (including symlink targets like `/Volumes/X10 Pro/.../RemoteComputers`) FIRST via `MNT_NOWAIT`
+    `/sbin/mount`, then terminate any leftover `rclone nfsmount` processes."""
     if platform.system().lower() != "darwin":
         return
 
-    root_str = str(safe_lexical_resolve(root))
+    prefixes = {str(safe_lexical_resolve(root))}
+    try:
+        prefixes.add(str(root.resolve()))
+    except OSError:
+        pass
+    if raw_root is not None:
+        prefixes.add(str(safe_lexical_resolve(raw_root)))
+
+    live_daemon_mounts: set[str] = set()
+    daemons = _daemons_dir()
+    if daemons.is_dir():
+        for mf in daemons.glob("*.json"):
+            try:
+                meta = json.loads(mf.read_text(encoding="utf-8"))
+                pid = int(meta.get("pid") or 0)
+                mp_val = str(meta.get("mount_point") or "")
+                if pid > 0 and mp_val:
+                    os.kill(pid, 0)
+                    live_daemon_mounts.add(mp_val)
+            except Exception:
+                pass
+
     table = get_macos_mount_table() or {}
-    # Unmount deepest paths first if any legacy non-soft NFS mounts exist under `~/RemoteComputers`
+    # Unmount deepest paths first if any legacy non-soft OR orphaned NFS mounts exist under `RemoteComputers`
     for mp_str in sorted(table.keys(), key=len, reverse=True):
-        if mp_str == root_str or mp_str.startswith(root_str + "/"):
+        if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
             opts_lower = table[mp_str].lower()
-            if "nfs" in opts_lower and "soft" not in opts_lower:
+            if "nfs" in opts_lower and ("soft" not in opts_lower or mp_str not in live_daemon_mounts):
                 unmount_sshfs(Path(mp_str))
 
     if not shutil.which("pgrep"):
@@ -1400,6 +1511,16 @@ def _cleanup_legacy_nfsmounts(root: Path) -> None:
             pass
 
 
+def _resolve_mount_root(base_dir: Optional[Path]) -> Tuple[Path, Path]:
+    """Return `(resolved_root, raw_root)` so symlinked `~/RemoteComputers -> /Volumes/X10 Pro/...` resolves cleanly."""
+    raw_root = Path(os.path.abspath(os.path.expanduser(str(base_dir or (Path.home() / "RemoteComputers")))))
+    try:
+        resolved_root = raw_root.resolve()
+    except OSError:
+        resolved_root = safe_lexical_resolve(raw_root)
+    return resolved_root, raw_root
+
+
 def mount_all_machines(
     config: FleetConfig,
     transport: FleetTransport,
@@ -1407,7 +1528,7 @@ def mount_all_machines(
     from_launchd: bool = False,
 ) -> Dict[str, Any]:
     """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` with mutex & self-healing."""
-    root = safe_lexical_resolve(base_dir or (Path.home() / "RemoteComputers"))
+    root, raw_root = _resolve_mount_root(base_dir)
     root.mkdir(parents=True, exist_ok=True)
 
     lock_dir = Path.home() / ".cache" / "remote-fleet"
@@ -1422,7 +1543,9 @@ def mount_all_machines(
             except OSError:
                 return {"base_dir": str(root), "results": [], "skipped_locked": True}
 
-        _cleanup_legacy_nfsmounts(root)
+        if not from_launchd:
+            _cleanup_stale_ssh_mux_sockets()
+        _cleanup_legacy_nfsmounts(root, raw_root=raw_root)
         transport.resolve_all_endpoints(config.machines, force_refresh=True)
 
         results = []
@@ -1454,6 +1577,8 @@ def mount_all_machines(
             and not sidebar_info.get("repaired")
         ):
             refresh_targets = [root]
+            if raw_root != root and raw_root.exists():
+                refresh_targets.append(raw_root)
             for mid in remote_ids:
                 cand = root / mid
                 if not is_mounted(cand) and cand.is_dir():
@@ -1487,14 +1612,14 @@ def mount_all_machines(
 
 
 def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
-    root = safe_lexical_resolve(base_dir or (Path.home() / "RemoteComputers"))
-    root_str = str(root)
+    root, raw_root = _resolve_mount_root(base_dir)
+    prefixes = {str(root), str(raw_root)}
     results = []
 
     table = get_macos_mount_table()
     if table is not None:
         for mp_str in sorted(table.keys(), key=len, reverse=True):
-            if mp_str == root_str or mp_str.startswith(root_str + "/"):
+            if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
                 results.append({"path": mp_str, **unmount_sshfs(Path(mp_str))})
     elif root.is_dir():
         for child in sorted(root.iterdir()):
@@ -1524,7 +1649,7 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
             except OSError:
                 pass
 
-    return {"base_dir": root_str, "results": results}
+    return {"base_dir": str(root), "results": results}
 
 
 def install_macos_launch_agent(

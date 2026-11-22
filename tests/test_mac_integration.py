@@ -647,45 +647,59 @@ class TestMacIntegration(unittest.TestCase):
             self.assertFalse(meta_file.exists())
 
     def test_macos_mount_table_parser_and_legacy_hard_nfs_cleanup(self) -> None:
-        """Verify orphaned hard `rclone nfsmount` mounts are detected via `/sbin/mount` (`MNT_NOWAIT`) and
-        force-unmounted even if `rclone nfsmount` already crashed, without touching soft NFS mounts."""
+        """Verify orphaned hard `rclone nfsmount` mounts (including symlinked `/Volumes/X10 Pro/...`) are detected
+        via `/sbin/mount` (`MNT_NOWAIT`) and force-unmounted without touching live soft NFS mounts."""
+        import json
         from unittest.mock import patch
         from remote_fleet.mac_integration import _cleanup_legacy_nfsmounts
         from remote_fleet.mount import parse_macos_mount_output
 
+        vol_root = "/Volumes/X10 Pro/MovedFromInternal/Projects/RemoteComputers"
         raw_mount = "\n".join(
             [
                 "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
-                "localhost:/ on /Users/danlinyu/RemoteComputers/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
-                "localhost:/ on /Users/danlinyu/RemoteComputers/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
-                "localhost:/ on /Users/danlinyu/RemoteComputers/spark01/Home (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
+                f"localhost:/ on {vol_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
+                f"localhost:/ on {vol_root}/pc/D (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
+                f"localhost:/ on {vol_root}/spark01/Home (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
             ]
         )
         parsed = parse_macos_mount_output(raw_mount)
-        self.assertIn("/Users/danlinyu/RemoteComputers/pc/C", parsed)
-        self.assertNotIn("soft", parsed["/Users/danlinyu/RemoteComputers/pc/C"])
-        self.assertIn("soft", parsed["/Users/danlinyu/RemoteComputers/spark01/Home"])
+        self.assertIn(f"{vol_root}/pc/C", parsed)
+        self.assertNotIn("soft", parsed[f"{vol_root}/pc/C"])
+        self.assertIn("soft", parsed[f"{vol_root}/spark01/Home"])
 
-        unmounted_paths: list[str] = []
-        with (
-            patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
-            patch("remote_fleet.mac_integration.safe_lexical_resolve", side_effect=lambda p: p),
-            patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=parsed),
-            patch(
-                "remote_fleet.mac_integration.unmount_sshfs",
-                side_effect=lambda p: unmounted_paths.append(str(p)) or {"ok": True},
-            ),
-            patch("remote_fleet.mac_integration.shutil.which", return_value=None),
-        ):
-            _cleanup_legacy_nfsmounts(Path("/Users/danlinyu/RemoteComputers"))
+        with tempfile.TemporaryDirectory() as tmp:
+            daemons = Path(tmp) / "daemons"
+            daemons.mkdir()
+            # spark01-Home has a live daemon PID; pc-D has NO live daemon (orphaned); pc-C is a hard mount
+            (daemons / "spark01-Home.json").write_text(
+                json.dumps({"pid": os.getpid(), "mount_point": f"{vol_root}/spark01/Home"}),
+                encoding="utf-8",
+            )
+            unmounted_paths: list[str] = []
+            with (
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration.safe_lexical_resolve", side_effect=lambda p: p),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=parsed),
+                patch(
+                    "remote_fleet.mac_integration.unmount_sshfs",
+                    side_effect=lambda p: unmounted_paths.append(str(p)) or {"ok": True},
+                ),
+                patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+            ):
+                _cleanup_legacy_nfsmounts(
+                    Path(vol_root),
+                    raw_root=Path("/Users/danlinyu/RemoteComputers"),
+                )
 
-        self.assertEqual(
-            set(unmounted_paths),
-            {
-                "/Users/danlinyu/RemoteComputers/pc/C",
-                "/Users/danlinyu/RemoteComputers/pc/D",
-            },
-        )
+            self.assertEqual(
+                set(unmounted_paths),
+                {
+                    f"{vol_root}/pc/C",
+                    f"{vol_root}/pc/D",
+                },
+            )
 
     def test_windows_10_drives_reuses_verified_sftp_flags(self) -> None:
         """Verify mounting 10 drives (`C:`..`L:`) on `danlin-hud` reuses verified SFTP flags after `C:`
@@ -745,6 +759,85 @@ class TestMacIntegration(unittest.TestCase):
                     self.assertIsNotNone(pre_val, f"Expected {drv_target} to reuse preverified SFTP flags")
                     assert pre_val is not None
                     self.assertEqual(pre_val[0], f"/{drv_target}")
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
+    def test_windows_no_controlmaster_fast_ping_and_sftp_fallback(self) -> None:
+        """Regression test for Windows PC `ssh ... ControlMaster=auto ... powershell` 10s hang:
+        1) `build_ssh_args` disables `ControlMaster` for `os='windows'`.
+        2) `_build_windows_fast_ping_cmd` uses zero-stdin `DriveInfo::GetDrives()` without `Test-Path` / `.IsReady`.
+        3) `mount_single_machine_root` still mounts all PC drives via pure SFTP even if PowerShell SSH times out!"""
+        import base64
+        from unittest.mock import patch
+        from remote_fleet.config import FleetConfig, MachineConfig, save_mounts_registry
+        from remote_fleet.mac_integration import mount_single_machine_root
+        from remote_fleet.transport import EndpointStatus, FleetTransport
+
+        pc = MachineConfig(
+            id="pc",
+            name="Home PC (danlin-hud)",
+            lan_host="192.168.68.70",
+            tailscale_host="100.93.148.108",
+            user="danli",
+            os="windows",
+        )
+        tr = FleetTransport(FleetConfig(machines=[pc]))
+        ssh_args = tr.build_ssh_args(pc, "192.168.68.70")
+        self.assertNotIn("ControlMaster=auto", ssh_args)
+        self.assertIn("ControlMaster=no", ssh_args)
+
+        fast_cmd = FleetTransport._build_windows_fast_ping_cmd()
+        decoded_fast = base64.b64decode(fast_cmd.split()[-1]).decode("utf-16-le")
+        self.assertIn("DriveInfo", decoded_fast)
+        self.assertNotIn("ReadToEnd", decoded_fast)
+        self.assertNotIn("Test-Path", decoded_fast)
+        self.assertNotIn("IsReady", decoded_fast)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            base_dir = tmp_path / "RemoteComputers"
+            (base_dir / "pc" / "G").mkdir(parents=True)
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                save_mounts_registry(
+                    {
+                        str(base_dir / "pc"): {"machine_id": "pc", "remote_root": "C:/Users/danli", "container_only": "1"},
+                        str(base_dir / "pc" / "C"): {"machine_id": "pc", "remote_root": "C:/"},
+                        str(base_dir / "pc" / "D"): {"machine_id": "pc", "remote_root": "D:/"},
+                    }
+                )
+                live_ep = EndpointStatus(
+                    machine_id="pc", transport="lan", host="192.168.68.70", port=22, reachable=True, latency_ms=2.0
+                )
+                captured_drives: list[str] = []
+
+                def fake_mount_win(
+                    m: MachineConfig, ep_d: dict[str, object], h: str, ping_d: dict[str, object], cdir: Path
+                ) -> dict[str, object]:
+                    captured_drives.extend(ping_d["drives"])  # type: ignore[arg-type]
+                    return {"ok": True, "machine_id": m.id, "drives": ping_d["drives"], "mount_point": str(cdir)}
+
+                with (
+                    patch.object(tr, "resolve_endpoint", return_value=live_ep),
+                    patch.object(tr, "run_worker_op", return_value={"ok": False, "error": "timed out after 20 seconds"}),
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration.find_rclone_binary", return_value="/usr/local/bin/rclone"),
+                    patch(
+                        "remote_fleet.mac_integration._select_verified_rclone_sftp_flags",
+                        return_value=("/C:/", ["--sftp-host", "192.168.68.70"], ""),
+                    ),
+                    patch("remote_fleet.mac_integration._mount_windows_all_drives", side_effect=fake_mount_win),
+                ):
+                    res = mount_single_machine_root(tr, pc, base_dir)
+
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(captured_drives, ["C:/", "D:/", "G:/"])
             finally:
                 if old_cfg_dir is None:
                     os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)

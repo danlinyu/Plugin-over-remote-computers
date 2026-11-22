@@ -119,15 +119,12 @@ def _windows_drives():
                 continue
             root = f"{letter}:\\"
             dtype = ctypes.windll.kernel32.GetDriveTypeW(root)
-            # 2=REMOVABLE (USB/SD), 3=FIXED (NVMe/SSD/HDD/External USB SSD), 4=REMOTE, 6=RAMDISK (skip 5=CDROM)
-            if dtype in (2, 3, 6) and os.path.isdir(root):
-                drives.append(f"{letter}:/")
-            elif dtype == 4:
+            # 2=REMOVABLE (USB/SD), 3=FIXED (NVMe/SSD/HDD/External USB), 4=REMOTE, 6=RAMDISK (skip 5=CDROM).
+            # Never call os.path.isdir(root) here: spinning up 8 parked USB/SATA HDDs sequentially takes 15-40s!
+            if dtype in (2, 3, 4, 6):
                 drives.append(f"{letter}:/")
     except Exception:
-        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            if os.path.isdir(f"{letter}:\\"):
-                drives.append(f"{letter}:/")
+        drives = ["C:/"]
     return drives or ["C:/"]
 
 def _posix_extra_roots():
@@ -885,8 +882,19 @@ class FleetTransport:
             f"ConnectTimeout={self.config.ssh_connect_timeout_sec}",
             "-o",
             "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
         ]
-        if use_control_master and os.name == "posix" and not os.environ.get("REMOTE_FLEET_SSH_BIN"):
+        # Never use ControlMaster against Windows OpenSSH (`Win32-OpenSSH` `sshd.exe` hangs on mux slave stdin EOF)
+        allow_mux = (
+            use_control_master
+            and machine.os != "windows"
+            and os.name == "posix"
+            and not os.environ.get("REMOTE_FLEET_SSH_BIN")
+        )
+        if allow_mux:
             args.extend(
                 [
                     "-o",
@@ -897,6 +905,9 @@ class FleetTransport:
                     "ControlPath=/tmp/rf-ssh-%C",
                 ]
             )
+        elif os.name == "posix" and not os.environ.get("REMOTE_FLEET_SSH_BIN"):
+            args.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
+
         if machine.port and machine.port != 22:
             args.extend(["-p", str(machine.port)])
         if machine.ssh_identity_file:
@@ -908,31 +919,20 @@ class FleetTransport:
         args.append(target)
         return args
 
-    def run_worker_op(
-        self, machine: MachineConfig, req: Dict[str, Any], timeout_sec: int = 30
+    def _exec_worker_on_endpoint(
+        self,
+        machine: MachineConfig,
+        ep: EndpointStatus,
+        req: Dict[str, Any],
+        timeout_sec: int,
     ) -> Dict[str, Any]:
-        """Execute a structured filesystem/project operation on `machine` (local or remote SSH)."""
-        ep = self.resolve_endpoint(machine)
-        if ep.transport == "local":
-            res = _run_local_worker(req)
-            res["endpoint"] = ep.to_dict()
-            return res
+        """Run a worker request against a single resolved endpoint `ep`."""
+        is_win_fast_ping = machine.os == "windows" and req.get("op") == "ping"
+        envelope = "" if is_win_fast_ping else json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req})
 
-        if not ep.reachable:
-            return {
-                "ok": False,
-                "error": (
-                    f"Machine '{machine.id}' ({machine.name}) is currently unreachable over "
-                    f"Home LAN ({machine.lan_host or 'n/a'}) and Tailscale ({machine.tailscale_host or 'n/a'}). "
-                    f"Details: {ep.error}"
-                ),
-                "endpoint": ep.to_dict(),
-            }
-
-        envelope = json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req})
-
-        # Bootstrap command compatible with POSIX shells (Linux/macOS) and Windows OpenSSH (cmd.exe / PowerShell)
-        if machine.os == "windows":
+        if is_win_fast_ping:
+            remote_py_cmd = self._build_windows_fast_ping_cmd()
+        elif machine.os == "windows":
             remote_py_cmd = self._build_windows_worker_cmd()
         else:
             py_snippet = (
@@ -947,14 +947,24 @@ class FleetTransport:
 
         ssh_cmd = [*self.build_ssh_args(machine, ep.host), remote_py_cmd]
         try:
-            proc = subprocess.run(
-                ssh_cmd,
-                input=envelope,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
-            )
+            if is_win_fast_ping:
+                proc = subprocess.run(
+                    ssh_cmd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    check=False,
+                )
+            else:
+                proc = subprocess.run(
+                    ssh_cmd,
+                    input=envelope,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    check=False,
+                )
         except (subprocess.TimeoutExpired, OSError) as exc:
             return {
                 "ok": False,
@@ -964,16 +974,29 @@ class FleetTransport:
 
         # If POSIX shell lookup failed on an `os="auto"` host that turns out to be Windows OpenSSH:
         if proc.returncode != 0 and machine.os == "auto":
-            ssh_win = [*self.build_ssh_args(machine, ep.host), self._build_windows_worker_cmd()]
+            ssh_win = [
+                *self.build_ssh_args(machine, ep.host, use_control_master=False),
+                self._build_windows_fast_ping_cmd() if req.get("op") == "ping" else self._build_windows_worker_cmd(),
+            ]
             try:
-                proc2 = subprocess.run(
-                    ssh_win,
-                    input=envelope,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                    check=False,
-                )
+                if req.get("op") == "ping":
+                    proc2 = subprocess.run(
+                        ssh_win,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_sec,
+                        check=False,
+                    )
+                else:
+                    proc2 = subprocess.run(
+                        ssh_win,
+                        input=envelope,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_sec,
+                        check=False,
+                    )
                 if proc2.returncode == 0 and proc2.stdout.strip():
                     proc = proc2
                     machine.os = "windows"
@@ -1001,11 +1024,71 @@ class FleetTransport:
                 "endpoint": ep.to_dict(),
             }
 
+    def run_worker_op(
+        self, machine: MachineConfig, req: Dict[str, Any], timeout_sec: int = 30
+    ) -> Dict[str, Any]:
+        """Execute a structured filesystem/project operation on `machine` (local or remote SSH)."""
+        ep = self.resolve_endpoint(machine)
+        if ep.transport == "local":
+            res = _run_local_worker(req)
+            res["endpoint"] = ep.to_dict()
+            return res
+
+        if not ep.reachable:
+            return {
+                "ok": False,
+                "error": (
+                    f"Machine '{machine.id}' ({machine.name}) is currently unreachable over "
+                    f"Home LAN ({machine.lan_host or 'n/a'}) and Tailscale ({machine.tailscale_host or 'n/a'}). "
+                    f"Details: {ep.error}"
+                ),
+                "endpoint": ep.to_dict(),
+            }
+
+        res = self._exec_worker_on_endpoint(machine, ep, req, timeout_sec)
+        # If Home LAN TCP port 22 accepted a socket (e.g. stale DHCP lease or hung interface) but SSH failed,
+        # automatically try Tailscale as a backup if available!
+        if (
+            not res.get("ok")
+            and ep.transport == "lan"
+            and machine.tailscale_host
+            and machine.tailscale_host != ep.host
+        ):
+            ts_host = machine.tailscale_host
+            if not is_tailscale_only_host(ts_host) or (self.tailscale_self is not None) or is_local_tailscale_running():
+                ok_ts, lat_ts, _ = self._tcp_probe(ts_host, machine.port, max(1.0, float(self.config.ssh_connect_timeout_sec)))
+                if ok_ts:
+                    ts_ep = EndpointStatus(
+                        machine_id=machine.id,
+                        transport="tailscale",
+                        host=ts_host,
+                        port=machine.port,
+                        reachable=True,
+                        latency_ms=lat_ts,
+                    )
+                    res_ts = self._exec_worker_on_endpoint(machine, ts_ep, req, timeout_sec)
+                    if res_ts.get("ok"):
+                        self._endpoint_cache[machine.id] = (time.monotonic(), ts_ep)
+                        return res_ts
+        return res
+
     @staticmethod
     def _encode_windows_powershell(ps_script: str) -> str:
         """Encode a PowerShell script as `-EncodedCommand` (UTF-16LE Base64) so `cmd.exe` and `powershell.exe` never mangle quotes."""
         b64 = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
         return f"powershell -NoProfile -NonInteractive -EncodedCommand {b64}"
+
+    @classmethod
+    def _build_windows_fast_ping_cmd(cls) -> str:
+        """Zero-stdin, zero-disk-spinup Windows `ping` command (`DriveInfo::GetDrives()` checks `.DriveType` only,
+        never `.IsReady` or `Test-Path`, so 8 parked USB/SATA HDDs never stall SSH discovery)."""
+        ps_script = (
+            "[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            "$drvs = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -in @('Fixed','Removable','Network','Ram') -and $_.Name[0] -notin @('A','B') } | ForEach-Object { \"$($_.Name[0]):/\" })\n"
+            "if (-not $drvs -or $drvs.Count -eq 0) { $drvs = @('C:/') }\n"
+            "@{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; home = $HOME; drives = $drvs } | ConvertTo-Json -Compress\n"
+        )
+        return cls._encode_windows_powershell(ps_script)
 
     @classmethod
     def _build_windows_worker_cmd(cls) -> str:
@@ -1040,7 +1123,7 @@ class FleetTransport:
             "}\n"
             "$d = $raw | ConvertFrom-Json\n"
             "if ($d.req.op -eq 'ping') {\n"
-            "  $drvs = @(Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[C-Z]:\\\\$' -and (Test-Path $_.Root) } | ForEach-Object { \"$($_.Name):/\" })\n"
+            "  $drvs = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -in @('Fixed','Removable','Network','Ram') -and $_.Name[0] -notin @('A','B') } | ForEach-Object { \"$($_.Name[0]):/\" })\n"
             "  if (-not $drvs -or $drvs.Count -eq 0) { $drvs = @('C:/') }\n"
             "  @{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; python = 'not-installed'; home = $HOME; drives = $drvs; cwd = (Get-Location).Path } | ConvertTo-Json -Compress\n"
             "  exit 0\n"

@@ -114,7 +114,7 @@ def parse_macos_mount_output(raw: str) -> Dict[str, str]:
     """Parse `/sbin/mount` (`MNT_NOWAIT`) output into `{mount_point: options_str}`."""
     mounts: Dict[str, str] = {}
     for line in raw.splitlines():
-        m = re.match(r"^.+?\s+on\s+(.+?)\s+\(([^)]*)\)\s*$", line.strip())
+        m = re.match(r"^.+?\s+on\s+(.+)\s+\(([^()]*)\)\s*$", line.strip())
         if m:
             mounts[m.group(1)] = m.group(2)
     return mounts
