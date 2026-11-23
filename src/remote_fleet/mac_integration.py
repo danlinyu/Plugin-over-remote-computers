@@ -561,7 +561,7 @@ def _mount_sftp_directory(
                 "writes",
                 "--vfs-fast-fingerprint",
                 "--dir-cache-time",
-                "45s",
+                "2m",
                 "--poll-interval",
                 "0",
                 "--sftp-idle-timeout",
@@ -1295,13 +1295,23 @@ def repair_macos_sidebar_favorites(
 
 def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected_host: str) -> bool:
     """Fast zero-SSH check for 30s LaunchAgent ticks: returns True iff `machine_id` already has
-    active soft-NFS daemons recorded and every one passes uncached `.fleet-probe-<uuid>` health on `expected_host`."""
+    all expected soft-NFS daemons recorded and every one passes uncached `.fleet-probe-<uuid>` health on `expected_host`."""
     if platform.system().lower() != "darwin" or is_mounted(container_dir):
         return False
     daemons = _daemons_dir()
     meta_files = sorted(daemons.glob(f"{machine_id}-*.json"))
     if not meta_files:
         return False
+
+    reg = load_mounts_registry()
+    expected_count = sum(
+        1
+        for info in reg.values()
+        if str(info.get("machine_id") or "") == machine_id and info.get("container_only") != "1"
+    )
+    if expected_count > len(meta_files):
+        return False
+
     for mf in meta_files:
         try:
             meta = json.loads(mf.read_text(encoding="utf-8"))
@@ -1511,6 +1521,20 @@ def _cleanup_legacy_nfsmounts(root: Path, raw_root: Optional[Path] = None) -> No
             pass
 
 
+def _external_volume_not_ready(target_root: Path) -> Optional[Path]:
+    """On macOS, if `target_root` resides under `/Volumes/<VolName>/...` (e.g. `/Volumes/X10 Pro/...`),
+    never call `mkdir` before `diskarbitrationd` mounts `<VolName>` — creating `/Volumes/X10 Pro` early at login
+    would cause macOS to mount the real external SSD at `/Volumes/X10 Pro 1`!"""
+    if platform.system().lower() != "darwin":
+        return None
+    parts = target_root.parts
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
+        vol_dir = Path("/Volumes") / parts[2]
+        if not is_mounted(vol_dir):
+            return vol_dir
+    return None
+
+
 def _resolve_mount_root(base_dir: Optional[Path]) -> Tuple[Path, Path]:
     """Return `(resolved_root, raw_root)` so symlinked `~/RemoteComputers -> /Volumes/X10 Pro/...` resolves cleanly."""
     raw_root = Path(os.path.abspath(os.path.expanduser(str(base_dir or (Path.home() / "RemoteComputers")))))
@@ -1529,7 +1553,23 @@ def mount_all_machines(
 ) -> Dict[str, Any]:
     """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` with mutex & self-healing."""
     root, raw_root = _resolve_mount_root(base_dir)
-    root.mkdir(parents=True, exist_ok=True)
+
+    unready_vol = _external_volume_not_ready(root)
+    if unready_vol is not None:
+        return {
+            "base_dir": str(root),
+            "results": [],
+            "waiting_for_volume": str(unready_vol),
+        }
+
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {
+            "base_dir": str(root),
+            "results": [],
+            "error": f"Cannot access {root}: {exc}",
+        }
 
     lock_dir = Path.home() / ".cache" / "remote-fleet"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -1652,6 +1692,22 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     return {"base_dir": str(root), "results": results}
 
 
+def _sync_local_runtime_mirror(home: Path, repo_src: Path) -> Path:
+    """Keep an internal-APFS copy of `remote_fleet` under `~/.local/share/remote-fleet/src`
+    so the login LaunchAgent always boots cleanly even if the git checkout sits on an external SSD."""
+    mirror_src = home / ".local" / "share" / "remote-fleet" / "src"
+    pkg_src = repo_src / "remote_fleet"
+    pkg_dst = mirror_src / "remote_fleet"
+    if pkg_src.is_dir():
+        try:
+            pkg_dst.mkdir(parents=True, exist_ok=True)
+            for py_file in pkg_src.glob("*.py"):
+                shutil.copy2(py_file, pkg_dst / py_file.name)
+        except OSError:
+            pass
+    return mirror_src
+
+
 def install_macos_launch_agent(
     home_dir: Optional[Path] = None,
     python_executable: Optional[str] = None,
@@ -1661,8 +1717,10 @@ def install_macos_launch_agent(
     """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & heal every 30s."""
     home = (home_dir or Path.home()).expanduser().resolve()
     py_exe = python_executable or sys.executable or "/usr/bin/python3"
-    repo_src = str(get_repo_root() / "src")
-    mount_root = str((base_dir or (home / "RemoteComputers")).expanduser().resolve())
+    repo_src_path = get_repo_root() / "src"
+    mirror_src_path = _sync_local_runtime_mirror(home, repo_src_path)
+    py_path_str = f"{repo_src_path}:{mirror_src_path}"
+    mount_root = os.path.abspath(os.path.expanduser(str(base_dir or (home / "RemoteComputers"))))
 
     agents_dir = home / "Library" / "LaunchAgents"
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -1680,7 +1738,7 @@ def install_macos_launch_agent(
             "--from-launchd",
         ],
         "EnvironmentVariables": {
-            "PYTHONPATH": repo_src,
+            "PYTHONPATH": py_path_str,
             "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,

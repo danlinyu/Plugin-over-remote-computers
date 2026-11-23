@@ -768,13 +768,16 @@ def cmd_ssh_config(args: argparse.Namespace) -> int:
 def cmd_mount_all(args: argparse.Namespace) -> int:
     cfg, ts_self = load_fleet_config(include_tailscale=True)
     transport = FleetTransport(cfg, ts_self)
-    base = Path(args.dir).expanduser().resolve() if args.dir else None
+    base = Path(args.dir).expanduser() if args.dir else None
     from_launchd = bool(getattr(args, "from_launchd", False))
     summary = mount_all_machines(cfg, transport, base_dir=base, from_launchd=from_launchd)
-    if summary.get("skipped_locked"):
+    if summary.get("skipped_locked") or (from_launchd and summary.get("waiting_for_volume")):
         return 0
     if args.json:
         print(json.dumps(summary, indent=2))
+        return 0
+    if summary.get("waiting_for_volume"):
+        print(f"Waiting for external volume {summary['waiting_for_volume']} to mount...")
         return 0
     print(f"Remote Computers folder: {summary['base_dir']}")
     for r in summary["results"]:

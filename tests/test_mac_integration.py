@@ -844,6 +844,70 @@ class TestMacIntegration(unittest.TestCase):
                 else:
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
+    def test_external_ssd_boot_race_mirror_and_pc_dhcp_drift_protection(self) -> None:
+        """Verify:
+        1) `mount_all_machines` never calls `mkdir` on `/Volumes/X10 Pro/...` before `X10 Pro` is mounted at login.
+        2) `install_macos_launch_agent` mirrors `remote_fleet` onto internal APFS (`~/.local/share/remote-fleet/src`).
+        3) `resolve_endpoint` falls back to `danlin-hud` / `danlin-hud.local` on LAN if DHCP IP `192.168.68.70` changes."""
+        from unittest.mock import patch
+        from remote_fleet.config import FleetConfig, MachineConfig
+        from remote_fleet.mac_integration import _external_volume_not_ready, mount_all_machines
+        from remote_fleet.transport import FleetTransport
+
+        # 1. External SSD boot guard
+        ext_target = Path("/Volumes/X10 Pro/MovedFromInternal/Projects/RemoteComputers")
+        with (
+            patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+            patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+        ):
+            self.assertEqual(_external_volume_not_ready(ext_target), Path("/Volumes/X10 Pro"))
+            with patch(
+                "remote_fleet.mac_integration._resolve_mount_root",
+                return_value=(ext_target, Path("/Users/danlinyu/RemoteComputers")),
+            ):
+                summary = mount_all_machines(FleetConfig(machines=[]), FleetTransport(FleetConfig(machines=[])), from_launchd=True)
+                self.assertEqual(summary.get("waiting_for_volume"), "/Volumes/X10 Pro")
+
+        # 2. Internal APFS runtime mirror in LaunchAgent
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            plist_path = install_macos_launch_agent(home_dir=fake_home)
+            mirror_pkg = fake_home / ".local" / "share" / "remote-fleet" / "src" / "remote_fleet" / "mac_integration.py"
+            self.assertTrue(mirror_pkg.is_file())
+            with open(plist_path, "rb") as fp:
+                pdata = plistlib.load(fp)
+            self.assertIn(str(fake_home / ".local" / "share" / "remote-fleet" / "src"), pdata["EnvironmentVariables"]["PYTHONPATH"])
+
+        # 3. DHCP IP drift on `pc` (`192.168.68.70` down -> `danlin-hud.local` reachable on LAN)
+        old_self = os.environ.get("REMOTE_FLEET_SELF")
+        os.environ["REMOTE_FLEET_SELF"] = "mac-mini"
+        try:
+            pc = MachineConfig(
+                id="pc",
+                name="Home PC (danlin-hud)",
+                lan_host="192.168.68.70",
+                tailscale_host="100.93.148.108",
+                user="danli",
+                os="windows",
+            )
+            tr = FleetTransport(FleetConfig(machines=[pc], prefer_lan=True))
+
+            def fake_probe(host: str, port: int, timeout_sec: float) -> tuple[bool, float | None, str]:
+                if host == "danlin-hud.local":
+                    return True, 1.8, ""
+                return False, None, "connection refused"
+
+            with patch.object(tr, "_tcp_probe", side_effect=fake_probe):
+                ep = tr.resolve_endpoint(pc, force_refresh=True)
+            self.assertTrue(ep.reachable)
+            self.assertEqual(ep.transport, "lan")
+            self.assertEqual(ep.host, "danlin-hud.local")
+        finally:
+            if old_self is None:
+                os.environ.pop("REMOTE_FLEET_SELF", None)
+            else:
+                os.environ["REMOTE_FLEET_SELF"] = old_self
+
 
 if __name__ == "__main__":
     unittest.main()

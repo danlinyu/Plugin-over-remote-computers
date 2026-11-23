@@ -805,9 +805,16 @@ class FleetTransport:
         )
         ts_timeout = max(0.5, float(self.config.ssh_connect_timeout_sec))
 
+        extra_lan_names: List[str] = []
+        if machine.lan_host and re.match(r"^\d+\.\d+\.\d+\.\d+$", machine.lan_host):
+            if machine.id == "pc" or "danlin-hud" in machine.name.lower():
+                extra_lan_names = ["danlin-hud", "danlin-hud.local"]
+
         if self.config.prefer_lan:
             if machine.lan_host:
                 candidates.append(("lan", machine.lan_host, lan_timeout))
+            for alt_lan in extra_lan_names:
+                candidates.append(("lan", alt_lan, max(1.0, base_lan_timeout)))
             if machine.tailscale_host and machine.tailscale_host != machine.lan_host:
                 candidates.append(("tailscale", machine.tailscale_host, ts_timeout))
         else:
@@ -815,6 +822,8 @@ class FleetTransport:
                 candidates.append(("tailscale", machine.tailscale_host, ts_timeout))
             if machine.lan_host and machine.lan_host != machine.tailscale_host:
                 candidates.append(("lan", machine.lan_host, lan_timeout))
+            for alt_lan in extra_lan_names:
+                candidates.append(("lan", alt_lan, max(1.0, base_lan_timeout)))
 
         errors: List[str] = []
         local_ts_checked = False
