@@ -562,10 +562,22 @@ class TestMacIntegration(unittest.TestCase):
             ):
                 self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "legacy_nfsmount")
 
-            # Write valid daemon metadata
+            # 2b. Daemon metadata without schema=2 (e.g. broken 46ab17a `--max-connections 1` daemon) -> "outdated_daemon"
             meta_file = daemons / "pc-C.json"
             meta_file.write_text(
                 json.dumps({"pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
+                encoding="utf-8",
+            )
+            with (
+                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+            ):
+                self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "outdated_daemon")
+
+            # Write valid schema=2 daemon metadata
+            meta_file.write_text(
+                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
                 encoding="utf-8",
             )
 

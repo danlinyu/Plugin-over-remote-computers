@@ -349,6 +349,9 @@ def _wait_tcp_ready(port: int, proc: subprocess.Popen[Any], timeout_sec: float =
     return False
 
 
+DAEMON_SCHEMA_VERSION = 2
+
+
 def _probe_mount_health(
     mount_point: Path,
     log_stem: str,
@@ -372,6 +375,8 @@ def _probe_mount_health(
             return "legacy_nfsmount"
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            if int(meta.get("schema") or 0) < DAEMON_SCHEMA_VERSION:
+                return "outdated_daemon"
             if expected_host and meta.get("host") and meta.get("host") != expected_host:
                 return "endpoint_changed"
             pid = int(meta.get("pid") or 0)
@@ -463,7 +468,7 @@ def _mount_sftp_directory(
     _ = vol_label
     mount_point = safe_lexical_resolve(mount_point)
 
-    health = _probe_mount_health(mount_point, log_stem, timeout_sec=20.0, expected_host=host)
+    health = _probe_mount_health(mount_point, log_stem, timeout_sec=12.0, expected_host=host)
     if health == "healthy":
         visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
         reg = load_mounts_registry()
@@ -531,13 +536,7 @@ def _mount_sftp_directory(
                 "error": f"rclone SFTP preflight failed on {host} ({remote_target}): {preflight_err}",
             }
 
-        # SFTP pipelines 64 concurrent requests over a single SSH connection (`--sftp-concurrency 64`).
-        # Capping Windows multi-drive mounts at `--max-connections 1` keeps 10 drives x 1 = 10 <= Windows sshd `MaxStartups 10`!
-        max_conns = "1" if machine.os == "windows" else "2"
-        extra_conn_flags = (
-            ["--max-connections", max_conns] if _rclone_supports_flag(rclone_bin, "--max-connections") else []
-        )
-
+        # Never pass `--max-connections 1` (deadlocks rclone VFS on nested Finder READDIRPLUS + .DS_Store calls!).
         for _attempt in range(2 if preverified_sftp is not None else 1):
             nfs_port = _allocate_loopback_port()
             nfs_cache_dir = cache_root / "nfs-handles" / log_stem
@@ -581,7 +580,6 @@ def _mount_sftp_directory(
                 "2",
                 "--transfers",
                 "2",
-                *extra_conn_flags,
             ]
 
             with open(log_file, "w", encoding="utf-8") as lf:
@@ -623,6 +621,7 @@ def _mount_sftp_directory(
                 meta_file.write_text(
                     json.dumps(
                         {
+                            "schema": DAEMON_SCHEMA_VERSION,
                             "pid": proc.pid,
                             "port": nfs_port,
                             "host": host,
@@ -634,7 +633,7 @@ def _mount_sftp_directory(
                     ),
                     encoding="utf-8",
                 )
-                if _probe_mount_health(mount_point, log_stem, timeout_sec=20.0, expected_host=host) == "healthy":
+                if _probe_mount_health(mount_point, log_stem, timeout_sec=15.0, expected_host=host) == "healthy":
                     visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
                     reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
@@ -1323,7 +1322,7 @@ def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected
                 return False
         except Exception:
             return False
-        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=20.0, expected_host=expected_host) != "healthy":
+        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=12.0, expected_host=expected_host) != "healthy":
             return False
     return True
 
@@ -1659,40 +1658,57 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     prefixes = {str(root), str(raw_root)}
     results = []
 
-    table = get_macos_mount_table()
-    if table is not None:
-        for mp_str in sorted(table.keys(), key=len, reverse=True):
-            if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
-                results.append({"path": mp_str, **unmount_sshfs(Path(mp_str))})
-    elif root.is_dir():
-        for child in sorted(root.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                continue
-            if is_mounted(child):
-                results.append({"path": str(child), **unmount_sshfs(child)})
-            else:
-                # Unmount nested multi-drive mounts (e.g. `~/RemoteComputers/pc/C`, `~/RemoteComputers/spark01/Home`)
-                for sub in sorted(child.iterdir()):
-                    if not sub.is_symlink() and sub.is_dir() and is_mounted(sub):
-                        results.append({"path": str(sub), **unmount_sshfs(sub)})
-
-    # Stop all recorded `rclone serve nfs` daemons AFTER unmounting
-    daemons = _daemons_dir()
-    if daemons.is_dir():
-        for mf in sorted(daemons.glob("*.json")):
+    lock_dir = Path.home() / ".cache" / "remote-fleet"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_fp = open(lock_dir / "mount-all.lock", "w", encoding="utf-8")
+    try:
+        if fcntl is not None:
             try:
-                meta = json.loads(mf.read_text(encoding="utf-8"))
-                pid = int(meta.get("pid") or 0)
-                if pid > 0:
-                    os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-            try:
-                mf.unlink(missing_ok=True)
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
             except OSError:
                 pass
 
-    return {"base_dir": str(root), "results": results}
+        table = get_macos_mount_table()
+        if table is not None:
+            for mp_str in sorted(table.keys(), key=len, reverse=True):
+                if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
+                    results.append({"path": mp_str, **unmount_sshfs(Path(mp_str))})
+        elif root.is_dir():
+            for child in sorted(root.iterdir()):
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                if is_mounted(child):
+                    results.append({"path": str(child), **unmount_sshfs(child)})
+                else:
+                    # Unmount nested multi-drive mounts (e.g. `~/RemoteComputers/pc/C`, `~/RemoteComputers/spark01/Home`)
+                    for sub in sorted(child.iterdir()):
+                        if not sub.is_symlink() and sub.is_dir() and is_mounted(sub):
+                            results.append({"path": str(sub), **unmount_sshfs(sub)})
+
+        # Stop all recorded `rclone serve nfs` daemons AFTER unmounting
+        daemons = _daemons_dir()
+        if daemons.is_dir():
+            for mf in sorted(daemons.glob("*.json")):
+                try:
+                    meta = json.loads(mf.read_text(encoding="utf-8"))
+                    pid = int(meta.get("pid") or 0)
+                    if pid > 0:
+                        os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                try:
+                    mf.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        return {"base_dir": str(root), "results": results}
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_fp.close()
 
 
 def _sync_local_runtime_mirror(home: Path, repo_src: Path) -> Path:
