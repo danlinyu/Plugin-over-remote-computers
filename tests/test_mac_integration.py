@@ -1242,6 +1242,193 @@ class TestMacIntegration(unittest.TestCase):
                 else:
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
+    def test_macos_login_item_app_bundle_tcc_stability_and_fallback(self) -> None:
+        """Verify `Remote Fleet Mount.app` compiles/signs once, preserves CDHash across updates,
+        and falls back to a strictly one-shot (`RunAtLoad` only, zero `StartInterval`) opener plist."""
+        import json
+        import plistlib
+        import subprocess as sp
+        from unittest.mock import patch
+
+        from remote_fleet.mac_integration import (
+            LOGIN_APP_BUNDLE_ID,
+            LOGIN_APP_EXECUTABLE,
+            LOGIN_APP_NAME,
+            LOGIN_APP_VERSION,
+            LOGIN_FALLBACK_AGENT_LABEL,
+            install_macos_login_item_app,
+            uninstall_macos_login_item_app,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            vol_target = Path(tmp) / "fake_x10" / "RemoteComputers"
+            vol_target.mkdir(parents=True)
+            mount_link = fake_home / "RemoteComputers"
+            mount_link.symlink_to(vol_target)
+
+            invoked: list[list[str]] = []
+
+            def fake_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                invoked.append(list(cmd))
+                if cmd and cmd[0].endswith("swiftc"):
+                    out_idx = cmd.index("-o") + 1
+                    out_bin = Path(cmd[out_idx])
+                    out_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    out_bin.chmod(0o755)
+                    return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if cmd and cmd[0].endswith("codesign"):
+                    return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if cmd and cmd[0].endswith("xattr"):
+                    return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if cmd and cmd[0] == "osascript":
+                    # Simulate System Events Automation denied -> should install one-shot fallback plist
+                    return sp.CompletedProcess(cmd, 1, stdout="", stderr="Not authorized")
+                return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with (
+                patch("remote_fleet.mac_integration.Path.home", return_value=fake_home),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch(
+                    "remote_fleet.mac_integration.shutil.which",
+                    side_effect=lambda name: f"/usr/bin/{name}" if name in ("swiftc", "codesign", "osascript", "xattr", "launchctl") else None,
+                ),
+                patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_run),
+            ):
+                res1 = install_macos_login_item_app(home_dir=None, base_dir=mount_link, register_login_item=True)
+
+            self.assertTrue(res1["ok"], res1)
+            self.assertTrue(res1["newly_created"])
+            self.assertFalse(res1["login_item_registered"])
+            self.assertTrue(res1["fallback_agent_installed"])
+
+            app_path = fake_home / "Applications" / f"{LOGIN_APP_NAME}.app"
+            info_plist = plistlib.loads((app_path / "Contents" / "Info.plist").read_bytes())
+            self.assertEqual(info_plist["CFBundleIdentifier"], LOGIN_APP_BUNDLE_ID)
+            self.assertEqual(info_plist["CFBundleExecutable"], LOGIN_APP_EXECUTABLE)
+            self.assertTrue(info_plist["LSUIElement"])
+            self.assertFalse(info_plist["LSBackgroundOnly"])
+            self.assertIn("NSRemovableVolumesUsageDescription", info_plist)
+            self.assertIn("NSLocalNetworkUsageDescription", info_plist)
+            self.assertEqual(
+                (app_path / "Contents" / "Resources" / "version.txt").read_text(encoding="utf-8").strip(),
+                LOGIN_APP_VERSION,
+            )
+
+            # Verify fallback plist is strictly one-shot (`RunAtLoad` ONLY, NO `StartInterval`)
+            fb_plist_path = fake_home / "Library" / "LaunchAgents" / f"{LOGIN_FALLBACK_AGENT_LABEL}.plist"
+            self.assertTrue(fb_plist_path.is_file())
+            fb_plist = plistlib.loads(fb_plist_path.read_bytes())
+            self.assertTrue(fb_plist["RunAtLoad"])
+            self.assertNotIn("StartInterval", fb_plist)
+            self.assertNotIn("KeepAlive", fb_plist)
+            self.assertEqual(fb_plist["ProgramArguments"], ["/usr/bin/open", "-g", str(app_path)])
+
+            # Verify dynamic config stores both raw symlink and resolved directory
+            cfg_json = json.loads((fake_home / ".config" / "remote-fleet" / "login-mount.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg_json["mount_dir"], str(mount_link))
+            self.assertEqual(cfg_json["resolved_dir"], str(vol_target.resolve()))
+
+            # Re-running install MUST NOT recompile or re-sign the app (keeps TCC CDHash intact!)
+            invoked.clear()
+            alt_dir = fake_home / "OtherRemote"
+            alt_dir.mkdir()
+            with (
+                patch("remote_fleet.mac_integration.Path.home", return_value=fake_home),
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch(
+                    "remote_fleet.mac_integration.shutil.which",
+                    side_effect=lambda name: f"/usr/bin/{name}" if name in ("swiftc", "codesign", "osascript", "launchctl") else None,
+                ),
+                patch(
+                    "remote_fleet.mac_integration.subprocess.run",
+                    side_effect=lambda cmd, **kw: invoked.append(list(cmd)) or sp.CompletedProcess(cmd, 0, stdout="", stderr=""),
+                ),
+            ):
+                res2 = install_macos_login_item_app(home_dir=None, base_dir=alt_dir, register_login_item=True)
+
+            self.assertTrue(res2["ok"])
+            self.assertFalse(res2["newly_created"])
+            self.assertTrue(res2["login_item_registered"])
+            self.assertFalse(any(c[0].endswith("swiftc") or c[0].endswith("codesign") for c in invoked))
+            # When Login Item succeeds, fallback LaunchAgent plist must be removed
+            self.assertFalse(fb_plist_path.exists())
+            cfg_json2 = json.loads((fake_home / ".config" / "remote-fleet" / "login-mount.json").read_text(encoding="utf-8"))
+            self.assertEqual(cfg_json2["mount_dir"], str(alt_dir))
+
+            # Uninstall cleans up everything cleanly
+            self.assertTrue(uninstall_macos_login_item_app(home_dir=fake_home))
+            self.assertFalse(app_path.exists())
+            self.assertFalse((fake_home / ".config" / "remote-fleet" / "login-mount.json").exists())
+
+    def test_safe_kill_rclone_daemon_pid_protects_recycled_pids_after_reboot(self) -> None:
+        """After a Mac reboot, a stale PID in `daemons/*.json` may now belong to Finder or Dock.
+        `_safe_kill_rclone_daemon_pid` must NEVER send SIGTERM to a non-rclone process."""
+        import subprocess as sp
+        from unittest.mock import patch
+
+        from remote_fleet.mac_integration import _safe_kill_rclone_daemon_pid
+
+        killed: list[int] = []
+
+        # Case 1: PID 777 belongs to Finder -> MUST NOT kill
+        with (
+            patch(
+                "remote_fleet.mac_integration.subprocess.run",
+                return_value=sp.CompletedProcess(["ps"], 0, stdout="/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder\n", stderr=""),
+            ),
+            patch("remote_fleet.mac_integration.os.kill", side_effect=lambda p, s: killed.append(p)),
+        ):
+            _safe_kill_rclone_daemon_pid(777)
+        self.assertEqual(killed, [])
+
+        # Case 2: PID 888 is a genuine `rclone serve nfs` process -> MUST kill
+        with (
+            patch(
+                "remote_fleet.mac_integration.subprocess.run",
+                return_value=sp.CompletedProcess(["ps"], 0, stdout="/Users/u/.local/bin/rclone serve nfs :sftp:/C:/ --addr 127.0.0.1:50000\n", stderr=""),
+            ),
+            patch("remote_fleet.mac_integration.os.kill", side_effect=lambda p, s: killed.append(p)),
+        ):
+            _safe_kill_rclone_daemon_pid(888)
+        self.assertEqual(killed, [888])
+
+    def test_mount_sshfs_on_macos_delegates_to_soft_nfs_not_legacy_nfsmount(self) -> None:
+        """Verify `mount_sshfs` on macOS delegates to soft `_mount_sftp_directory` instead of hard `rclone nfsmount`."""
+        from unittest.mock import patch
+
+        from remote_fleet.config import FleetConfig, MachineConfig
+        from remote_fleet.mount import mount_sshfs
+        from remote_fleet.transport import EndpointStatus, FleetTransport
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local_dir = Path(tmp) / "ws"
+            spark = MachineConfig(id="spark01", name="Spark 01", lan_host="spark01.local", user="danlinyu", os="linux")
+            cfg = FleetConfig(machines=[spark])
+            tr = FleetTransport(cfg)
+            fake_ep = EndpointStatus(machine_id="spark01", transport="lan", host="spark01.local", port=22, reachable=True, latency_ms=1.0)
+            captured: dict[str, object] = {}
+
+            def fake_mount_sftp(**kwargs: object) -> dict[str, object]:
+                captured.update(kwargs)
+                return {"ok": True, "engine": "rclone-serve-nfs-soft", "mount_point": str(local_dir)}
+
+            with (
+                patch.object(tr, "resolve_endpoint", return_value=fake_ep),
+                patch.object(tr, "run_worker_op", return_value={"ok": True, "path": "/home/danlinyu/proj"}),
+                patch("remote_fleet.mount.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mount.is_mounted", return_value=False),
+                patch("remote_fleet.mount.shutil.which", side_effect=lambda n: "/usr/local/bin/rclone" if n == "rclone" else None),
+                patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_sftp),
+                patch("remote_fleet.mount.subprocess.run", side_effect=AssertionError("Legacy rclone nfsmount must not run on macOS!")),
+            ):
+                res = mount_sshfs(tr, spark, "~/proj", local_dir)
+
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["mode"], "rclone-serve-nfs-soft")
+            self.assertEqual(captured["remote_target"], "/home/danlinyu/proj")
+
 
 if __name__ == "__main__":
     unittest.main()

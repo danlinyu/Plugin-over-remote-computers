@@ -1,11 +1,11 @@
 ---
 name: remote-fleet
-description: Browse folders, pick or create a project directory, edit files, access remote datasets, and run heavy calculations on any computer across your Home LAN or Tailscale (Mac Mini, PC, DGX Spark 1, Spark 2, Spark 3) while keeping your local interface machine fast and idle.
+description: Browse folders, pick or create a project directory, edit files, access remote datasets, and run heavy calculations on any computer across your Home LAN or Tailscale (Mac Mini, PC, DGX Sparks) while keeping your local interface machine fast and idle.
 ---
 
 # Remote Fleet (Mac Control Terminal -> Remote Files, Data & Compute)
 
-`remote-fleet` lets the user run any LLM harness (**Antigravity**, **Claude**, **Codex**, **DSH**, **Kimi Code**) smoothly on their local interface computer (e.g., **Mac Mini**), while **picking a folder, keeping all project files/changes/datasets, and running heavy calculations** directly on **PC**, **Spark 1**, **Spark 2**, **Spark 3** (or the Mac Mini itself) over **Home LAN or Tailscale**.
+`remote-fleet` lets the user run any LLM harness (**Antigravity**, **Claude**, **Codex**, **DSH**, **Kimi Code**) smoothly on their local interface computer (e.g., **Mac Mini**), while **picking a folder, keeping all project files/changes/datasets, and running heavy calculations** directly on **PC** or **DGX Sparks** (e.g., `spark01`, `spark03`, `spark04`, or the Mac Mini itself) over **Home LAN or Tailscale**.
 
 ## Golden Rules
 
@@ -25,8 +25,8 @@ When MCP tools are unavailable, run `<path/to/this/skill>/scripts/fleet` (or `fl
 
 ```bash
 fleet status --load                                       # Check LAN/Tailscale latency + CPU/GPU load
-fleet browse spark-1 ~/projects                           # Browse folders on spark-1
-fleet use spark-2 ~/projects/new-app --create --init-git  # Create & select remote folder
+fleet browse spark01 ~/projects                           # Browse folders on spark01
+fleet use spark03 ~/projects/new-app --create --init-git  # Create & select remote folder
 fleet ls                                                  # List files in active remote project
 fleet read src/main.py                                    # Read remote file
 fleet edit src/main.py --old "lr = 1e-3" --new "lr = 3e-4"# Edit remote file directly on target host

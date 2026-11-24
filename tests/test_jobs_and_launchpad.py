@@ -76,11 +76,17 @@ class TestJobsDatasetSyncAndLaunchpad(unittest.TestCase):
 
             saved_env = {
                 k: os.environ.get(k)
-                for k in ("REMOTE_FLEET_SSH_BIN", "REMOTE_FLEET_SKIP_TCP_PROBE", "REMOTE_FLEET_SELF")
+                for k in (
+                    "REMOTE_FLEET_SSH_BIN",
+                    "REMOTE_FLEET_SKIP_TCP_PROBE",
+                    "REMOTE_FLEET_SELF",
+                    "REMOTE_FLEET_CONFIG_DIR",
+                )
             }
             os.environ["REMOTE_FLEET_SSH_BIN"] = str(mock_ssh)
             os.environ["REMOTE_FLEET_SKIP_TCP_PROBE"] = "1"
             os.environ["REMOTE_FLEET_SELF"] = "mac-mini"
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(tmp_path / "cfg")
 
             try:
                 spark2 = MachineConfig(

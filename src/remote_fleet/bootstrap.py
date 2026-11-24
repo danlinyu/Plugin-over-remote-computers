@@ -40,6 +40,7 @@ from remote_fleet.config import (
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
     find_rclone_binary,
+    install_macos_login_item_app,
     mount_all_machines,
     sync_ssh_config,
     uninstall_macos_launch_agent,
@@ -200,6 +201,7 @@ def _scan_subnet_for_missing_hosts(
                             f"{ssh_user}@{ip}",
                             "hostname",
                         ],
+                        stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
                         timeout=4,
@@ -456,6 +458,7 @@ def check_batch_ssh(user: str, host: str, port: int = 22) -> bool:
                 target,
                 "echo ok",
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=8,
@@ -532,6 +535,7 @@ def cleanup_duplicate_spark_tailscale_if_present(user: str, host: str) -> None:
                 target,
                 check_cmd,
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=8,
@@ -872,6 +876,18 @@ def run_bootstrap(
     if platform.system().lower() == "darwin":
         if uninstall_macos_launch_agent():
             print("\nRemoved legacy background LaunchAgent (com.remote-fleet.automount).")
+        login_res = install_macos_login_item_app(base_dir=mount_dir or (Path.home() / "RemoteComputers"))
+        if login_res.get("ok"):
+            print(f"\n[BOOT] Installed one-shot macOS reboot/login auto-mounter (zero polling): {login_res['app_path']}")
+            if login_res.get("newly_created") and shutil.which("open"):
+                try:
+                    subprocess.run(["open", "-g", str(login_res["app_path"])], capture_output=True, timeout=8, check=False)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+                print(
+                    "       If macOS asks whether 'Remote Fleet Mount' can access your external volume or local network, "
+                    "click Allow once."
+                )
 
     if pc_needs_windows_sshd:
         _print_windows_pc_final_banner(pc_default_lan, effective_pc_user, pub_key_str)

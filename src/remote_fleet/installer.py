@@ -25,7 +25,7 @@ MD_END_MARKER = "<!-- remote-fleet-end -->"
 GLOBAL_FLEET_INSTRUCTION_BLOCK = f"""{MD_BEGIN_MARKER}
 ## Remote Fleet (Home LAN & Tailscale Multi-Computer Projects)
 
-You have the `remote-fleet` MCP server and skill installed. The user uses this machine (e.g., Mac Mini) as a fast, lightweight control interface while heavy computations and large local datasets live on their remote machines (`pc`, `spark-1`, `spark-2`, `spark-3`, `mac-mini`) over Home LAN / Tailscale.
+You have the `remote-fleet` MCP server and skill installed. The user uses this machine (e.g., Mac Mini) as a fast, lightweight control interface while heavy computations and large local datasets live on their remote machines (e.g., `pc`, `spark01`, `spark03`, `spark04`, `mac-mini` — always call `fleet_list_machines` to see live configured IDs) over Home LAN / Tailscale.
 
 - **Starting a new project or picking a remote folder**: Whenever the user starts a new project (especially from `~/Fleet/Start-Here` or without a target repo yet) or asks to open/create a project on another machine, call `fleet_list_machines(probe=true, include_load=true)` and `fleet_browse_folders`, then bind the folder with `fleet_select_project` or `fleet_create_project`.
 - **Keep changes, datasets, and compute on the target machine**: Once a remote machine folder is active, perform ALL file reads/writes/edits (`fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, `fleet_search_files`) and command execution (`fleet_run_command`) on that target machine—never leave edits stranded only on this interface computer, and never run heavy calculations locally on this interface computer.

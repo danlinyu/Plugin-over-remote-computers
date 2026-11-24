@@ -1,4 +1,4 @@
-"""Local workspace bridge: macOS rclone nfsmount / SSHFS mounts, dataset-safe code sync, live watch, and Start-Here launchpad."""
+"""Local workspace bridge: macOS soft `rclone serve nfs` / SSHFS mounts, dataset-safe code sync, live watch, and Start-Here launchpad."""
 
 from __future__ import annotations
 
@@ -197,12 +197,12 @@ def create_launchpad_workspace(
 
     launchpad_doc = """# Remote Fleet Launchpad (Start a New Project on Any Machine)
 
-You are running on the user's **local interface/terminal machine** (e.g., Mac Mini), while heavy compute and large local datasets live on their remote machines (**PC** and **3 Sparks** over Home LAN / Tailscale).
+You are running on the user's **local interface/terminal machine** (e.g., Mac Mini), while heavy compute and large local datasets live on their remote machines (**PC** and **DGX Sparks** over Home LAN / Tailscale).
 
 ## Mandatory Startup Behavior in This Folder
 
 1. **Immediately offer to pick a target computer & folder**:
-   - Call `fleet_list_machines(probe=true, include_load=true)` to show online computers (`mac-mini`, `pc`, `spark-1`, `spark-2`, `spark-3`) along with their live LAN/Tailscale latency and CPU/GPU load.
+   - Call `fleet_list_machines(probe=true, include_load=true)` to show all configured online computers (e.g., `mac-mini`, `pc`, `spark01`, `spark03`, `spark04`) along with their live LAN/Tailscale latency and CPU/GPU load.
    - Let the user browse folders with `fleet_browse_folders(machine=...)` and either pick an existing folder (`fleet_select_project`) or create a new project folder (`fleet_create_project`).
 2. **Keep ALL files, changes, and heavy computation on the remote machine**:
    - Do **NOT** create project source files inside this `Start-Here` folder or run heavy CPU/GPU jobs locally on this Mac.
@@ -279,7 +279,7 @@ def mount_sshfs(
     remote_path: str,
     local_dir: Path,
 ) -> Dict[str, Any]:
-    """Mount `machine:remote_path` onto `local_dir` using macOS `rclone nfsmount` (no macFUSE!) or `sshfs`."""
+    """Mount `machine:remote_path` onto `local_dir` using macOS soft `rclone serve nfs` (no macFUSE!) or `sshfs`."""
     ep = transport.resolve_endpoint(machine)
     if ep.transport == "local":
         return {
@@ -291,7 +291,7 @@ def mount_sshfs(
     if not ep.reachable:
         return {"ok": False, "error": f"Machine '{machine.id}' is unreachable: {ep.error}"}
 
-    local_dir.mkdir(parents=True, exist_ok=True)
+    local_dir = safe_lexical_resolve(local_dir)
     if is_mounted(local_dir):
         return {
             "ok": True,
@@ -301,12 +301,16 @@ def mount_sshfs(
             "endpoint": ep.to_dict(),
         }
 
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": f"Cannot access local mount directory {local_dir}: {exc}"}
+
     inspected = transport.run_worker_op(
         machine, {"op": "inspect_project", "path": remote_path, "create_if_missing": False}
     )
     resolved_remote = inspected.get("path", remote_path) if inspected.get("ok") else remote_path
 
-    # 1. On macOS (or if sshfs is absent), prefer `rclone nfsmount` — uses native macOS NFSv3, zero kernel extensions!
     rclone_bin = shutil.which("rclone")
     if not rclone_bin:
         for cand in (
@@ -320,7 +324,40 @@ def mount_sshfs(
     is_macos = platform.system().lower() == "darwin"
     sshfs_bin = shutil.which("sshfs")
 
-    if rclone_bin and (is_macos or not sshfs_bin):
+    # 1. On macOS, ALWAYS use soft-NFS `_mount_sftp_directory` (`rclone serve nfs` + `soft,intr,nolocks,locallocks,nfc`)
+    # instead of legacy hard `rclone nfsmount` which can wedge Finder!
+    if rclone_bin and is_macos:
+        from remote_fleet.mac_integration import _mount_sftp_directory
+
+        safe_leaf = re.sub(r"[^A-Za-z0-9._-]+", "-", local_dir.name).strip("-") or "root"
+        res = _mount_sftp_directory(
+            machine=machine,
+            ep_dict=ep.to_dict(),
+            host=ep.host,
+            remote_target=resolved_remote,
+            mount_point=local_dir,
+            vol_label=f"Fleet-{machine.id}-{safe_leaf}",
+            log_stem=f"ws-{machine.id}-{safe_leaf}",
+            allow_empty_fallback=False,
+        )
+        if res.get("ok"):
+            return {
+                "ok": True,
+                "mode": str(res.get("engine") or "rclone-serve-nfs-soft"),
+                "local_path": str(res.get("mount_point") or local_dir),
+                "remote_path": resolved_remote,
+                "already_mounted": bool(res.get("already_mounted")),
+                "endpoint": ep.to_dict(),
+            }
+        if not sshfs_bin:
+            return {
+                "ok": False,
+                "error": str(res.get("error") or f"Failed to mount {machine.id}:{resolved_remote}"),
+                "endpoint": ep.to_dict(),
+            }
+
+    # 2. On Linux/non-macOS when sshfs is absent, use `rclone mount` (FUSE)
+    if rclone_bin and not is_macos and not sshfs_bin:
         ssh_parts = [
             shutil.which("ssh") or "/usr/bin/ssh",
             "-o",
@@ -335,11 +372,14 @@ def mount_sshfs(
         ssh_parts.append(f"{machine.user}@{ep.host}" if machine.user else ep.host)
         ssh_ext = " ".join(f'"{p}"' if " " in p else p for p in ssh_parts)
 
-        rclone_path = f"/{resolved_remote}" if (len(resolved_remote) > 2 and resolved_remote[1] == ":") else resolved_remote
-        mount_subcmd = "nfsmount" if is_macos else "mount"
+        rclone_path = (
+            f"/{resolved_remote}"
+            if (len(resolved_remote) >= 2 and resolved_remote[0].isalpha() and resolved_remote[1] == ":")
+            else resolved_remote
+        )
         cmd = [
             rclone_bin,
-            mount_subcmd,
+            "mount",
             f":sftp:{rclone_path}",
             str(local_dir),
             "--sftp-ssh",
@@ -360,7 +400,7 @@ def mount_sshfs(
         if (proc is not None and proc.returncode == 0) or is_mounted(local_dir):
             return {
                 "ok": True,
-                "mode": f"rclone-{mount_subcmd}",
+                "mode": "rclone-mount",
                 "local_path": str(local_dir),
                 "remote_path": resolved_remote,
                 "endpoint": ep.to_dict(),

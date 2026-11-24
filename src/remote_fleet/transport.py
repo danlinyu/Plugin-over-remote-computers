@@ -211,16 +211,22 @@ def handle(req: dict) -> dict:
             for entry in sorted(target.iterdir(), key=lambda e: e.name.lower()):
                 if not include_hidden and entry.name.startswith("."):
                     continue
-                if entry.is_dir():
-                    is_git = (entry / ".git").exists()
-                    dirs.append({
-                        "name": entry.name,
-                        "path": str(entry),
-                        "is_git_repo": is_git,
-                    })
-                elif entry.is_file():
-                    files.append(entry.name)
-        except PermissionError as exc:
+                try:
+                    if entry.is_dir():
+                        try:
+                            is_git = (entry / ".git").exists()
+                        except OSError:
+                            is_git = False
+                        dirs.append({
+                            "name": entry.name,
+                            "path": str(entry),
+                            "is_git_repo": is_git,
+                        })
+                    elif entry.is_file():
+                        files.append(entry.name)
+                except OSError:
+                    continue
+        except OSError as exc:
             return {
                 "ok": False,
                 "error": f"Permission denied reading {target}: {exc}",
@@ -274,7 +280,10 @@ def handle(req: dict) -> dict:
             (target / "README.md").write_text(f"# {target.name}\n", encoding="utf-8")
 
         if init_git and not (target / ".git").exists() and shutil.which("git"):
-            subprocess.run(["git", "init"], cwd=str(target), capture_output=True, text=True, check=False)
+            try:
+                subprocess.run(["git", "init"], cwd=str(target), capture_output=True, text=True, timeout=10, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
         is_git = (target / ".git").exists()
         git_branch = ""
@@ -312,8 +321,14 @@ def handle(req: dict) -> dict:
                 gpu_info = ["GPU busy (nvidia-smi timed out)"]
 
         entries = []
-        for e in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:40]:
-            entries.append(e.name + ("/" if e.is_dir() else ""))
+        try:
+            for e in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:40]:
+                try:
+                    entries.append(e.name + ("/" if e.is_dir() else ""))
+                except OSError:
+                    continue
+        except OSError:
+            pass
 
         return {
             "ok": True,
@@ -349,7 +364,7 @@ def handle(req: dict) -> dict:
                 return
             try:
                 children = sorted(cur.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-            except PermissionError:
+            except OSError:
                 return
             for child in children:
                 if len(items) >= max_entries:
@@ -357,13 +372,20 @@ def handle(req: dict) -> dict:
                     return
                 if not include_hidden and child.name.startswith("."):
                     continue
-                if child.is_dir() and child.name in IGNORED_DIRS and not include_hidden:
+                try:
+                    if child.is_symlink():
+                        continue
+                    is_dir_flag = child.is_dir()
+                    is_file_flag = not is_dir_flag and child.is_file()
+                except OSError:
+                    continue
+                if is_dir_flag and child.name in IGNORED_DIRS and not include_hidden:
                     continue
                 rel = str(child.relative_to(root)).replace("\\", "/")
-                if child.is_dir():
+                if is_dir_flag:
                     items.append({"path": rel + "/", "type": "dir"})
                     _walk(child, depth + 1)
-                elif child.is_file():
+                elif is_file_flag:
                     try:
                         sz = child.stat().st_size
                     except OSError:
@@ -419,6 +441,8 @@ def handle(req: dict) -> dict:
         if not target.is_file():
             return {"ok": False, "error": f"File not found: {target}"}
         old_text = str(req["old_text"])
+        if not old_text:
+            return {"ok": False, "error": "old_text must be non-empty"}
         new_text = str(req["new_text"])
         replace_all = bool(req.get("replace_all", False))
         original = target.read_text(encoding="utf-8")
@@ -467,14 +491,14 @@ def handle(req: dict) -> dict:
                 for line in proc.stdout.splitlines():
                     if len(matches) >= max_results:
                         break
-                    parts = line.split(":", 2)
-                    if len(parts) == 3:
-                        fpath, lno, snippet = parts
+                    rm = re.match(r"^([A-Za-z]:[^:]+|[^:]+):(\d+):(.*)$", line)
+                    if rm:
+                        fpath, lno, snippet = rm.group(1), rm.group(2), rm.group(3)
                         try:
                             rel = str(Path(fpath).resolve().relative_to(root)).replace("\\", "/")
                         except Exception:
                             rel = fpath
-                        matches.append({"file": rel, "line": int(lno) if lno.isdigit() else 1, "text": snippet[:300]})
+                        matches.append({"file": rel, "line": int(lno), "text": snippet[:300]})
                 return {"ok": True, "root": str(root), "matches": matches, "engine": "ripgrep"}
             except (subprocess.TimeoutExpired, OSError):
                 pass
@@ -489,16 +513,25 @@ def handle(req: dict) -> dict:
                 return
             try:
                 entries = sorted(cur.iterdir(), key=lambda x: x.name.lower())
-            except PermissionError:
+            except OSError:
                 return
             for entry in entries:
                 if len(matches) >= max_results:
                     return
-                if entry.name.startswith(".") or (entry.is_dir() and entry.name in IGNORED_DIRS):
+                if entry.name.startswith("."):
                     continue
-                if entry.is_dir():
+                try:
+                    if entry.is_symlink():
+                        continue
+                    is_dir_flag = entry.is_dir()
+                    is_file_flag = not is_dir_flag and entry.is_file()
+                except OSError:
+                    continue
+                if is_dir_flag and entry.name in IGNORED_DIRS:
+                    continue
+                if is_dir_flag:
                     _search_dir(entry)
-                elif entry.is_file():
+                elif is_file_flag:
                     if file_pattern and not fnmatch.fnmatch(entry.name, file_pattern):
                         continue
                     try:
@@ -569,6 +602,31 @@ def handle(req: dict) -> dict:
             "gpus": gpus,
         }
 
+    def _pid_alive(check_pid: int) -> bool:
+        if check_pid <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                handle = k32.OpenProcess(0x1000, False, int(check_pid))
+                if not handle:
+                    return False
+                try:
+                    code = ctypes.c_ulong(0)
+                    if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        return int(code.value) == 259
+                    return False
+                finally:
+                    k32.CloseHandle(handle)
+            except Exception:
+                return False
+        try:
+            os.kill(check_pid, 0)
+            return True
+        except OSError:
+            return False
+
     if op == "start_job":
         import signal as _signal
         import time as _time
@@ -596,7 +654,7 @@ def handle(req: dict) -> dict:
             f"cwd = {repr(str(cwd_path))}\n"
             f"cmd = {repr(actual_cmd)}\n"
             "with open(log_path, 'wb') as lf:\n"
-            "    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT)\n"
+            "    proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT)\n"
             "    rc = proc.wait()\n"
             "with open(done_path, 'w', encoding='utf-8') as df:\n"
             "    json.dump({'exit_code': rc, 'finished_at': time.time()}, df)\n"
@@ -641,19 +699,13 @@ def handle(req: dict) -> dict:
         pid = int(meta["pid"])
 
         done_info = json.loads(done_file.read_text(encoding="utf-8")) if done_file.is_file() else None
-        running = False
-        if done_info is None:
-            try:
-                os.kill(pid, 0)
-                running = True
-            except OSError:
-                running = False
+        running = _pid_alive(pid) if done_info is None else False
 
         if op == "stop_job":
             if running:
                 try:
                     if os.name == "nt":
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10, check=False)
                     else:
                         os.killpg(pid, _signal.SIGTERM)
                 except Exception:
@@ -693,13 +745,7 @@ def handle(req: dict) -> dict:
                 continue
             meta = json.loads(mf.read_text(encoding="utf-8"))
             done_info = json.loads(df.read_text(encoding="utf-8")) if df.is_file() else None
-            running = False
-            if done_info is None:
-                try:
-                    os.kill(int(meta["pid"]), 0)
-                    running = True
-                except OSError:
-                    running = False
+            running = _pid_alive(int(meta["pid"])) if done_info is None else False
             jobs.append({
                 "job_id": meta["job_id"],
                 "pid": meta["pid"],
@@ -928,6 +974,20 @@ class FleetTransport:
         args.append(target)
         return args
 
+    _IDEMPOTENT_WORKER_OPS = frozenset(
+        {
+            "ping",
+            "machine_metrics",
+            "browse_folders",
+            "list_files",
+            "read_file",
+            "search_files",
+            "list_jobs",
+            "job_status",
+            "job_logs",
+        }
+    )
+
     def _exec_worker_on_endpoint(
         self,
         machine: MachineConfig,
@@ -937,21 +997,24 @@ class FleetTransport:
     ) -> Dict[str, Any]:
         """Run a worker request against a single resolved endpoint `ep`."""
         is_win_fast_ping = machine.os == "windows" and req.get("op") == "ping"
-        envelope = "" if is_win_fast_ping else json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req})
+        envelope = "" if is_win_fast_ping else (json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req}) + "\n")
 
         if is_win_fast_ping:
-            remote_py_cmd = self._build_windows_fast_ping_cmd()
+            remote_py_cmd = self._build_windows_fast_ping_cmd(timeout_sec=timeout_sec)
         elif machine.os == "windows":
-            remote_py_cmd = self._build_windows_worker_cmd()
+            remote_py_cmd = self._build_windows_worker_cmd(timeout_sec=timeout_sec)
         else:
+            wd_sec = max(5, int(timeout_sec) + 5)
             py_snippet = (
-                "import json,sys; d=json.loads(sys.stdin.read()); "
+                "import json,sys; d=json.loads(sys.stdin.readline()); "
                 "ns={}; exec(d['code'], ns); print(json.dumps(ns['handle'](d['req'])))"
             )
             remote_py_cmd = (
                 "PY=$(command -v python3 || command -v /opt/homebrew/bin/python3 || "
                 "command -v /usr/local/bin/python3 || command -v python); "
-                f"\"$PY\" -c {shlex.quote(py_snippet)}"
+                f"if command -v timeout >/dev/null 2>&1; then "
+                f"timeout -k 5 {wd_sec} \"$PY\" -c {shlex.quote(py_snippet)}; "
+                f"else \"$PY\" -c {shlex.quote(py_snippet)}; fi"
             )
 
         ssh_cmd = [*self.build_ssh_args(machine, ep.host), remote_py_cmd]
@@ -985,7 +1048,11 @@ class FleetTransport:
         if proc.returncode != 0 and machine.os == "auto":
             ssh_win = [
                 *self.build_ssh_args(machine, ep.host, use_control_master=False),
-                self._build_windows_fast_ping_cmd() if req.get("op") == "ping" else self._build_windows_worker_cmd(),
+                (
+                    self._build_windows_fast_ping_cmd(timeout_sec=timeout_sec)
+                    if req.get("op") == "ping"
+                    else self._build_windows_worker_cmd(timeout_sec=timeout_sec)
+                ),
             ]
             try:
                 if req.get("op") == "ping":
@@ -1055,10 +1122,14 @@ class FleetTransport:
             }
 
         res = self._exec_worker_on_endpoint(machine, ep, req, timeout_sec)
-        # If Home LAN TCP port 22 accepted a socket (e.g. stale DHCP lease or hung interface) but SSH failed,
-        # automatically try Tailscale as a backup if available!
+        op_name = str(req.get("op") or "")
+        is_idempotent = op_name in self._IDEMPOTENT_WORKER_OPS or (
+            op_name == "inspect_project" and not req.get("create_if_missing")
+        )
+        # Only auto-failover LAN -> Tailscale for idempotent read-only ops (never double-execute writes/jobs!)
         if (
             not res.get("ok")
+            and is_idempotent
             and ep.transport == "lan"
             and machine.tailscale_host
             and machine.tailscale_host != ep.host
@@ -1087,25 +1158,47 @@ class FleetTransport:
         b64 = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
         return f"powershell -NoProfile -NonInteractive -EncodedCommand {b64}"
 
+    _WINDOWS_WD_STOP = "try { $__rfWd.Stop(); $__rfWd.Dispose() } catch {}"
+
+    @staticmethod
+    def _windows_watchdog_prefix(timeout_sec: int) -> str:
+        """In-process PowerShell self-destruct watchdog (zero extra OS processes while running).
+        Guarantees every child process spawned by the remote `powershell.exe` is terminated via
+        `taskkill.exe /F /T /PID` before calling `[Environment]::Exit(124)` if anything hangs or SSH drops."""
+        wd_ms = max(5, int(timeout_sec) + 5) * 1000
+        return (
+            "$__rfWd = [powershell]::Create().AddScript({ param($p,$ms); Start-Sleep -Milliseconds $ms; "
+            "try { $cs = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$p\" -ErrorAction Stop); "
+            "foreach ($c in $cs) { if ($c.ProcessId -and $c.ProcessId -ne $p) { & taskkill.exe /F /T /PID $c.ProcessId 2>$null | Out-Null } } } "
+            "catch { try { & taskkill.exe /F /T /PID $p 2>$null | Out-Null } catch {} }; "
+            "[Environment]::Exit(124) }).AddArgument($PID).AddArgument("
+            f"{wd_ms}); $__rfWd.BeginInvoke() | Out-Null\n"
+        )
+
     @classmethod
-    def _build_windows_fast_ping_cmd(cls) -> str:
+    def _build_windows_fast_ping_cmd(cls, timeout_sec: int = 20) -> str:
         """Zero-stdin, zero-disk-spinup Windows `ping` command (`DriveInfo::GetDrives()` checks `.DriveType` only,
         never `.IsReady` or `Test-Path`, so 8 parked USB/SATA HDDs never stall SSH discovery)."""
         ps_script = (
-            "[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            cls._windows_watchdog_prefix(timeout_sec)
+            + "[Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
             "$drvs = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -in @('Fixed','Removable','Network','Ram') -and $_.Name[0] -notin @('A','B') } | ForEach-Object { \"$($_.Name[0]):/\" })\n"
             "if (-not $drvs -or $drvs.Count -eq 0) { $drvs = @('C:/') }\n"
             "@{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; home = $HOME; drives = $drvs } | ConvertTo-Json -Compress\n"
+            f"{cls._WINDOWS_WD_STOP}\n"
+            "exit 0\n"
         )
         return cls._encode_windows_powershell(ps_script)
 
     @classmethod
-    def _build_windows_worker_cmd(cls) -> str:
-        """Build a self-contained Windows PowerShell launcher that locates real Python (skipping WindowsApps Store stubs)
-        and gracefully answers `ping` with `$HOME` even if Python is not yet installed on Windows."""
+    def _build_windows_worker_cmd(cls, timeout_sec: int = 30) -> str:
+        """Build a self-contained Windows PowerShell launcher using single-line `[Console]::In.ReadLine()`
+        (never blocking on Win32-OpenSSH stdin EOF) plus an in-process self-destruct watchdog."""
         ps_script = (
-            "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
-            "$raw = [Console]::In.ReadToEnd()\n"
+            cls._windows_watchdog_prefix(timeout_sec)
+            + "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            "$raw = [Console]::In.ReadLine()\n"
+            f"if (-not $raw) {{ {cls._WINDOWS_WD_STOP}; exit 1 }}\n"
             "$py = $null\n"
             "foreach ($c in @(Get-Command python, python3 -ErrorAction SilentlyContinue)) {\n"
             "  if ($c.Source -and ($c.Source -notlike '*\\WindowsApps\\*')) { $py = $c.Source; break }\n"
@@ -1127,17 +1220,21 @@ class FleetTransport:
             "}\n"
             "if ($py) {\n"
             "  $env:PYTHONIOENCODING = 'utf-8'\n"
-            "  $raw | & $py -c \"import json,sys; d=json.loads(sys.stdin.read()); ns={}; exec(d['code'], ns); print(json.dumps(ns['handle'](d['req'])))\"\n"
-            "  exit $LASTEXITCODE\n"
+            "  $raw | & $py -c \"import json,sys; d=json.loads(sys.stdin.readline()); ns={}; exec(d['code'], ns); print(json.dumps(ns['handle'](d['req'])))\"\n"
+            "  $__rc = $LASTEXITCODE\n"
+            f"  {cls._WINDOWS_WD_STOP}\n"
+            "  exit $__rc\n"
             "}\n"
             "$d = $raw | ConvertFrom-Json\n"
             "if ($d.req.op -eq 'ping') {\n"
             "  $drvs = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -in @('Fixed','Removable','Network','Ram') -and $_.Name[0] -notin @('A','B') } | ForEach-Object { \"$($_.Name[0]):/\" })\n"
             "  if (-not $drvs -or $drvs.Count -eq 0) { $drvs = @('C:/') }\n"
             "  @{ ok = $true; hostname = $env:COMPUTERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; python = 'not-installed'; home = $HOME; drives = $drvs; cwd = (Get-Location).Path } | ConvertTo-Json -Compress\n"
+            f"  {cls._WINDOWS_WD_STOP}\n"
             "  exit 0\n"
             "}\n"
             "@{ ok = $false; error = \"Python 3 not found on Windows ($env:COMPUTERNAME); install Python or Miniconda on Windows for remote worker ops.\" } | ConvertTo-Json -Compress\n"
+            f"{cls._WINDOWS_WD_STOP}\n"
             "exit 0\n"
         )
         return cls._encode_windows_powershell(ps_script)
@@ -1171,6 +1268,7 @@ class FleetTransport:
                     shell=True,
                     cwd=expanded_cwd,
                     env=merged_env,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     timeout=timeout_sec,
@@ -1207,6 +1305,7 @@ class FleetTransport:
 
         if machine.os == "windows":
             env_lines = [
+                self._windows_watchdog_prefix(timeout_sec).rstrip("\n"),
                 "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
                 "foreach ($d in @(\"$HOME\\.local\\bin\", \"$HOME\\miniconda3\", \"$HOME\\miniconda3\\Scripts\", \"$HOME\\anaconda3\", \"$HOME\\anaconda3\\Scripts\")) { if (Test-Path $d) { $env:PATH = \"$d;$env:PATH\" } }",
             ]
@@ -1223,7 +1322,14 @@ class FleetTransport:
             else:
                 lit_win = cwd.replace("'", "''")
                 cd_line = f"Set-Location -LiteralPath '{lit_win}'"
-            ps_script = "\n".join([*env_lines, cd_line, command])
+            cd_check = f"if (-not $?) {{ {self._WINDOWS_WD_STOP}; exit 1 }}"
+            footer_lines = [
+                "$__ok = $?",
+                "$__rc = if (-not $__ok) { if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { $LASTEXITCODE } else { 1 } } elseif ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }",
+                self._WINDOWS_WD_STOP,
+                "exit $__rc",
+            ]
+            ps_script = "\n".join([*env_lines, cd_line, cd_check, "$global:LASTEXITCODE = $null", command, *footer_lines])
             remote_cmd = self._encode_windows_powershell(ps_script)
         else:
             env_prefix = ""
@@ -1243,12 +1349,20 @@ class FleetTransport:
                 cd_expr = f"cd {shlex.quote(cwd)}"
             # Load common user PATH locations (/opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin) for non-login SSH shells
             path_init = 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
-            remote_cmd = f"{path_init}{cd_expr} && {{ {env_prefix}{command}; }}"
+            inner_cmd = f"{path_init}{cd_expr} && {{ {env_prefix}{command}; }}"
+            wd_sec = max(5, int(timeout_sec) + 5)
+            remote_cmd = (
+                f"if command -v timeout >/dev/null 2>&1; then "
+                f"_RF_SH=$(command -v bash || echo /bin/sh); "
+                f"timeout -k 5 {wd_sec} \"$_RF_SH\" -c {shlex.quote(inner_cmd)}; "
+                f"else {inner_cmd}; fi"
+            )
 
         ssh_cmd = [*self.build_ssh_args(machine, ep.host), remote_cmd]
         try:
             proc = subprocess.run(
                 ssh_cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
@@ -1270,6 +1384,15 @@ class FleetTransport:
                 "exit_code": -1,
                 "stdout": (exc.stdout or "") if isinstance(exc.stdout, str) else "",
                 "stderr": f"Remote command timed out after {timeout_sec}s on '{machine.id}'",
+                "cwd": cwd,
+                "endpoint": ep.to_dict(),
+            }
+        except OSError as exc:
+            return {
+                "ok": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Failed to execute SSH command on '{machine.id}': {exc}",
                 "cwd": cwd,
                 "endpoint": ep.to_dict(),
             }

@@ -50,6 +50,11 @@ SSH_BEGIN_MARKER = "# >>> remote-fleet-ssh >>>"
 SSH_END_MARKER = "# <<< remote-fleet-ssh <<<"
 
 LAUNCH_AGENT_LABEL = "com.remote-fleet.automount"
+LOGIN_APP_NAME = "Remote Fleet Mount"
+LOGIN_APP_BUNDLE_ID = "com.remote-fleet.login-mount"
+LOGIN_APP_EXECUTABLE = "RemoteFleetMount"
+LOGIN_APP_VERSION = "v1"
+LOGIN_FALLBACK_AGENT_LABEL = "com.remote-fleet.login-mount"
 
 
 def render_ssh_config_block(
@@ -430,6 +435,37 @@ def _probe_mount_health(
     return "unresponsive" if code in dead_codes else "healthy"
 
 
+def _safe_kill_rclone_daemon_pid(pid: int) -> None:
+    """Terminate `pid` ONLY if it is NOT an unrelated recycled process after a reboot.
+
+    After a Mac reboot, PIDs saved in `~/.cache/remote-fleet/daemons/*.json` can be reassigned
+    by macOS to unrelated user apps (e.g. Finder, Dock, Antigravity, Tailscale). Checking
+    `ps -p <pid> -o command=` guarantees we never send `SIGTERM` to a non-rclone process.
+    """
+    if pid <= 0 or pid == os.getpid():
+        return
+    ps_bin = "/bin/ps" if os.path.exists("/bin/ps") else shutil.which("ps")
+    if ps_bin:
+        try:
+            chk = subprocess.run(
+                [ps_bin, "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if chk.returncode == 0:
+                cmdline = chk.stdout.strip().lower()
+                if cmdline and ("rclone" not in cmdline or "serve nfs" not in cmdline):
+                    return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+
+
 def _teardown_mount_and_daemon(mount_point: Path, log_stem: str) -> None:
     """Unmount FIRST, then terminate the backing `rclone serve nfs` daemon (never kill before unmount!)."""
     if is_mounted(mount_point):
@@ -441,7 +477,7 @@ def _teardown_mount_and_daemon(mount_point: Path, log_stem: str) -> None:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             pid = int(meta.get("pid") or 0)
             if pid > 0:
-                os.kill(pid, signal.SIGTERM)
+                _safe_kill_rclone_daemon_pid(pid)
         except Exception:
             pass
         try:
@@ -1064,7 +1100,15 @@ def _mount_posix_container(
             "error": f"Could not detach previous direct mount at {container_dir}; close any terminal inside {container_dir} and retry.",
         }
 
-    container_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        container_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "permission_denied": isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES),
+            "error": f"Cannot access {container_dir}: {exc}",
+        }
     remote_home = str(ping.get("home") or "/").replace("\\", "/")
 
     reg = _prune_stale_registry_entries(machine.id, container_dir)
@@ -1586,6 +1630,7 @@ def mount_single_machine_root(
     machine: MachineConfig,
     base_dir: Path,
     from_launchd: bool = False,
+    from_login_app: bool = False,
 ) -> Dict[str, Any]:
     """Mount a remote computer inside permanent local APFS container `~/RemoteComputers/<machine.id>/`."""
     mount_point = safe_lexical_resolve(base_dir / machine.id)
@@ -1608,10 +1653,9 @@ def mount_single_machine_root(
                 "error": f"Cannot access {mount_point}: {exc}",
             }
 
-    # On background ticks, if every recorded mount for `machine.id` is already live & passes uncached
-    # `.fleet-probe-<uuid>` health, skip spawning SSH / SFTP probes completely (and preserve working
-    # mounts even if `launchd` saw a transient TCP/Local Network probe failure!).
-    if from_launchd and _all_recorded_daemons_healthy(
+    # On non-interactive/login-app runs, if every recorded mount for `machine.id` is already live & passes
+    # uncached `.fleet-probe-<uuid>` health, skip spawning SSH / SFTP probes completely!
+    if (from_launchd or from_login_app) and _all_recorded_daemons_healthy(
         machine.id, mount_point, ep.host if ep.reachable else ""
     ):
         return {
@@ -1837,9 +1881,11 @@ def mount_all_machines(
     transport: FleetTransport,
     base_dir: Optional[Path] = None,
     from_launchd: bool = False,
+    from_login_app: bool = False,
 ) -> Dict[str, Any]:
     """Mount all reachable remote fleet computers under `~/RemoteComputers/<id>/` with mutex & self-healing."""
     root, raw_root = _resolve_mount_root(base_dir)
+    non_interactive = from_launchd or from_login_app
 
     unready_vol = _external_volume_not_ready(root)
     if unready_vol is not None:
@@ -1864,7 +1910,7 @@ def mount_all_machines(
     lock_fp = open(lock_file_path, "w", encoding="utf-8")
     try:
         if fcntl is not None:
-            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if from_launchd else 0)
+            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_interactive else 0)
             try:
                 fcntl.flock(lock_fp.fileno(), flags)
             except OSError:
@@ -1878,7 +1924,13 @@ def mount_all_machines(
         results = []
         remote_ids: List[str] = []
         for m in config.machines:
-            res = mount_single_machine_root(transport, m, root, from_launchd=from_launchd)
+            res = mount_single_machine_root(
+                transport,
+                m,
+                root,
+                from_launchd=from_launchd,
+                from_login_app=from_login_app,
+            )
             results.append(res)
             if not res.get("skipped"):
                 remote_ids.append(m.id)
@@ -1889,11 +1941,11 @@ def mount_all_machines(
         )
 
         sidebar_info: Dict[str, Any] = {"repaired": False}
-        if platform.system().lower() == "darwin" and remote_ids and (not from_launchd or newly_mounted):
+        if platform.system().lower() == "darwin" and remote_ids and (not non_interactive or newly_mounted):
             sidebar_info = repair_macos_sidebar_favorites(
                 root,
                 remote_ids,
-                dismiss_stuck_panels=not from_launchd,
+                dismiss_stuck_panels=not non_interactive,
             )
 
         # Refresh macOS Finder windows (`~/RemoteComputers` and `~/RemoteComputers/<id>`) when new mounts appear
@@ -1910,10 +1962,12 @@ def mount_all_machines(
                 cand = root / mid
                 if not is_mounted(cand) and cand.is_dir():
                     refresh_targets.append(cand)
-            script_lines = [
-                f'tell application "Finder" to if exists (POSIX file "{p}" as alias) then update (POSIX file "{p}" as alias)'
-                for p in refresh_targets
-            ]
+            script_lines = []
+            for p in refresh_targets:
+                esc_p = str(p).replace("\\", "\\\\").replace('"', '\\"')
+                script_lines.append(
+                    f'tell application "Finder" to if exists (POSIX file "{esc_p}" as alias) then update (POSIX file "{esc_p}" as alias)'
+                )
             try:
                 subprocess.run(
                     ["osascript", "-e", "\n".join(script_lines)],
@@ -1979,7 +2033,7 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
                     meta = json.loads(mf.read_text(encoding="utf-8"))
                     pid = int(meta.get("pid") or 0)
                     if pid > 0:
-                        os.kill(pid, signal.SIGTERM)
+                        _safe_kill_rclone_daemon_pid(pid)
                 except Exception:
                     pass
                 try:
@@ -2145,3 +2199,444 @@ def install_macos_launch_agent(
                 time.sleep(0.3)
 
     return plist_path
+
+
+_SWIFT_LOGIN_MOUNT_SOURCE = r'''
+import Foundation
+
+struct LoginMountConfig: Decodable {
+    let python_exe: String
+    let mount_dir: String
+    let resolved_dir: String
+    let pythonpath: String
+    let path_env: String
+}
+
+let home = NSHomeDirectory()
+let cfgURL = URL(fileURLWithPath: home).appendingPathComponent(".config/remote-fleet/login-mount.json")
+let logDir = URL(fileURLWithPath: home).appendingPathComponent(".cache/remote-fleet")
+let logURL = logDir.appendingPathComponent("login-mount.log")
+
+func logLine(_ msg: String) {
+    try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(ts)] \(msg)\n"
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+       let size = attrs[.size] as? NSNumber, size.intValue > 262144 {
+        try? Data().write(to: logURL)
+    }
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let fh = try? FileHandle(forWritingTo: logURL) {
+            fh.seekToEndOfFile()
+            fh.write(data)
+            fh.closeFile()
+        } else {
+            try? data.write(to: logURL)
+        }
+    }
+}
+
+guard let rawCfg = try? Data(contentsOf: cfgURL),
+      let cfg = try? JSONDecoder().decode(LoginMountConfig.self, from: rawCfg) else {
+    logLine("Missing or unreadable config at \(cfgURL.path); exiting.")
+    exit(0)
+}
+
+func externalVolumeRoot(_ path: String) -> String? {
+    let comps = (path as NSString).pathComponents
+    if comps.count >= 3 && comps[0] == "/" && comps[1] == "Volumes" {
+        return "/Volumes/\(comps[2])"
+    }
+    return nil
+}
+
+func isVolumeMounted(_ volRoot: String) -> Bool {
+    let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []
+    for u in urls {
+        if u.standardizedFileURL.path == volRoot {
+            return true
+        }
+    }
+    return false
+}
+
+let volRoot = externalVolumeRoot(cfg.resolved_dir) ?? externalVolumeRoot(cfg.mount_dir)
+if let vr = volRoot {
+    var ready = false
+    for _ in 0..<23 {
+        if isVolumeMounted(vr) {
+            ready = true
+            break
+        }
+        Thread.sleep(forTimeInterval: 2.0)
+    }
+    if !ready {
+        logLine("External volume \(vr) did not mount within 45s; exiting.")
+        exit(0)
+    }
+}
+
+if volRoot != nil || FileManager.default.fileExists(atPath: cfg.resolved_dir) {
+    let probePath = FileManager.default.fileExists(atPath: cfg.resolved_dir)
+        ? cfg.resolved_dir
+        : (volRoot ?? cfg.resolved_dir)
+    do {
+        _ = try FileManager.default.contentsOfDirectory(atPath: probePath)
+    } catch {
+        logLine("Cannot access \(probePath) (macOS Privacy/Removable Volumes): \(error.localizedDescription)")
+        exit(1)
+    }
+}
+
+func runMountOnce() -> (Int32, String) {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: cfg.python_exe)
+    proc.arguments = ["-m", "remote_fleet", "mount-all", "--dir", cfg.mount_dir, "--from-login-app"]
+    var env = ProcessInfo.processInfo.environment
+    env["PYTHONPATH"] = cfg.pythonpath
+    env["PATH"] = cfg.path_env
+    env["PYTHONUNBUFFERED"] = "1"
+    proc.environment = env
+    proc.standardInput = FileHandle.nullDevice
+
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = pipe
+
+    do {
+        try proc.run()
+    } catch {
+        return (1, "Failed to launch python: \(error.localizedDescription)")
+    }
+
+    let killer = DispatchWorkItem {
+        if proc.isRunning {
+            proc.terminate()
+        }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 180.0, execute: killer)
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
+    killer.cancel()
+
+    let text = String(data: data, encoding: .utf8) ?? ""
+    return (proc.terminationStatus, text)
+}
+
+logLine("Starting login auto-mount for \(cfg.mount_dir) (resolved: \(cfg.resolved_dir))")
+let (rc1, out1) = runMountOnce()
+if !out1.isEmpty {
+    logLine("Pass 1 (rc=\(rc1)):\n\(out1.trimmingCharacters(in: .whitespacesAndNewlines))")
+}
+
+let lower1 = out1.lowercased()
+if lower1.contains("unreachable") && !lower1.contains("operation not permitted") && !lower1.contains("permission denied") {
+    logLine("One or more machines unreachable during early login; waiting 10s for 1 final retry...")
+    Thread.sleep(forTimeInterval: 10.0)
+    let (rc2, out2) = runMountOnce()
+    if !out2.isEmpty {
+        logLine("Pass 2 (rc=\(rc2)):\n\(out2.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+}
+
+logLine("Login auto-mount finished.")
+exit(0)
+'''
+
+
+def _uninstall_login_app_fallback_agent(home: Path, live_darwin: bool) -> bool:
+    plist_path = home / "Library" / "LaunchAgents" / f"{LOGIN_FALLBACK_AGENT_LABEL}.plist"
+    existed = plist_path.is_file()
+    if live_darwin and shutil.which("launchctl"):
+        uid = os.getuid()
+        for lcmd in (
+            ["launchctl", "bootout", f"gui/{uid}/{LOGIN_FALLBACK_AGENT_LABEL}"],
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+        ):
+            try:
+                subprocess.run(lcmd, capture_output=True, timeout=5, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+    if existed:
+        try:
+            plist_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return existed
+
+
+def _install_login_app_fallback_agent(home: Path, app_path: Path) -> Path:
+    """Install a strictly one-shot (`RunAtLoad` ONLY, ZERO `StartInterval`) LaunchAgent that calls
+    `/usr/bin/open -g <Remote Fleet Mount.app>` once on reboot/login if `System Events` Login Items
+    automation was denied."""
+    agents_dir = home / "Library" / "LaunchAgents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = agents_dir / f"{LOGIN_FALLBACK_AGENT_LABEL}.plist"
+    plist_data = {
+        "Label": LOGIN_FALLBACK_AGENT_LABEL,
+        "ProgramArguments": ["/usr/bin/open", "-g", str(app_path)],
+        "RunAtLoad": True,
+        "StandardOutPath": str(home / ".cache" / "remote-fleet" / "login-app-launch.log"),
+        "StandardErrorPath": str(home / ".cache" / "remote-fleet" / "login-app-launch.err.log"),
+    }
+    (home / ".cache" / "remote-fleet").mkdir(parents=True, exist_ok=True)
+    plist_bytes = plistlib.dumps(plist_data)
+    existing: Optional[bytes] = None
+    if plist_path.is_file():
+        try:
+            existing = plist_path.read_bytes()
+        except OSError:
+            existing = None
+    if existing != plist_bytes:
+        plist_path.write_bytes(plist_bytes)
+    return plist_path
+
+
+def uninstall_macos_login_item_app(home_dir: Optional[Path] = None) -> bool:
+    """Remove `~/Applications/Remote Fleet Mount.app`, its macOS Login Item entry, fallback plist, and config."""
+    home = (home_dir or Path.home()).expanduser().resolve()
+    live_darwin = home_dir is None and platform.system().lower() == "darwin"
+    removed = False
+
+    if live_darwin and shutil.which("osascript"):
+        script = (
+            'tell application "System Events"\n'
+            f'    if exists login item "{LOGIN_APP_NAME}" then\n'
+            f'        delete login item "{LOGIN_APP_NAME}"\n'
+            "    end if\n"
+            "end tell\n"
+        )
+        try:
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=8, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    if _uninstall_login_app_fallback_agent(home, live_darwin=live_darwin):
+        removed = True
+
+    app_path = home / "Applications" / f"{LOGIN_APP_NAME}.app"
+    if app_path.exists():
+        try:
+            shutil.rmtree(app_path)
+            removed = True
+        except OSError:
+            pass
+
+    cfg_file = home / ".config" / "remote-fleet" / "login-mount.json"
+    if cfg_file.is_file():
+        try:
+            cfg_file.unlink(missing_ok=True)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def install_macos_login_item_app(
+    home_dir: Optional[Path] = None,
+    python_executable: Optional[str] = None,
+    base_dir: Optional[Path] = None,
+    register_login_item: bool = True,
+) -> Dict[str, Any]:
+    """Build & ad-hoc sign `~/Applications/Remote Fleet Mount.app` and register it to run ONCE at login/reboot.
+
+    Why a native compiled `.app` bundle instead of bare `launchd` `python3`:
+    - macOS TCC denies `/Volumes/<ExternalSSD>` access (`Operation not permitted`) to bare `launchd` Python scripts
+      without ever showing an Allow dialog.
+    - A signed `.app` bundle on the internal disk (`~/Applications/Remote Fleet Mount.app`) has a stable bundle ID
+      (`com.remote-fleet.login-mount`) and `NSRemovableVolumesUsageDescription` so macOS prompts ONCE for Removable
+      Volumes permission and remembers that approval across every reboot, log-out/log-in, and `git pull` (because we
+      keep dynamic paths in `~/.config/remote-fleet/login-mount.json` and NEVER recompile/re-sign unless `version.txt`
+      changes).
+    - Runs strictly ONCE at login/reboot with ZERO background polling timer.
+    """
+    home = (home_dir or Path.home()).expanduser().resolve()
+    py_exe = python_executable or sys.executable or "/usr/bin/python3"
+    repo_src_path = get_repo_root() / "src"
+    mirror_src_path = _sync_local_runtime_mirror(home, repo_src_path)
+    resolved_root, raw_root = _resolve_mount_root(base_dir or (home / "RemoteComputers"))
+
+    cfg_dir = home / ".config" / "remote-fleet"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = cfg_dir / "login-mount.json"
+    cfg_payload = {
+        "python_exe": py_exe,
+        "mount_dir": str(raw_root),
+        "resolved_dir": str(resolved_root),
+        "pythonpath": f"{repo_src_path}:{mirror_src_path}",
+        "path_env": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    cfg_file.write_text(json.dumps(cfg_payload, indent=2) + "\n", encoding="utf-8")
+
+    app_path = home / "Applications" / f"{LOGIN_APP_NAME}.app"
+    contents_dir = app_path / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+    exec_path = macos_dir / LOGIN_APP_EXECUTABLE
+    info_plist = contents_dir / "Info.plist"
+    version_file = resources_dir / "version.txt"
+
+    current_ver = ""
+    if version_file.is_file():
+        try:
+            current_ver = version_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            current_ver = ""
+
+    needs_build = not (
+        exec_path.is_file()
+        and os.access(exec_path, os.X_OK)
+        and info_plist.is_file()
+        and current_ver == LOGIN_APP_VERSION
+    )
+    newly_created = False
+
+    if needs_build:
+        swiftc_bin = shutil.which("swiftc") or ("/usr/bin/swiftc" if os.path.exists("/usr/bin/swiftc") else None)
+        if not swiftc_bin:
+            return {
+                "ok": False,
+                "app_path": str(app_path),
+                "config_path": str(cfg_file),
+                "newly_created": False,
+                "login_item_registered": False,
+                "fallback_agent_installed": False,
+                "error": "swiftc not found (install Apple Command Line Tools: xcode-select --install)",
+            }
+
+        macos_dir.mkdir(parents=True, exist_ok=True)
+        resources_dir.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="rf-login-app-") as tmp:
+            swift_src = Path(tmp) / "main.swift"
+            swift_src.write_text(_SWIFT_LOGIN_MOUNT_SOURCE, encoding="utf-8")
+            try:
+                comp = subprocess.run(
+                    [swiftc_bin, "-O", str(swift_src), "-o", str(exec_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return {
+                    "ok": False,
+                    "app_path": str(app_path),
+                    "config_path": str(cfg_file),
+                    "newly_created": False,
+                    "login_item_registered": False,
+                    "fallback_agent_installed": False,
+                    "error": f"Failed to compile {LOGIN_APP_NAME}.app: {exc}",
+                }
+            if comp.returncode != 0 or not exec_path.is_file():
+                err_txt = comp.stderr.strip() or comp.stdout.strip() or f"exit code {comp.returncode}"
+                return {
+                    "ok": False,
+                    "app_path": str(app_path),
+                    "config_path": str(cfg_file),
+                    "newly_created": False,
+                    "login_item_registered": False,
+                    "fallback_agent_installed": False,
+                    "error": f"swiftc failed for {LOGIN_APP_NAME}.app: {err_txt}",
+                }
+
+        plist_payload = {
+            "CFBundleIdentifier": LOGIN_APP_BUNDLE_ID,
+            "CFBundleName": LOGIN_APP_NAME,
+            "CFBundleDisplayName": LOGIN_APP_NAME,
+            "CFBundleExecutable": LOGIN_APP_EXECUTABLE,
+            "CFBundlePackageType": "APPL",
+            "CFBundleVersion": LOGIN_APP_VERSION,
+            "CFBundleShortVersionString": "1.0",
+            "LSUIElement": True,
+            "LSBackgroundOnly": False,
+            "NSRemovableVolumesUsageDescription": (
+                "Remote Fleet Mount accesses external volumes (such as ~/RemoteComputers on an external SSD) "
+                "to mount your PC and Spark drives automatically when you log in."
+            ),
+            "NSLocalNetworkUsageDescription": (
+                "Remote Fleet Mount connects to your PC and DGX Sparks over your local network "
+                "to mount their drives automatically when you log in."
+            ),
+        }
+        info_plist.write_bytes(plistlib.dumps(plist_payload))
+        version_file.write_text(f"{LOGIN_APP_VERSION}\n", encoding="utf-8")
+
+        if shutil.which("xattr"):
+            try:
+                subprocess.run(["xattr", "-cr", str(app_path)], capture_output=True, timeout=5, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        codesign_bin = shutil.which("codesign") or ("/usr/bin/codesign" if os.path.exists("/usr/bin/codesign") else None)
+        if codesign_bin:
+            try:
+                subprocess.run(
+                    [
+                        codesign_bin,
+                        "--force",
+                        "--deep",
+                        "--sign",
+                        "-",
+                        "--identifier",
+                        LOGIN_APP_BUNDLE_ID,
+                        str(app_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        newly_created = True
+
+    live_darwin = home_dir is None and platform.system().lower() == "darwin"
+    login_item_registered = False
+    fallback_agent_installed = False
+
+    if register_login_item and live_darwin:
+        esc_app = str(app_path).replace("\\", "\\\\").replace('"', '\\"')
+        if shutil.which("osascript"):
+            script = (
+                'tell application "System Events"\n'
+                f'    if exists login item "{LOGIN_APP_NAME}" then\n'
+                f'        if (path of login item "{LOGIN_APP_NAME}") is not "{esc_app}" then\n'
+                f'            delete login item "{LOGIN_APP_NAME}"\n'
+                f'            make login item at end with properties {{path:"{esc_app}", hidden:false}}\n'
+                "        end if\n"
+                "    else\n"
+                f'        make login item at end with properties {{path:"{esc_app}", hidden:false}}\n'
+                "    end if\n"
+                "end tell\n"
+            )
+            try:
+                reg_proc = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                login_item_registered = reg_proc.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                login_item_registered = False
+
+        if login_item_registered:
+            _uninstall_login_app_fallback_agent(home, live_darwin=True)
+        else:
+            _install_login_app_fallback_agent(home, app_path)
+            fallback_agent_installed = True
+
+    return {
+        "ok": True,
+        "app_path": str(app_path),
+        "config_path": str(cfg_file),
+        "newly_created": newly_created,
+        "login_item_registered": login_item_registered,
+        "fallback_agent_installed": fallback_agent_installed,
+        "error": "",
+    }
+

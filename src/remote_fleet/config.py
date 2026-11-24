@@ -542,9 +542,23 @@ def is_self_machine(
     return bool(local_ids.intersection(machine_candidates))
 
 
+def _safe_lexical_path(raw: str) -> Path:
+    """Resolve parent directory symlinks without calling `lstat` on the leaf mountpoint itself."""
+    expanded = Path(os.path.abspath(os.path.expanduser(raw)))
+    if str(expanded) == expanded.anchor:
+        return expanded
+    try:
+        return expanded.parent.resolve() / expanded.name
+    except OSError:
+        return expanded
+
+
 def find_workspace_marker(start_dir: Optional[Path] = None) -> Optional[Tuple[Path, ActiveProjectState]]:
     """Search `start_dir` and its parents for `.remote-fleet.json`."""
-    cur = (start_dir or Path.cwd()).resolve()
+    try:
+        cur = (start_dir or Path.cwd()).resolve()
+    except OSError:
+        return None
     for directory in (cur, *cur.parents):
         marker = directory / WORKSPACE_MARKER_FILENAME
         if marker.is_file():
@@ -583,13 +597,19 @@ def save_mounts_registry(mapping: Dict[str, Dict[str, str]]) -> Path:
 
 def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[ActiveProjectState]:
     """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/pc/D/foo`), map it back."""
-    cur = (start_dir or Path.cwd()).resolve()
+    try:
+        cur = (start_dir or Path.cwd()).resolve()
+    except OSError:
+        return None
     registry = load_mounts_registry()
-    # Sort longest mount paths first so nested drive mounts (`~/RemoteComputers/pc/D`) take precedence
-    sorted_entries = sorted(registry.items(), key=lambda kv: len(kv[0]), reverse=True)
-    for local_mount_str, info in sorted_entries:
+    resolved_entries: List[Tuple[Path, Dict[str, str]]] = [
+        (_safe_lexical_path(local_mount_str), info)
+        for local_mount_str, info in registry.items()
+    ]
+    # Sort longest resolved mount paths first so nested drive mounts (`~/RemoteComputers/pc/D`) take precedence
+    resolved_entries.sort(key=lambda pair: len(str(pair[0])), reverse=True)
+    for mount_root, info in resolved_entries:
         try:
-            mount_root = Path(local_mount_str).expanduser().resolve()
             rel = cur.relative_to(mount_root)
         except Exception:
             continue

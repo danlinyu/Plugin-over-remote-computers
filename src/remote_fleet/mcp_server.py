@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+from pathlib import Path
 import sys
 import traceback
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
@@ -12,8 +14,10 @@ from remote_fleet.config import (
     ActiveProjectState,
     FleetConfig,
     MachineConfig,
+    get_config_path,
     load_active_project,
     load_fleet_config,
+    load_mounts_registry,
     save_active_project,
 )
 from remote_fleet.mount import compute_local_workspace_dir, prepare_local_workspace, sync_workspace
@@ -26,7 +30,7 @@ SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 SERVER_INSTRUCTIONS = (
     "Remote Fleet lets the user run this harness smoothly on their local interface machine (e.g., Mac Mini) "
     "while picking a folder, keeping all project files/changes/datasets, and running computations on any "
-    "computer across their Home LAN or Tailscale (PC, DGX Spark 1, Spark 2, Spark 3, Mac Mini). "
+    "computer across their Home LAN or Tailscale (e.g., PC, DGX Sparks such as spark01/spark03/spark04, Mac Mini). "
     "When starting a new project, call `fleet_list_machines(probe=true, include_load=true)` and `fleet_browse_folders`, "
     "then `fleet_select_project` (or `fleet_create_project`). Once a remote project is selected, ALWAYS use "
     "`fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, `fleet_search_files`, "
@@ -41,7 +45,8 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         "description": (
             "List all computers in the Home LAN / Tailscale fleet (Mac Mini, PC, Sparks, plus "
             "any auto-discovered Tailscale nodes), showing whether each machine is LOCAL, reachable "
-            "over Home LAN, or reachable over Tailscale, along with latency, optional CPU/GPU load, and active project."
+            "over Home LAN, or reachable over Tailscale, along with latency, optional CPU/GPU load, "
+            "active Finder mount paths, and active project."
         ),
         "inputSchema": {
             "type": "object",
@@ -70,7 +75,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "properties": {
                 "machine": {
                     "type": "string",
-                    "description": "Machine ID or name (e.g. 'spark-1', 'spark-2', 'spark-3', 'pc', 'mac-mini').",
+                    "description": "Machine ID or name from `fleet_list_machines` (e.g. 'spark01', 'spark03', 'spark04', 'pc', 'mac-mini').",
                 },
                 "path": {
                     "type": "string",
@@ -96,7 +101,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "properties": {
                 "machine": {
                     "type": "string",
-                    "description": "Target machine ID or name (e.g. 'spark-1', 'pc', 'mac-mini').",
+                    "description": "Target machine ID or name from `fleet_list_machines` (e.g. 'spark01', 'pc', 'mac-mini').",
                 },
                 "path": {
                     "type": "string",
@@ -119,7 +124,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
         "name": "fleet_create_project",
         "description": (
-            "Create a new project folder on any computer in the fleet ( optionally initializing git "
+            "Create a new project folder on any computer in the fleet (optionally initializing git "
             "and a starter layout) and set it as the active project."
         ),
         "inputSchema": {
@@ -127,7 +132,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "properties": {
                 "machine": {
                     "type": "string",
-                    "description": "Target machine ID or name (e.g. 'spark-2', 'pc', 'mac-mini').",
+                    "description": "Target machine ID or name from `fleet_list_machines` (e.g. 'spark03', 'pc', 'mac-mini').",
                 },
                 "path": {
                     "type": "string",
@@ -448,17 +453,47 @@ class RemoteFleetMCPServer:
     """Stateful MCP server handling machine discovery, folder selection, file ops, and remote execution."""
 
     def __init__(self, config: Optional[FleetConfig] = None) -> None:
+        self._managed_config = config is None
+        self._config_mtime: Optional[float] = None
         if config is not None:
             self.config = config
             self.tailscale_self = None
         else:
+            self._config_mtime = self._current_config_mtime()
             self.config, self.tailscale_self = load_fleet_config(include_tailscale=True)
         self.transport = FleetTransport(self.config, self.tailscale_self)
         self.session_project: Optional[ActiveProjectState] = load_active_project()
 
+    @staticmethod
+    def _current_config_mtime() -> Optional[float]:
+        try:
+            cfg_path = get_config_path()
+            return cfg_path.stat().st_mtime if cfg_path.is_file() else None
+        except OSError:
+            return None
+
     def reload_config(self) -> None:
+        self._config_mtime = self._current_config_mtime()
         self.config, self.tailscale_self = load_fleet_config(include_tailscale=True)
         self.transport = FleetTransport(self.config, self.tailscale_self)
+
+    def _maybe_reload_config(self) -> None:
+        """Auto-reload `fleet.json` when modified on disk so long-lived MCP processes stay fresh."""
+        if not self._managed_config:
+            return
+        cur_mtime = self._current_config_mtime()
+        if cur_mtime != self._config_mtime:
+            self.reload_config()
+
+    @staticmethod
+    def _resolve_tool_cwd(cwd_raw: str, base: str) -> str:
+        cwd = cwd_raw.strip()
+        if not cwd:
+            return base
+        if cwd.startswith(("/", "~", "\\")) or (len(cwd) >= 2 and cwd[0].isalpha() and cwd[1] == ":"):
+            return cwd
+        trimmed = base.rstrip("/\\")
+        return f"{trimmed}/{cwd}"
 
     def _resolve_machine_and_base(
         self, machine_arg: Optional[str] = None
@@ -503,6 +538,7 @@ class RemoteFleetMCPServer:
         }
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        self._maybe_reload_config()
         args = arguments or {}
 
         if name == "fleet_list_machines":
@@ -513,6 +549,38 @@ class RemoteFleetMCPServer:
                 if (probe or include_load)
                 else {}
             )
+
+            load_map: Dict[str, Dict[str, Any]] = {}
+            if include_load:
+                online_machines = [
+                    m for m in self.config.machines if m.id in ep_map and ep_map[m.id].reachable
+                ]
+                if online_machines:
+                    def _fetch_load(machine: MachineConfig) -> Tuple[str, Dict[str, Any]]:
+                        return machine.id, self.transport.run_worker_op(
+                            machine, {"op": "machine_metrics"}, timeout_sec=6
+                        )
+
+                    with ThreadPoolExecutor(max_workers=max(1, len(online_machines))) as pool:
+                        for mid, metrics in pool.map(_fetch_load, online_machines):
+                            if metrics.get("ok"):
+                                load_map[mid] = {
+                                    "cpu_count": metrics.get("cpu_count"),
+                                    "load_1m": metrics.get("load_1m"),
+                                    "load_5m": metrics.get("load_5m"),
+                                    "disk_free_gb": metrics.get("disk_free_gb"),
+                                    "gpus": metrics.get("gpus"),
+                                }
+
+            mounts_by_machine: Dict[str, List[Dict[str, str]]] = {}
+            for local_mp, info in sorted(load_mounts_registry().items()):
+                mid = str(info.get("machine_id") or "")
+                if not mid or info.get("container_only") == "1":
+                    continue
+                mounts_by_machine.setdefault(mid, []).append(
+                    {"local_path": local_mp, "remote_root": str(info.get("remote_root") or "")}
+                )
+
             machines_out = []
             for m in self.config.machines:
                 entry: Dict[str, Any] = {
@@ -525,18 +593,11 @@ class RemoteFleetMCPServer:
                     "tags": m.tags,
                 }
                 if m.id in ep_map:
-                    ep = ep_map[m.id]
-                    entry["status"] = ep.to_dict()
-                    if include_load and ep.reachable:
-                        metrics = self.transport.run_worker_op(m, {"op": "machine_metrics"}, timeout_sec=6)
-                        if metrics.get("ok"):
-                            entry["load"] = {
-                                "cpu_count": metrics.get("cpu_count"),
-                                "load_1m": metrics.get("load_1m"),
-                                "load_5m": metrics.get("load_5m"),
-                                "disk_free_gb": metrics.get("disk_free_gb"),
-                                "gpus": metrics.get("gpus"),
-                            }
+                    entry["status"] = ep_map[m.id].to_dict()
+                if m.id in load_map:
+                    entry["load"] = load_map[m.id]
+                if m.id in mounts_by_machine:
+                    entry["mounts"] = mounts_by_machine[m.id]
                 machines_out.append(entry)
             active = self.session_project or load_active_project()
             return self._tool_result(
@@ -707,11 +768,7 @@ class RemoteFleetMCPServer:
             m, base, err = self._resolve_machine_and_base(args.get("machine"))
             if err or not m:
                 return self._tool_result(err, is_error=True)
-            cwd = str(args.get("cwd") or "").strip()
-            if not cwd:
-                cwd = base
-            elif not cwd.startswith(("/", "~")) and not (len(cwd) > 2 and cwd[1] == ":"):
-                cwd = f"{base.rstrip('/')}/{cwd}"
+            cwd = self._resolve_tool_cwd(str(args.get("cwd") or ""), base)
             res = self.transport.run_command(
                 m,
                 command=str(args["command"]),
@@ -730,7 +787,7 @@ class RemoteFleetMCPServer:
             local_dir = (
                 compute_local_workspace_dir(self.config, m, remote_path)
                 if not local_override
-                else compute_local_workspace_dir(self.config, m, remote_path).__class__(local_override)
+                else Path(local_override).expanduser()
             )
             res = sync_workspace(
                 self.transport,
@@ -746,7 +803,7 @@ class RemoteFleetMCPServer:
             m, base, err = self._resolve_machine_and_base(args.get("machine"))
             if err or not m:
                 return self._tool_result(err, is_error=True)
-            cwd = str(args.get("cwd") or "").strip() or base
+            cwd = self._resolve_tool_cwd(str(args.get("cwd") or ""), base)
             res = self.transport.run_worker_op(
                 m,
                 {
@@ -858,6 +915,7 @@ class RemoteFleetMCPServer:
                 }
 
             if method == "resources/read":
+                self._maybe_reload_config()
                 uri = str((msg.get("params") or {}).get("uri") or "")
                 if uri == "fleet://machines":
                     text = json.dumps(self.config.to_dict(), indent=2)
@@ -890,7 +948,7 @@ class RemoteFleetMCPServer:
                                 "arguments": [
                                     {
                                         "name": "machine",
-                                        "description": "Optional machine name (e.g. spark-1, pc, mac-mini)",
+                                        "description": "Optional machine name (e.g. spark01, pc, mac-mini)",
                                         "required": False,
                                     }
                                 ],

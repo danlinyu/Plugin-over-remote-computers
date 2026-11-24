@@ -32,9 +32,11 @@ from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
     install_macos_launch_agent,
+    install_macos_login_item_app,
     mount_all_machines,
     sync_ssh_config,
     uninstall_macos_launch_agent,
+    uninstall_macos_login_item_app,
     unmount_all_machines,
 )
 from remote_fleet.mcp_server import serve_stdio
@@ -137,19 +139,31 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    from concurrent.futures import ThreadPoolExecutor
+
     cfg, ts_self = load_fleet_config(include_tailscale=True)
     transport = FleetTransport(cfg, ts_self)
     active = load_active_project()
 
     ep_map = transport.resolve_all_endpoints(cfg.machines, force_refresh=True)
+    load_map: Dict[str, Dict[str, Any]] = {}
+    if getattr(args, "load", False):
+        online = [m for m in cfg.machines if ep_map[m.id].reachable]
+        if online:
+            def _fetch_load(machine: MachineConfig) -> Tuple[str, Dict[str, Any]]:
+                return machine.id, transport.run_worker_op(machine, {"op": "machine_metrics"}, timeout_sec=6)
+
+            with ThreadPoolExecutor(max_workers=max(1, len(online))) as pool:
+                for mid, metrics in pool.map(_fetch_load, online):
+                    if metrics.get("ok"):
+                        load_map[mid] = metrics
+
     rows = []
     for m in cfg.machines:
         ep = ep_map[m.id]
         row: Dict[str, Any] = {"machine": m.to_dict(), "status": ep.to_dict()}
-        if getattr(args, "load", False) and ep.reachable:
-            metrics = transport.run_worker_op(m, {"op": "machine_metrics"}, timeout_sec=6)
-            if metrics.get("ok"):
-                row["load"] = metrics
+        if m.id in load_map:
+            row["load"] = load_map[m.id]
         rows.append(row)
 
     if args.json:
@@ -766,20 +780,42 @@ def cmd_ssh_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _trigger_login_app_first_run(app_path: str) -> None:
+    """Launch `Remote Fleet Mount.app` once in the background immediately on creation so macOS shows its
+    one-time Removable Volumes Allow prompt while the user is at the keyboard."""
+    if sys.platform != "darwin" or not shutil.which("open"):
+        return
+    try:
+        subprocess.run(["open", "-g", app_path], capture_output=True, timeout=8, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def cmd_mount_all(args: argparse.Namespace) -> int:
     cfg, ts_self = load_fleet_config(include_tailscale=True)
     transport = FleetTransport(cfg, ts_self)
     base = Path(args.dir).expanduser() if args.dir else None
     from_launchd = bool(getattr(args, "from_launchd", False))
-    summary = mount_all_machines(cfg, transport, base_dir=base, from_launchd=from_launchd)
-    if summary.get("skipped_locked") or (from_launchd and summary.get("waiting_for_volume")):
+    from_login_app = bool(getattr(args, "from_login_app", False))
+    summary = mount_all_machines(
+        cfg,
+        transport,
+        base_dir=base,
+        from_launchd=from_launchd,
+        from_login_app=from_login_app,
+    )
+    if summary.get("skipped_locked") or ((from_launchd or from_login_app) and summary.get("waiting_for_volume")):
         return 0
     if args.json:
         print(json.dumps(summary, indent=2))
-        return 0
+        return 1 if summary.get("error") else 0
     if summary.get("waiting_for_volume"):
         print(f"Waiting for external volume {summary['waiting_for_volume']} to mount...")
         return 0
+    if summary.get("error"):
+        print(f"Remote Computers folder: {summary['base_dir']}")
+        print(f"  [ERROR] {summary['error']}")
+        return 1
     print(f"Remote Computers folder: {summary['base_dir']}")
     for r in summary["results"]:
         mid = r.get("machine_id", "?")
@@ -800,9 +836,25 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
             print(f"  [WARN] {mid:<12} -> {r.get('error')}")
     if summary.get("sidebar_repaired"):
         print("  [FIXED] Repaired macOS Finder & Open-Dialog Sidebar Favorites (`pc`, `spark01`, `spark03`, `spark04`)!")
-    if sys.platform == "darwin" and not getattr(args, "from_launchd", False):
+    if sys.platform == "darwin" and not from_launchd and not from_login_app:
         if uninstall_macos_launch_agent():
             print("  [CLEAN] Removed legacy background LaunchAgent (com.remote-fleet.automount) — no background polling.")
+        login_res = install_macos_login_item_app(base_dir=base)
+        if login_res.get("ok"):
+            via = (
+                "macOS Login Items"
+                if login_res.get("login_item_registered")
+                else ("one-shot login launcher" if login_res.get("fallback_agent_installed") else "app ready")
+            )
+            print(f"  [BOOT]  Auto-mount after reboot/login ready ({via}): {login_res['app_path']}")
+            if login_res.get("newly_created"):
+                _trigger_login_app_first_run(str(login_res["app_path"]))
+                print(
+                    "  [ACTION] If macOS prompts to allow 'Remote Fleet Mount' to access your external volume "
+                    "or local network, click Allow once — future reboots/logins will mount automatically."
+                )
+        elif login_res.get("error"):
+            print(f"  [WARN]  Could not install login auto-mount app: {login_res['error']}")
     return 0
 
 
@@ -831,7 +883,7 @@ def cmd_setup_mac(args: argparse.Namespace) -> int:
     print(f"  Updated {ssh_cfg} with LAN-first + Tailscale-fallback Host entries")
 
     print("\n=== Step 4/4: Mounting online computers under ~/RemoteComputers/ (for 'Choose Folder' dialogs) ===")
-    mount_dir = Path(args.dir).expanduser().resolve() if args.dir else (Path.home() / "RemoteComputers")
+    mount_dir = Path(args.dir).expanduser() if args.dir else (Path.home() / "RemoteComputers")
     transport = FleetTransport(cfg, ts_self)
     summary = mount_all_machines(cfg, transport, base_dir=mount_dir)
     for r in summary["results"]:
@@ -844,15 +896,21 @@ def cmd_setup_mac(args: argparse.Namespace) -> int:
             print(f"  [INFO]  {mid:<12} -> {r.get('error')}")
 
     if sys.platform == "darwin":
-        if getattr(args, "autostart", False) and not args.no_autostart and not str(mount_dir).startswith("/Volumes/"):
-            plist = install_macos_launch_agent(base_dir=mount_dir)
-            print(f"\nInstalled one-shot macOS login mounter (no periodic polling): {plist}")
+        uninstall_macos_launch_agent()
+        if args.no_autostart:
+            uninstall_macos_login_item_app()
         else:
-            uninstall_macos_launch_agent()
+            login_res = install_macos_login_item_app(base_dir=mount_dir)
+            if login_res.get("ok"):
+                print(f"\nInstalled one-shot macOS reboot/login auto-mounter (zero polling): {login_res['app_path']}")
+                if login_res.get("newly_created"):
+                    _trigger_login_app_first_run(str(login_res["app_path"]))
+            elif login_res.get("error"):
+                print(f"\n[WARN] Could not install login auto-mount app: {login_res['error']}")
 
     print(
-        f"\nDone! Drag `{mount_dir}` into your macOS Finder Sidebar Favorites so `spark-1`, "
-        "`spark-2`, `spark-3`, and `pc` appear directly inside every harness's 'New / Create Project' dialog!"
+        f"\nDone! Drag `{mount_dir}` into your macOS Finder Sidebar Favorites so `spark01`, "
+        "`spark03`, `spark04`, and `pc` appear directly inside every harness's 'New / Create Project' dialog!"
     )
     return 0
 
@@ -903,7 +961,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.set_defaults(func=cmd_doctor)
 
     p_browse = sub.add_parser("browse", help="Browse folders on a specific fleet computer")
-    p_browse.add_argument("machine", help="Machine ID or name (e.g. spark-1, pc, mac-mini)")
+    p_browse.add_argument("machine", help="Machine ID or name (e.g. spark01, pc, mac-mini)")
     p_browse.add_argument("path", nargs="?", default="", help="Optional starting directory")
     p_browse.add_argument("--hidden", action="store_true", help="Show hidden dot-folders")
     p_browse.add_argument("--json", action="store_true", help="Output JSON")
@@ -923,7 +981,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gui.set_defaults(func=cmd_gui)
 
     p_use = sub.add_parser("use", help="Select (or create) a remote folder non-interactively")
-    p_use.add_argument("machine", help="Machine ID or name (e.g. spark-2, pc, mac-mini)")
+    p_use.add_argument("machine", help="Machine ID or name (e.g. spark03, pc, mac-mini)")
     p_use.add_argument("path", help="Folder path on target machine (e.g. ~/projects/app)")
     p_use.add_argument("--create", action="store_true", help="Create folder if missing")
     p_use.add_argument("--init-git", action="store_true", help="Run git init if not yet a repo")
@@ -1005,7 +1063,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
 
-    p_mount = sub.add_parser("mount", help="Mount remote folder locally via rclone nfsmount (macOS) or SSHFS")
+    p_mount = sub.add_parser("mount", help="Mount remote folder locally via soft rclone NFS (macOS) or SSHFS")
     p_mount.add_argument("machine", nargs="?")
     p_mount.add_argument("path", nargs="?")
     p_mount.set_defaults(func=cmd_mount)
@@ -1028,6 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mall.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
     p_mall.add_argument("--json", action="store_true")
     p_mall.add_argument("--from-launchd", action="store_true", help=argparse.SUPPRESS)
+    p_mall.add_argument("--from-login-app", action="store_true", help=argparse.SUPPRESS)
     p_mall.set_defaults(func=cmd_mount_all)
 
     p_umall = sub.add_parser("unmount-all", help="Unmount all ~/RemoteComputers/<machine> mounts")
@@ -1039,8 +1098,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="All-in-one Mac setup: install into all harnesses, configure ~/.ssh/config, and mount ~/RemoteComputers/",
     )
     p_mac.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
-    p_mac.add_argument("--autostart", action="store_true", help="Opt-in: create one-shot login LaunchAgent (no periodic polling; skipped for /Volumes paths)")
-    p_mac.add_argument("--no-autostart", action="store_true", help="Skip creating macOS login LaunchAgent (default)")
+    p_mac.add_argument("--autostart", action="store_true", help="Install one-shot macOS login app (default enabled; zero polling)")
+    p_mac.add_argument("--no-autostart", action="store_true", help="Disable/remove macOS login auto-mount app")
     p_mac.set_defaults(func=cmd_setup_mac)
 
     p_boot = sub.add_parser(
