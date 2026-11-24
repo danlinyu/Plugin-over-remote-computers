@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 try:
@@ -39,6 +39,7 @@ from remote_fleet.mount import (
     get_macos_mount_table,
     get_repo_root,
     is_mounted,
+    normalize_mount_path,
     safe_lexical_resolve,
     unmount_sshfs,
 )
@@ -377,7 +378,18 @@ def _probe_mount_health(
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             if int(meta.get("schema") or 0) < DAEMON_SCHEMA_VERSION:
                 return "outdated_daemon"
-            if expected_host and meta.get("host") and meta.get("host") != expected_host:
+            meta_host = str(meta.get("host") or "")
+            if (
+                expected_host
+                and meta_host
+                and meta_host != expected_host
+                and is_tailscale_only_host(meta_host)
+                and not is_tailscale_only_host(expected_host)
+            ):
+                # Upgrade from Tailscale back to fast Home LAN once LAN is reachable again.
+                # For LAN -> Tailscale or LAN -> LAN alias differences, let the live uncached `lstat`
+                # probe below decide so a background `launchd` LAN probe blip / Local Network TCC block
+                # never tears down an actively healthy LAN mount!
                 return "endpoint_changed"
             pid = int(meta.get("pid") or 0)
             if pid <= 0:
@@ -617,6 +629,14 @@ def _mount_sftp_directory(
                     mount_err_detail = str(exc)
 
             if mounted_ok:
+                recorded_mp = str(mount_point)
+                table_now = get_macos_mount_table()
+                if table_now:
+                    mp_norm = normalize_mount_path(recorded_mp)
+                    for tbl_key in table_now.keys():
+                        if normalize_mount_path(tbl_key) == mp_norm:
+                            recorded_mp = tbl_key
+                            break
                 meta_file = _daemons_dir() / f"{log_stem}.json"
                 meta_file.write_text(
                     json.dumps(
@@ -626,7 +646,7 @@ def _mount_sftp_directory(
                             "port": nfs_port,
                             "host": host,
                             "machine_id": machine.id,
-                            "mount_point": str(mount_point),
+                            "mount_point": recorded_mp,
                             "remote_target": remote_target,
                         },
                         indent=2,
@@ -636,7 +656,7 @@ def _mount_sftp_directory(
                 if _probe_mount_health(mount_point, log_stem, timeout_sec=15.0, expected_host=host) == "healthy":
                     visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
-                    reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+                    reg[recorded_mp] = {"machine_id": machine.id, "remote_root": remote_target}
                     save_mounts_registry(reg)
                     return {
                         "ok": True,
@@ -789,6 +809,24 @@ def _mount_sftp_directory(
     return {"ok": False, "machine_id": machine.id, "error": "Mount failed."}
 
 
+def _prune_stale_registry_entries(machine_id: str, container_dir: Path) -> Dict[str, Dict[str, str]]:
+    """Remove stale `mounts.json` keys for `machine_id` outside `container_dir` (e.g. pre-symlink paths)."""
+    reg = load_mounts_registry()
+    c_norm = normalize_mount_path(str(container_dir))
+    stale_keys = [
+        key
+        for key, info in reg.items()
+        if str(info.get("machine_id") or "") == machine_id
+        and normalize_mount_path(key) != c_norm
+        and not normalize_mount_path(key).startswith(c_norm + "/")
+    ]
+    if stale_keys:
+        for key in stale_keys:
+            reg.pop(key, None)
+        save_mounts_registry(reg)
+    return reg
+
+
 def _mount_windows_all_drives(
     machine: MachineConfig,
     ep_dict: Dict[str, Any],
@@ -810,15 +848,10 @@ def _mount_windows_all_drives(
             "error": f"Could not detach previous single-folder mount at {container_dir}; close any terminal inside {container_dir} and retry.",
         }
 
-    # Remove legacy direct container key from mounts.json so nested `<container>/<Drive>` entries govern path resolution
-    reg = load_mounts_registry()
-    if str(container_dir) in reg:
-        reg.pop(str(container_dir), None)
-        save_mounts_registry(reg)
-
+    # Prune stale pre-symlink keys and record container entry so nested `<container>/<Drive>` entries govern path resolution
     container_dir.mkdir(parents=True, exist_ok=True)
     remote_home = str(ping.get("home") or "C:/").replace("\\", "/")
-    reg = load_mounts_registry()
+    reg = _prune_stale_registry_entries(machine.id, container_dir)
     reg[str(container_dir)] = {
         "machine_id": machine.id,
         "remote_root": remote_home,
@@ -959,7 +992,7 @@ def _mount_posix_container(
     container_dir.mkdir(parents=True, exist_ok=True)
     remote_home = str(ping.get("home") or "/").replace("\\", "/")
 
-    reg = load_mounts_registry()
+    reg = _prune_stale_registry_entries(machine.id, container_dir)
     reg[str(container_dir)] = {
         "machine_id": machine.id,
         "remote_root": remote_home,
@@ -1296,8 +1329,9 @@ def repair_macos_sidebar_favorites(
 
 
 def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected_host: str) -> bool:
-    """Fast zero-SSH check for 30s LaunchAgent ticks: returns True iff `machine_id` already has
-    all expected soft-NFS daemons recorded and every one passes uncached `.fleet-probe-<uuid>` health on `expected_host`."""
+    """Fast zero-SSH check for background LaunchAgent ticks: returns True iff `machine_id` already has
+    all expected soft-NFS daemons recorded under `container_dir` and every one passes uncached
+    `.fleet-probe-<uuid>` health."""
     if platform.system().lower() != "darwin" or is_mounted(container_dir):
         return False
     daemons = _daemons_dir()
@@ -1305,26 +1339,33 @@ def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected
     if not meta_files:
         return False
 
+    container_prefix = normalize_mount_path(str(safe_lexical_resolve(container_dir)))
     reg = load_mounts_registry()
-    expected_count = sum(
-        1
-        for info in reg.values()
-        if str(info.get("machine_id") or "") == machine_id and info.get("container_only") != "1"
-    )
-    if expected_count > len(meta_files):
+    expected_targets: Set[str] = set()
+    for reg_key, info in reg.items():
+        if str(info.get("machine_id") or "") != machine_id or info.get("container_only") == "1":
+            continue
+        key_norm = normalize_mount_path(reg_key)
+        if key_norm.startswith(container_prefix + "/"):
+            expected_targets.add(str(info.get("remote_root") or key_norm))
+    if len(expected_targets) > len(meta_files):
         return False
 
+    healthy_count = 0
     for mf in meta_files:
         try:
             meta = json.loads(mf.read_text(encoding="utf-8"))
             mp_str = str(meta.get("mount_point") or "")
             if not mp_str:
                 return False
+            if not normalize_mount_path(mp_str).startswith(container_prefix + "/"):
+                return False
         except Exception:
             return False
         if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=12.0, expected_host=expected_host) != "healthy":
             return False
-    return True
+        healthy_count += 1
+    return healthy_count > 0
 
 
 def _fallback_windows_ping_via_sftp(
@@ -1395,12 +1436,12 @@ def mount_single_machine_root(
     if not is_mounted(mount_point):
         mount_point.mkdir(parents=True, exist_ok=True)
 
-    if not ep.reachable:
-        return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
-
-    # On 30s background ticks, if every recorded mount for `machine.id` is already healthy on `ep.host`,
-    # skip spawning SSH / PowerShell `ping` completely!
-    if from_launchd and _all_recorded_daemons_healthy(machine.id, mount_point, ep.host):
+    # On background ticks, if every recorded mount for `machine.id` is already live & passes uncached
+    # `.fleet-probe-<uuid>` health, skip spawning SSH / PowerShell `ping` completely (and preserve working
+    # mounts even if `launchd` saw a transient TCP/Local Network probe failure!).
+    if from_launchd and _all_recorded_daemons_healthy(
+        machine.id, mount_point, ep.host if ep.reachable else ""
+    ):
         return {
             "ok": True,
             "machine_id": machine.id,
@@ -1408,6 +1449,9 @@ def mount_single_machine_root(
             "already_mounted": True,
             "endpoint": ep.to_dict(),
         }
+
+    if not ep.reachable:
+        return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
     ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=20)
     active_ep_dict = ping.get("endpoint") if isinstance(ping.get("endpoint"), dict) else ep.to_dict()
@@ -1464,22 +1508,74 @@ def _cleanup_stale_ssh_mux_sockets() -> None:
         pass
 
 
+def _kill_orphan_rclone_serve_daemons(live_daemon_pids: Set[int]) -> None:
+    """Terminate leaked `rclone serve nfs` daemons referencing `remote-fleet/nfs-handles/`
+    whose PID is NOT tracked in `live_daemon_pids`. Must ONLY be called after verifying
+    zero unowned NFS mounts remain in `/sbin/mount`."""
+    ps_bin = "/bin/ps" if os.path.exists("/bin/ps") else shutil.which("ps")
+    if not ps_bin:
+        return
+    try:
+        proc = subprocess.run(
+            [ps_bin, "-ax", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return
+    if proc.returncode != 0:
+        return
+    my_pid = os.getpid()
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmdline = parts[1]
+        if (
+            pid > 0
+            and pid != my_pid
+            and pid not in live_daemon_pids
+            and "rclone" in cmdline
+            and "serve nfs" in cmdline
+            and "remote-fleet/nfs-handles/" in cmdline
+        ):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
 def _cleanup_legacy_nfsmounts(root: Path, raw_root: Optional[Path] = None) -> None:
-    """Seamless migration & orphan cleanup: detach any legacy hard `rclone nfsmount` or dead-daemon NFS mounts
-    under `root` (including symlink targets like `/Volumes/X10 Pro/.../RemoteComputers`) FIRST via `MNT_NOWAIT`
-    `/sbin/mount`, then terminate any leftover `rclone nfsmount` processes."""
+    """Detach ONLY unowned NFS mounts (legacy `rclone nfsmount` or dead-daemon orphans) under `root`,
+    then sweep leftover `rclone nfsmount` and orphaned `rclone serve nfs` processes.
+
+    CRITICAL macOS FACT: `/sbin/mount` prints only generic `statfs.f_flags` (e.g.
+    `(nfs, nodev, nosuid, mounted by danlinyu)`) and NEVER prints NFS-layer options like `soft`
+    (those only appear in `nfsstat -m`). Therefore we identify live managed mounts strictly via
+    active daemon PIDs in `~/.cache/remote-fleet/daemons/*.json`, NEVER by checking for `"soft"`
+    in `/sbin/mount` output!
+    """
     if platform.system().lower() != "darwin":
         return
 
-    prefixes = {str(safe_lexical_resolve(root))}
+    raw_prefixes = {str(safe_lexical_resolve(root))}
     try:
-        prefixes.add(str(root.resolve()))
+        raw_prefixes.add(str(root.resolve()))
     except OSError:
         pass
     if raw_root is not None:
-        prefixes.add(str(safe_lexical_resolve(raw_root)))
+        raw_prefixes.add(str(safe_lexical_resolve(raw_root)))
+        raw_prefixes.add(str(raw_root))
+    prefixes = {normalize_mount_path(p) for p in raw_prefixes if p}
 
-    live_daemon_mounts: set[str] = set()
+    live_daemon_mounts: Set[str] = set()
+    live_daemon_pids: Set[int] = set()
     daemons = _daemons_dir()
     if daemons.is_dir():
         for mf in daemons.glob("*.json"):
@@ -1489,38 +1585,51 @@ def _cleanup_legacy_nfsmounts(root: Path, raw_root: Optional[Path] = None) -> No
                 mp_val = str(meta.get("mount_point") or "")
                 if pid > 0 and mp_val:
                     os.kill(pid, 0)
-                    live_daemon_mounts.add(mp_val)
+                    live_daemon_pids.add(pid)
+                    live_daemon_mounts.add(normalize_mount_path(mp_val))
+                    live_daemon_mounts.add(normalize_mount_path(str(safe_lexical_resolve(Path(mp_val)))))
             except Exception:
                 pass
 
-    table = get_macos_mount_table() or {}
-    # Unmount deepest paths first if any legacy non-soft OR orphaned NFS mounts exist under `RemoteComputers`
-    for mp_str in sorted(table.keys(), key=len, reverse=True):
-        if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
-            opts_lower = table[mp_str].lower()
-            if "nfs" in opts_lower and ("soft" not in opts_lower or mp_str not in live_daemon_mounts):
-                unmount_sshfs(Path(mp_str))
-
-    if not shutil.which("pgrep"):
+    table = get_macos_mount_table()
+    if table is None:
         return
-    try:
-        chk = subprocess.run(
-            ["pgrep", "-f", "rclone.*nfsmount"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        if chk.returncode != 0 or not chk.stdout.strip():
+
+    def _find_unowned_nfs(tbl: Dict[str, str]) -> List[str]:
+        found: List[str] = []
+        for mp_str in sorted(tbl.keys(), key=len, reverse=True):
+            mp_norm = normalize_mount_path(mp_str)
+            if any(mp_norm == pfx or mp_norm.startswith(pfx + "/") for pfx in prefixes):
+                if "nfs" in tbl[mp_str].lower() and mp_norm not in live_daemon_mounts:
+                    found.append(mp_str)
+        return found
+
+    # Unmount deepest paths first ONLY for truly unowned/orphaned NFS mounts under `RemoteComputers`
+    unowned = _find_unowned_nfs(table)
+    for mp_str in unowned:
+        unmount_sshfs(Path(mp_str))
+
+    # Never terminate any backing rclone process while an unowned NFS mount is still attached in the kernel
+    if unowned:
+        table_after = get_macos_mount_table()
+        if table_after is None or _find_unowned_nfs(table_after):
             return
-    except (subprocess.TimeoutExpired, OSError):
-        return
 
-    if shutil.which("pkill"):
+    if shutil.which("pgrep") and shutil.which("pkill"):
         try:
-            subprocess.run(["pkill", "-f", "rclone.*nfsmount"], capture_output=True, timeout=4, check=False)
+            chk = subprocess.run(
+                ["pgrep", "-f", "rclone.*nfsmount"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if chk.returncode == 0 and chk.stdout.strip():
+                subprocess.run(["pkill", "-f", "rclone.*nfsmount"], capture_output=True, timeout=4, check=False)
         except (subprocess.TimeoutExpired, OSError):
             pass
+
+    _kill_orphan_rclone_serve_daemons(live_daemon_pids)
 
 
 def _external_volume_not_ready(target_root: Path) -> Optional[Path]:
@@ -1655,7 +1764,7 @@ def mount_all_machines(
 
 def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     root, raw_root = _resolve_mount_root(base_dir)
-    prefixes = {str(root), str(raw_root)}
+    prefixes = {normalize_mount_path(str(root)), normalize_mount_path(str(raw_root))}
     results = []
 
     lock_dir = Path.home() / ".cache" / "remote-fleet"
@@ -1671,7 +1780,8 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
         table = get_macos_mount_table()
         if table is not None:
             for mp_str in sorted(table.keys(), key=len, reverse=True):
-                if any(mp_str == pfx or mp_str.startswith(pfx + "/") for pfx in prefixes):
+                mp_norm = normalize_mount_path(mp_str)
+                if any(mp_norm == pfx or mp_norm.startswith(pfx + "/") for pfx in prefixes):
                     results.append({"path": mp_str, **unmount_sshfs(Path(mp_str))})
         elif root.is_dir():
             for child in sorted(root.iterdir()):
@@ -1700,6 +1810,21 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
                     mf.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+        # Sweep any leaked orphan `rclone serve nfs` daemons strictly after verifying no mounts remain
+        if platform.system().lower() == "darwin":
+            table_after = get_macos_mount_table()
+            still_mounted = False
+            if table_after is None:
+                still_mounted = True
+            else:
+                for mp_str in table_after.keys():
+                    mp_norm = normalize_mount_path(mp_str)
+                    if any(mp_norm == pfx or mp_norm.startswith(pfx + "/") for pfx in prefixes):
+                        still_mounted = True
+                        break
+            if not still_mounted:
+                _kill_orphan_rclone_serve_daemons(set())
 
         return {"base_dir": str(root), "results": results}
     finally:
@@ -1733,7 +1858,7 @@ def install_macos_launch_agent(
     base_dir: Optional[Path] = None,
     load_now: bool = True,
 ) -> Path:
-    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & heal every 30s."""
+    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & heal every 60s."""
     home = (home_dir or Path.home()).expanduser().resolve()
     py_exe = python_executable or sys.executable or "/usr/bin/python3"
     repo_src_path = get_repo_root() / "src"
@@ -1761,24 +1886,61 @@ def install_macos_launch_agent(
             "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,
-        "StartInterval": 30,
+        "StartInterval": 60,
         "AbandonProcessGroup": True,
         "StandardOutPath": str(home / ".cache" / "remote-fleet" / "automount.log"),
         "StandardErrorPath": str(home / ".cache" / "remote-fleet" / "automount.err.log"),
     }
     (home / ".cache" / "remote-fleet").mkdir(parents=True, exist_ok=True)
-    with open(plist_path, "wb") as fp:
-        plistlib.dump(plist_data, fp)
+    plist_bytes = plistlib.dumps(plist_data)
+    existing_bytes: Optional[bytes] = None
+    if plist_path.is_file():
+        try:
+            existing_bytes = plist_path.read_bytes()
+        except OSError:
+            existing_bytes = None
+    plist_changed = existing_bytes != plist_bytes
+    if plist_changed:
+        plist_path.write_bytes(plist_bytes)
 
     if load_now and home_dir is None and platform.system().lower() == "darwin" and shutil.which("launchctl"):
         uid = os.getuid()
-        for lcmd in (
-            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
-            ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
-        ):
+        already_loaded = False
+        try:
+            chk = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{LAUNCH_AGENT_LABEL}"],
+                capture_output=True,
+                timeout=4,
+                check=False,
+            )
+            already_loaded = chk.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            already_loaded = False
+
+        # Skip redundant bootout/bootstrap when plist is unchanged and already loaded
+        if plist_changed or not already_loaded:
             try:
-                subprocess.run(lcmd, capture_output=True, timeout=5, check=False)
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
             except (subprocess.TimeoutExpired, OSError):
                 pass
+            time.sleep(0.25)
+            for _attempt in range(2):
+                try:
+                    boot = subprocess.run(
+                        ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    if boot.returncode == 0:
+                        break
+                except (subprocess.TimeoutExpired, OSError):
+                    break
+                time.sleep(0.3)
 
     return plist_path

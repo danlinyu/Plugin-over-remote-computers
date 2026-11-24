@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+import unicodedata
 
 from remote_fleet.config import (
     ActiveProjectState,
@@ -139,6 +140,11 @@ def get_macos_mount_table() -> Optional[Dict[str, str]]:
     return None
 
 
+def normalize_mount_path(path_str: str) -> str:
+    """Normalize macOS/POSIX mountpoint paths (normpath + NFC) so `/sbin/mount` keys always match."""
+    return unicodedata.normalize("NFC", os.path.normpath(path_str))
+
+
 def is_mounted(path: Path) -> bool:
     """Check whether `path` is currently an active OS mountpoint without ever hanging on a dead NFS mount."""
     safe_path = safe_lexical_resolve(path)
@@ -146,7 +152,10 @@ def is_mounted(path: Path) -> bool:
 
     table = get_macos_mount_table()
     if table is not None:
-        return str(safe_path) in table or expanded_str in table
+        if str(safe_path) in table or expanded_str in table:
+            return True
+        norm_targets = {normalize_mount_path(str(safe_path)), normalize_mount_path(expanded_str)}
+        return any(normalize_mount_path(k) in norm_targets for k in table.keys())
 
     out: Dict[str, bool] = {}
 

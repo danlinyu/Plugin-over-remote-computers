@@ -137,7 +137,7 @@ class TestMacIntegration(unittest.TestCase):
             self.assertIn("mount-all", data["ProgramArguments"])
             self.assertIn("--from-launchd", data["ProgramArguments"])
             self.assertTrue(data["AbandonProcessGroup"])
-            self.assertEqual(data["StartInterval"], 30)
+            self.assertEqual(data["StartInterval"], 60)
             self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
 
     def test_empty_unmounted_folder_cleanup(self) -> None:
@@ -575,13 +575,13 @@ class TestMacIntegration(unittest.TestCase):
             ):
                 self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "outdated_daemon")
 
-            # Write valid schema=2 daemon metadata
+            # Write valid schema=2 daemon metadata on Tailscale first
             meta_file.write_text(
-                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
+                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "100.93.148.108", "mount_point": str(mp)}),
                 encoding="utf-8",
             )
 
-            # 3. Network roamed (LAN -> Tailscale) -> "endpoint_changed"
+            # 3a. Returned home (Tailscale -> Home LAN) -> "endpoint_changed" immediately so we upgrade back to LAN
             with (
                 patch("remote_fleet.mac_integration.is_mounted", return_value=True),
                 patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
@@ -589,11 +589,18 @@ class TestMacIntegration(unittest.TestCase):
                 patch("remote_fleet.mac_integration.os.kill", return_value=None),
             ):
                 self.assertEqual(
-                    _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="100.93.148.108"),
+                    _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="192.168.68.70"),
                     "endpoint_changed",
                 )
 
-            # 4. Live LOOKUP returning ENOENT -> "healthy"
+            # Write valid schema=2 daemon metadata on Home LAN
+            meta_file.write_text(
+                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
+                encoding="utf-8",
+            )
+
+            # 3b. LAN mount with live LOOKUP ENOENT stays "healthy" even if expected_host is Tailscale
+            #     (prevents launchd Local Network privacy hiccups from tearing down fast live LAN mounts!)
             def lstat_enoent(p: str) -> object:
                 raise OSError(errno.ENOENT, "No such file")
 
@@ -604,6 +611,11 @@ class TestMacIntegration(unittest.TestCase):
                 patch("remote_fleet.mac_integration.os.kill", return_value=None),
                 patch("remote_fleet.mac_integration.os.lstat", side_effect=lstat_enoent),
             ):
+                self.assertEqual(
+                    _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="100.93.148.108"),
+                    "healthy",
+                )
+                # 4. Same-host live LOOKUP returning ENOENT -> "healthy"
                 self.assertEqual(
                     _probe_mount_health(mp, "pc-C", timeout_sec=0.3, expected_host="192.168.68.70"),
                     "healthy",
@@ -659,59 +671,86 @@ class TestMacIntegration(unittest.TestCase):
             self.assertFalse(meta_file.exists())
 
     def test_macos_mount_table_parser_and_legacy_hard_nfs_cleanup(self) -> None:
-        """Verify orphaned hard `rclone nfsmount` mounts (including symlinked `/Volumes/X10 Pro/...`) are detected
-        via `/sbin/mount` (`MNT_NOWAIT`) and force-unmounted without touching live soft NFS mounts."""
+        """Verify REAL macOS `/sbin/mount` output (`(nfs, nodev, nosuid, mounted by danlinyu)` — NEVER containing
+        `"soft"`) preserves ALL mounts backed by live `rclone serve nfs` daemon PIDs while unmounting ONLY
+        genuinely unowned/orphaned NFS mounts and sweeping leaked orphan `rclone serve nfs` processes."""
         import json
+        import signal
+        import subprocess as sp
         from unittest.mock import patch
         from remote_fleet.mac_integration import _cleanup_legacy_nfsmounts
         from remote_fleet.mount import parse_macos_mount_output
 
         vol_root = "/Volumes/X10 Pro/MovedFromInternal/Projects/RemoteComputers"
+        # Real macOS `/sbin/mount` output NEVER includes NFS-layer options like `soft` or `intr`!
         raw_mount = "\n".join(
             [
                 "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
                 f"localhost:/ on {vol_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
-                f"localhost:/ on {vol_root}/pc/D (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
-                f"localhost:/ on {vol_root}/spark01/Home (nfs, nodev, nosuid, soft, intr, mounted by danlinyu)",
+                f"localhost:/ on {vol_root}/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
+                f"localhost:/ on {vol_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
             ]
         )
         parsed = parse_macos_mount_output(raw_mount)
         self.assertIn(f"{vol_root}/pc/C", parsed)
-        self.assertNotIn("soft", parsed[f"{vol_root}/pc/C"])
-        self.assertIn("soft", parsed[f"{vol_root}/spark01/Home"])
+        self.assertNotIn("soft", parsed[f"{vol_root}/spark01/Home"])
 
         with tempfile.TemporaryDirectory() as tmp:
             daemons = Path(tmp) / "daemons"
             daemons.mkdir()
-            # spark01-Home has a live daemon PID; pc-D has NO live daemon (orphaned); pc-C is a hard mount
+            # spark01-Home and pc-C both have live daemon PIDs; pc-D has NO live daemon (orphaned/legacy)
             (daemons / "spark01-Home.json").write_text(
-                json.dumps({"pid": os.getpid(), "mount_point": f"{vol_root}/spark01/Home"}),
+                json.dumps({"schema": 2, "pid": os.getpid(), "mount_point": f"{vol_root}/spark01/Home"}),
+                encoding="utf-8",
+            )
+            (daemons / "pc-C.json").write_text(
+                json.dumps({"schema": 2, "pid": os.getpid(), "mount_point": f"{vol_root}/pc/C"}),
                 encoding="utf-8",
             )
             unmounted_paths: list[str] = []
+            killed_pids: list[tuple[int, int]] = []
+            parsed_after = {k: v for k, v in parsed.items() if k != f"{vol_root}/pc/D"}
+
+            fake_ps_out = "\n".join(
+                [
+                    f"  {os.getpid()} rclone serve nfs :sftp:/home/danlinyu --nfs-cache-dir /Users/danlinyu/.cache/remote-fleet/nfs-handles/spark01-Home",
+                    "  88888 rclone serve nfs :sftp:/D:/ --nfs-cache-dir /Users/danlinyu/.cache/remote-fleet/nfs-handles/pc-D",
+                    "  99999 rclone serve nfs :sftp:/unrelated --nfs-cache-dir /tmp/other-cache",
+                ]
+            )
+
+            def fake_subproc_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                if cmd and cmd[0].endswith("ps"):
+                    return sp.CompletedProcess(cmd, 0, stdout=fake_ps_out, stderr="")
+                return sp.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    return
+                killed_pids.append((pid, int(sig)))
+
             with (
                 patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
                 patch("remote_fleet.mac_integration.safe_lexical_resolve", side_effect=lambda p: p),
                 patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
-                patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=parsed),
+                patch("remote_fleet.mac_integration.get_macos_mount_table", side_effect=[parsed, parsed_after]),
                 patch(
                     "remote_fleet.mac_integration.unmount_sshfs",
                     side_effect=lambda p: unmounted_paths.append(str(p)) or {"ok": True},
                 ),
                 patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+                patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_subproc_run),
+                patch("remote_fleet.mac_integration.os.kill", side_effect=fake_kill),
             ):
                 _cleanup_legacy_nfsmounts(
                     Path(vol_root),
                     raw_root=Path("/Users/danlinyu/RemoteComputers"),
                 )
 
-            self.assertEqual(
-                set(unmounted_paths),
-                {
-                    f"{vol_root}/pc/C",
-                    f"{vol_root}/pc/D",
-                },
-            )
+            # MUST unmount ONLY orphaned pc/D — NEVER live spark01/Home or pc/C!
+            self.assertEqual(unmounted_paths, [f"{vol_root}/pc/D"])
+            # MUST kill ONLY leaked orphan PID 88888 — NEVER live daemon or unrelated rclone!
+            self.assertEqual(killed_pids, [(88888, int(signal.SIGTERM))])
 
     def test_windows_10_drives_reuses_verified_sftp_flags(self) -> None:
         """Verify mounting 10 drives (`C:`..`L:`) on `danlin-hud` reuses verified SFTP flags after `C:`
@@ -919,6 +958,162 @@ class TestMacIntegration(unittest.TestCase):
                 os.environ.pop("REMOTE_FLEET_SELF", None)
             else:
                 os.environ["REMOTE_FLEET_SELF"] = old_self
+
+    def test_launchd_tick_preserves_all_live_sparks_and_pc_on_real_macos_mount_output(self) -> None:
+        """End-to-end regression test for the catastrophic all-disconnect bug:
+        1) Real macOS `/sbin/mount` prints `(nfs, nodev, nosuid, mounted by danlinyu)` — NEVER `"soft"`.
+        2) `mounts.json` may contain stale pre-symlink keys (`/Users/.../RemoteComputers/...`) alongside resolved keys.
+        3) Running `mount_all_machines(..., from_launchd=True)` MUST unmount ZERO mounts and spawn ZERO SSH calls!
+        4) `install_macos_launch_agent` MUST skip `launchctl bootout`/`bootstrap` when plist is unchanged & already loaded."""
+        import errno
+        import json
+        import subprocess as sp
+        from unittest.mock import patch
+        from remote_fleet.config import FleetConfig, MachineConfig, save_mounts_registry
+        from remote_fleet.mac_integration import mount_all_machines
+        from remote_fleet.mount import parse_macos_mount_output
+        from remote_fleet.transport import EndpointStatus, FleetTransport
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            daemons = tmp_path / "daemons"
+            daemons.mkdir()
+            vol_root = tmp_path / "X10 Pro" / "Projects" / "RemoteComputers"
+            (vol_root / "spark01" / "Home").mkdir(parents=True)
+            (vol_root / "spark01" / "raid").mkdir(parents=True)
+            (vol_root / "pc" / "C").mkdir(parents=True)
+            (vol_root / "pc" / "D").mkdir(parents=True)
+            raw_link = tmp_path / "RemoteComputers"
+            raw_link.symlink_to(vol_root)
+
+            resolved_root = vol_root.resolve()
+            raw_mount = "\n".join(
+                [
+                    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
+                    f"localhost:/ on {resolved_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"localhost:/ on {resolved_root}/spark01/raid (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"localhost:/ on {resolved_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"localhost:/ on {resolved_root}/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
+                ]
+            )
+            mount_table = parse_macos_mount_output(raw_mount)
+
+            for stem, mid, host, rel in (
+                ("spark01-Home", "spark01", "spark01.local", "spark01/Home"),
+                ("spark01-raid", "spark01", "spark01.local", "spark01/raid"),
+                ("pc-C", "pc", "192.168.68.70", "pc/C"),
+                ("pc-D", "pc", "192.168.68.70", "pc/D"),
+            ):
+                (daemons / f"{stem}.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": 2,
+                            "pid": os.getpid(),
+                            "port": 51234,
+                            "host": host,
+                            "machine_id": mid,
+                            "mount_point": str(resolved_root / rel),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                # Deliberately include BOTH stale pre-symlink keys AND resolved keys in mounts.json
+                save_mounts_registry(
+                    {
+                        f"{raw_link}/spark01/Home": {"machine_id": "spark01", "remote_root": "/home/danlinyu"},
+                        f"{raw_link}/spark01/raid": {"machine_id": "spark01", "remote_root": "/raid"},
+                        f"{resolved_root}/spark01/Home": {"machine_id": "spark01", "remote_root": "/home/danlinyu"},
+                        f"{resolved_root}/spark01/raid": {"machine_id": "spark01", "remote_root": "/raid"},
+                        f"{raw_link}/pc/C": {"machine_id": "pc", "remote_root": "C:/"},
+                        f"{raw_link}/pc/D": {"machine_id": "pc", "remote_root": "D:/"},
+                        f"{resolved_root}/pc/C": {"machine_id": "pc", "remote_root": "C:/"},
+                        f"{resolved_root}/pc/D": {"machine_id": "pc", "remote_root": "D:/"},
+                    }
+                )
+
+                spark01 = MachineConfig(id="spark01", name="Spark 01", lan_host="spark01.local", user="danlinyu", os="linux")
+                pc = MachineConfig(id="pc", name="PC", lan_host="192.168.68.70", user="danli", os="windows")
+                cfg = FleetConfig(machines=[spark01, pc])
+                tr = FleetTransport(cfg)
+
+                def fake_resolve(m: MachineConfig, force_refresh: bool = False) -> EndpointStatus:
+                    return EndpointStatus(
+                        machine_id=m.id, transport="lan", host=m.lan_host, port=22, reachable=True, latency_ms=1.5
+                    )
+
+                real_lstat = os.lstat
+
+                def fake_lstat_enoent(p: object) -> object:
+                    if ".fleet-probe-" in str(p):
+                        raise OSError(errno.ENOENT, "No such file")
+                    return real_lstat(p)  # type: ignore[arg-type]
+
+                unmounted: list[str] = []
+                ssh_calls: list[str] = []
+
+                with (
+                    patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                    patch("remote_fleet.mount.platform.system", return_value="Darwin"),
+                    patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                    patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=mount_table),
+                    patch("remote_fleet.mount.get_macos_mount_table", return_value=mount_table),
+                    patch("remote_fleet.mac_integration._kill_orphan_rclone_serve_daemons"),
+                    patch(
+                        "remote_fleet.mac_integration.unmount_sshfs",
+                        side_effect=lambda p: unmounted.append(str(p)) or {"ok": True},
+                    ),
+                    patch("remote_fleet.mac_integration.os.lstat", side_effect=fake_lstat_enoent),
+                    patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+                    patch.object(tr, "resolve_all_endpoints", return_value={}),
+                    patch.object(tr, "resolve_endpoint", side_effect=fake_resolve),
+                    patch.object(
+                        tr,
+                        "run_worker_op",
+                        side_effect=lambda m, req, **kw: ssh_calls.append(m.id) or {"ok": False},
+                    ),
+                ):
+                    summary = mount_all_machines(cfg, tr, base_dir=raw_link, from_launchd=True)
+
+                self.assertEqual(unmounted, [], f"Live mounts were unexpectedly unmounted: {unmounted}")
+                self.assertEqual(ssh_calls, [], f"Expected zero SSH calls when mounts are healthy: {ssh_calls}")
+                by_id = {r["machine_id"]: r for r in summary["results"]}
+                self.assertTrue(by_id["spark01"]["ok"] and by_id["spark01"].get("already_mounted"))
+                self.assertTrue(by_id["pc"]["ok"] and by_id["pc"].get("already_mounted"))
+
+                # Verify install_macos_launch_agent skips bootout/bootstrap when plist is unchanged & already loaded
+                fake_home = tmp_path / "home"
+                fake_home.mkdir()
+                # First create the plist with home_dir=fake_home
+                plist_path = install_macos_launch_agent(home_dir=fake_home, load_now=False)
+                self.assertTrue(plist_path.is_file())
+
+                launchctl_cmds: list[list[str]] = []
+
+                def fake_launchctl(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                    launchctl_cmds.append(list(cmd))
+                    # Simulate `launchctl print` succeeding (agent already loaded)
+                    return sp.CompletedProcess(cmd, 0, stdout="state = waiting", stderr="")
+
+                with (
+                    patch("remote_fleet.mac_integration.Path.home", return_value=fake_home),
+                    patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                    patch("remote_fleet.mac_integration.shutil.which", return_value="/bin/launchctl"),
+                    patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_launchctl),
+                ):
+                    install_macos_launch_agent(home_dir=None, load_now=True)
+
+                subcmds = [c[1] for c in launchctl_cmds if len(c) >= 2 and c[0] == "launchctl"]
+                self.assertEqual(subcmds, ["print"])
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
 
 if __name__ == "__main__":
