@@ -463,7 +463,7 @@ def _mount_sftp_directory(
     _ = vol_label
     mount_point = safe_lexical_resolve(mount_point)
 
-    health = _probe_mount_health(mount_point, log_stem, timeout_sec=12.0, expected_host=host)
+    health = _probe_mount_health(mount_point, log_stem, timeout_sec=20.0, expected_host=host)
     if health == "healthy":
         visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
         reg = load_mounts_registry()
@@ -531,8 +531,11 @@ def _mount_sftp_directory(
                 "error": f"rclone SFTP preflight failed on {host} ({remote_target}): {preflight_err}",
             }
 
+        # SFTP pipelines 64 concurrent requests over a single SSH connection (`--sftp-concurrency 64`).
+        # Capping Windows multi-drive mounts at `--max-connections 1` keeps 10 drives x 1 = 10 <= Windows sshd `MaxStartups 10`!
+        max_conns = "1" if machine.os == "windows" else "2"
         extra_conn_flags = (
-            ["--max-connections", "2"] if _rclone_supports_flag(rclone_bin, "--max-connections") else []
+            ["--max-connections", max_conns] if _rclone_supports_flag(rclone_bin, "--max-connections") else []
         )
 
         for _attempt in range(2 if preverified_sftp is not None else 1):
@@ -631,7 +634,7 @@ def _mount_sftp_directory(
                     ),
                     encoding="utf-8",
                 )
-                if _probe_mount_health(mount_point, log_stem, timeout_sec=15.0, expected_host=host) == "healthy":
+                if _probe_mount_health(mount_point, log_stem, timeout_sec=20.0, expected_host=host) == "healthy":
                     visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
                     reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
@@ -1320,7 +1323,7 @@ def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected
                 return False
         except Exception:
             return False
-        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=12.0, expected_host=expected_host) != "healthy":
+        if _probe_mount_health(Path(mp_str), mf.stem, timeout_sec=20.0, expected_host=expected_host) != "healthy":
             return False
     return True
 
