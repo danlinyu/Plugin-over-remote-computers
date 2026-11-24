@@ -34,6 +34,7 @@ from remote_fleet.mac_integration import (
     install_macos_launch_agent,
     mount_all_machines,
     sync_ssh_config,
+    uninstall_macos_launch_agent,
     unmount_all_machines,
 )
 from remote_fleet.mcp_server import serve_stdio
@@ -787,7 +788,10 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
         elif r.get("ok"):
             if r.get("drives"):
                 drv_list = ", ".join(r["drives"])
-                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} (drives: {drv_list} + Home shortcut)")
+                home_note = " + Home shortcut" if r.get("home_created") else ""
+                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} (drives: {drv_list}{home_note})")
+                for ferr in r.get("failed_drives") or []:
+                    print(f"  [WARN] {mid:<12} -> failed drive {ferr}")
             else:
                 entries = ", ".join(r.get("sample_entries") or ["Home"])
                 state = "already mounted" if r.get("already_mounted") else f"mounted via {r.get('engine')}"
@@ -797,8 +801,8 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
     if summary.get("sidebar_repaired"):
         print("  [FIXED] Repaired macOS Finder & Open-Dialog Sidebar Favorites (`pc`, `spark01`, `spark03`, `spark04`)!")
     if sys.platform == "darwin" and not getattr(args, "from_launchd", False):
-        plist = install_macos_launch_agent(base_dir=base, load_now=True)
-        print(f"  [AUTO]  Active across Mac restarts: {plist}")
+        if uninstall_macos_launch_agent():
+            print("  [CLEAN] Removed legacy background LaunchAgent (com.remote-fleet.automount) — no background polling.")
     return 0
 
 
@@ -839,9 +843,12 @@ def cmd_setup_mac(args: argparse.Namespace) -> int:
         else:
             print(f"  [INFO]  {mid:<12} -> {r.get('error')}")
 
-    if sys.platform == "darwin" and not args.no_autostart:
-        plist = install_macos_launch_agent(base_dir=mount_dir)
-        print(f"\nInstalled macOS login auto-mounter: {plist}")
+    if sys.platform == "darwin":
+        if getattr(args, "autostart", False) and not args.no_autostart and not str(mount_dir).startswith("/Volumes/"):
+            plist = install_macos_launch_agent(base_dir=mount_dir)
+            print(f"\nInstalled one-shot macOS login mounter (no periodic polling): {plist}")
+        else:
+            uninstall_macos_launch_agent()
 
     print(
         f"\nDone! Drag `{mount_dir}` into your macOS Finder Sidebar Favorites so `spark-1`, "
@@ -1032,7 +1039,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="All-in-one Mac setup: install into all harnesses, configure ~/.ssh/config, and mount ~/RemoteComputers/",
     )
     p_mac.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
-    p_mac.add_argument("--no-autostart", action="store_true", help="Skip creating macOS login LaunchAgent")
+    p_mac.add_argument("--autostart", action="store_true", help="Opt-in: create one-shot login LaunchAgent (no periodic polling; skipped for /Volumes paths)")
+    p_mac.add_argument("--no-autostart", action="store_true", help="Skip creating macOS login LaunchAgent (default)")
     p_mac.set_defaults(func=cmd_setup_mac)
 
     p_boot = sub.add_parser(

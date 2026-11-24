@@ -513,7 +513,16 @@ def _mount_sftp_directory(
             "error": "Neither `rclone` nor `sshfs` is installed yet.",
         }
 
-    mount_point.mkdir(parents=True, exist_ok=True)
+    try:
+        mount_point.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        is_perm = isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES)
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "permission_denied": is_perm,
+            "error": f"Cannot access mount folder {mount_point}: {exc}",
+        }
     try:
         (mount_point / ".DS_Store").unlink(missing_ok=True)
     except OSError:
@@ -549,6 +558,8 @@ def _mount_sftp_directory(
             }
 
         # Never pass `--max-connections 1` (deadlocks rclone VFS on nested Finder READDIRPLUS + .DS_Store calls!).
+        permission_denied = False
+        probe_timeout = 20.0 if machine.os == "windows" else 15.0
         for _attempt in range(2 if preverified_sftp is not None else 1):
             nfs_port = _allocate_loopback_port()
             nfs_cache_dir = cache_root / "nfs-handles" / log_stem
@@ -653,7 +664,7 @@ def _mount_sftp_directory(
                     ),
                     encoding="utf-8",
                 )
-                if _probe_mount_health(mount_point, log_stem, timeout_sec=15.0, expected_host=host) == "healthy":
+                if _probe_mount_health(mount_point, log_stem, timeout_sec=probe_timeout, expected_host=host) == "healthy":
                     visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
                     reg[recorded_mp] = {"machine_id": machine.id, "remote_root": remote_target}
@@ -678,6 +689,11 @@ def _mount_sftp_directory(
                 except Exception:
                     pass
 
+            err_low = mount_err_detail.lower()
+            if "operation not permitted" in err_low or "permission denied" in err_low:
+                permission_denied = True
+                break
+
             if _attempt == 0 and preverified_sftp is not None:
                 verified_rclone_path, fallback_flags, preflight_err = _select_verified_rclone_sftp_flags(
                     rclone_bin,
@@ -695,11 +711,13 @@ def _mount_sftp_directory(
         log_file = cache_root / f"rclone-{log_stem}.log"
         if log_file.is_file():
             log_tail = "\n".join(log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-8:])
-        if not sshfs_bin:
-            _cleanup_unmounted_empty_dir(mount_point)
+        if not sshfs_bin or permission_denied:
+            if not permission_denied:
+                _cleanup_unmounted_empty_dir(mount_point)
             return {
                 "ok": False,
                 "machine_id": machine.id,
+                "permission_denied": permission_denied,
                 "error": f"rclone serve nfs mount failed on {mount_point}: {mount_err_detail or log_tail or 'timeout'}",
             }
 
@@ -849,7 +867,15 @@ def _mount_windows_all_drives(
         }
 
     # Prune stale pre-symlink keys and record container entry so nested `<container>/<Drive>` entries govern path resolution
-    container_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        container_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "permission_denied": isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES),
+            "error": f"Cannot access {container_dir}: {exc}",
+        }
     remote_home = str(ping.get("home") or "C:/").replace("\\", "/")
     reg = _prune_stale_registry_entries(machine.id, container_dir)
     reg[str(container_dir)] = {
@@ -871,11 +897,14 @@ def _mount_windows_all_drives(
         drive_letters = ["C"]
 
     mounted_drives: List[str] = []
-    drive_errors: List[str] = []
+    drive_errors: Dict[str, str] = {}
+    failed_letters: List[str] = []
     total_visible = 0
     any_already = True
     cached_sftp_flags: Optional[List[str]] = None
     use_leading_slash = True
+    new_mount_attempts = 0
+    aborted_permission = False
 
     for letter in drive_letters:
         drive_mp = safe_lexical_resolve(container_dir / letter)
@@ -883,7 +912,9 @@ def _mount_windows_all_drives(
         if cached_sftp_flags is not None:
             cand_rclone_path = f"/{letter}:/" if use_leading_slash else f"{letter}:/"
             extra_kwargs["preverified_sftp"] = (cand_rclone_path, cached_sftp_flags)
-            time.sleep(0.15)
+            # Space out newly launched Windows SFTP mounts so we never burst past Windows sshd MaxStartups (10)
+            if new_mount_attempts > 0:
+                time.sleep(0.4)
 
         res = _mount_sftp_directory(
             machine=machine,
@@ -901,12 +932,48 @@ def _mount_windows_all_drives(
             total_visible += int(res.get("visible_count") or 0)
             if not res.get("already_mounted"):
                 any_already = False
+                new_mount_attempts += 1
                 if cached_sftp_flags is None and res.get("verified_sftp_flags"):
                     cached_sftp_flags = list(res["verified_sftp_flags"])
                     vpath = str(res.get("verified_rclone_path") or f"/{letter}:/")
                     use_leading_slash = vpath.startswith("/")
         else:
-            drive_errors.append(f"{letter}: {res.get('error')}")
+            new_mount_attempts += 1
+            drive_errors[letter] = f"{letter}: {res.get('error')}"
+            failed_letters.append(letter)
+            if res.get("permission_denied"):
+                aborted_permission = True
+                break
+
+    # Single clean retry pass for any drives that transiently failed (e.g. parked HDD spin-up or sshd handshake hiccup)
+    if failed_letters and not aborted_permission:
+        time.sleep(2.0)
+        for letter in list(failed_letters):
+            drive_mp = safe_lexical_resolve(container_dir / letter)
+            res2 = _mount_sftp_directory(
+                machine=machine,
+                ep_dict=ep_dict,
+                host=host,
+                remote_target=f"{letter}:/",
+                mount_point=drive_mp,
+                vol_label=f"Fleet-{machine.id}-{letter}",
+                log_stem=f"{machine.id}-{letter}",
+                allow_empty_fallback=False,
+            )
+            if res2.get("ok"):
+                mounted_drives.append(f"{letter}:/")
+                total_visible += int(res2.get("visible_count") or 0)
+                any_already = False
+                drive_errors.pop(letter, None)
+                failed_letters.remove(letter)
+            else:
+                drive_errors[letter] = f"{letter}: {res2.get('error')}"
+                if res2.get("permission_denied"):
+                    break
+            time.sleep(0.4)
+
+    mounted_drives.sort()
+    final_errors = [drive_errors[ch] for ch in sorted(drive_errors.keys())]
 
     # Create/refresh `Home` shortcut (`~/RemoteComputers/pc/Home -> C/Users/danli`) for 1-click access to user profile
     home_link = container_dir / "Home"
@@ -929,36 +996,44 @@ def _mount_windows_all_drives(
 
     # Clean up any stale unmounted empty drive directories from previously unplugged USB drives
     mounted_names = {d[0] for d in mounted_drives}
-    for child in list(container_dir.iterdir()):
-        if child.name == "Home" or child.name in mounted_names:
-            continue
-        if not is_mounted(child) and not child.is_symlink() and child.is_dir():
-            _cleanup_unmounted_empty_dir(child)
+    try:
+        for child in list(container_dir.iterdir()):
+            if child.name == "Home" or child.name in mounted_names:
+                continue
+            if not is_mounted(child) and not child.is_symlink() and child.is_dir():
+                _cleanup_unmounted_empty_dir(child)
+    except OSError:
+        pass
 
     if not mounted_drives:
         # Never delete `container_dir` itself — keep its APFS inode permanent for macOS Sidebar Favorites!
         return {
             "ok": False,
             "machine_id": machine.id,
-            "error": "; ".join(drive_errors) or "No Windows drives could be mounted.",
+            "permission_denied": aborted_permission,
+            "error": "; ".join(final_errors) or "No Windows drives could be mounted.",
         }
 
     flat_entries = [d[0] for d in mounted_drives]
     if home_created:
         flat_entries.insert(0, "Home")
 
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "machine_id": machine.id,
         "engine": "rclone-serve-nfs-drives" if platform.system().lower() == "darwin" else "rclone-mount-drives",
         "mount_point": str(container_dir),
         "remote_root": ", ".join(mounted_drives),
         "drives": mounted_drives,
+        "home_created": home_created,
         "already_mounted": any_already,
         "visible_count": total_visible,
         "sample_entries": flat_entries,
         "endpoint": ep_dict,
     }
+    if final_errors:
+        out["failed_drives"] = final_errors
+    return out
 
 
 def _mount_posix_container(
@@ -1368,14 +1443,103 @@ def _all_recorded_daemons_healthy(machine_id: str, container_dir: Path, expected
     return healthy_count > 0
 
 
+def _parse_sftp_windows_batch_output(stdout: str, default_user: str = "") -> Tuple[str, List[str]]:
+    """Parse `@pwd` + `-@cd /X:/` + `@pwd` batch output from OpenSSH `sftp` against Win32-OpenSSH.
+    Returns `(remote_home, drive_letters)` without ever spawning `powershell.exe` or `cmd.exe`."""
+    default_home = f"C:/Users/{default_user}" if default_user else "C:/"
+    remote_home = default_home
+    discovered_letters: List[str] = []
+    pwd_lines: List[str] = []
+    for line in stdout.splitlines():
+        m = re.search(r"Remote working directory:\s*(.+?)\s*$", line)
+        if m:
+            pwd_lines.append(m.group(1).strip().replace("\\", "/"))
+
+    if pwd_lines:
+        first = pwd_lines[0]
+        hm = re.match(r"^/?([A-Za-z]):/(.+)$", first)
+        if hm:
+            remote_home = f"{hm.group(1).upper()}:/{hm.group(2).strip('/')}"
+        for raw_dir in pwd_lines[1:]:
+            dm = re.match(r"^/?([A-Za-z]):/?$", raw_dir)
+            if dm:
+                letter = dm.group(1).upper()
+                if letter not in discovered_letters:
+                    discovered_letters.append(letter)
+
+    return remote_home, discovered_letters
+
+
+def _discover_windows_via_pure_sftp(
+    machine: MachineConfig,
+    host: str,
+    container_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Discover Windows home path and all accessible drive letters (`C:`..`Z:`) using PURE SFTP ONLY.
+
+    Connects directly to Windows OpenSSH's `sftp-server.exe` subsystem — NEVER spawns `powershell.exe`,
+    `cmd.exe`, or `conhost.exe` on Windows, eliminating leaked PowerShell processes permanently!
+    """
+    sftp_bin = shutil.which("sftp") or ("/usr/bin/sftp" if os.path.exists("/usr/bin/sftp") else None)
+    if sftp_bin:
+        cmd = [
+            sftp_bin,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+        ]
+        if machine.port and machine.port != 22:
+            cmd.extend(["-P", str(machine.port)])
+        if machine.ssh_identity_file:
+            cmd.extend(["-i", os.path.expanduser(machine.ssh_identity_file)])
+        target = f"{machine.user}@{host}" if machine.user else host
+        cmd.extend(["-b", "-", target])
+
+        batch_lines = ["@pwd"]
+        for ch in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            batch_lines.append(f"-@cd /{ch}:/")
+            batch_lines.append("@pwd")
+        batch_input = "\n".join(batch_lines) + "\n"
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=batch_input,
+                capture_output=True,
+                text=True,
+                timeout=25,
+                check=False,
+            )
+            if proc.stdout:
+                remote_home, letters = _parse_sftp_windows_batch_output(proc.stdout, default_user=machine.user)
+                if letters:
+                    return {
+                        "ok": True,
+                        "os": "windows",
+                        "home": remote_home,
+                        "drives": [f"{ch}:/" for ch in letters],
+                        "sftp_discovery": True,
+                    }
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return _fallback_windows_ping_via_sftp(machine, host, container_dir)
+
+
 def _fallback_windows_ping_via_sftp(
     machine: MachineConfig,
     host: str,
     container_dir: Path,
 ) -> Optional[Dict[str, Any]]:
-    """Pure-SFTP fallback for Windows `pc` when PowerShell SSH shell is slow or blocked:
-    verifies SFTP on `C:/` via `rclone` (`--sftp-shell-type none`) and recovers drive letters from
-    `mounts.json` + existing `<container>/<Drive>` folders (or `C:/`)."""
+    """Pure-SFTP fallback via `rclone lsf` (`--sftp-shell-type none`) when `/usr/bin/sftp` batch probe is unavailable:
+    verifies SFTP on `C:/` and recovers drive letters from `mounts.json` + existing `<container>/<Drive>` folders."""
     rclone_bin = find_rclone_binary()
     if not rclone_bin:
         return None
@@ -1434,10 +1598,18 @@ def mount_single_machine_root(
     if is_mounted(mount_point):
         unmount_sshfs(mount_point)
     if not is_mounted(mount_point):
-        mount_point.mkdir(parents=True, exist_ok=True)
+        try:
+            mount_point.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {
+                "ok": False,
+                "machine_id": machine.id,
+                "permission_denied": isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES),
+                "error": f"Cannot access {mount_point}: {exc}",
+            }
 
     # On background ticks, if every recorded mount for `machine.id` is already live & passes uncached
-    # `.fleet-probe-<uuid>` health, skip spawning SSH / PowerShell `ping` completely (and preserve working
+    # `.fleet-probe-<uuid>` health, skip spawning SSH / SFTP probes completely (and preserve working
     # mounts even if `launchd` saw a transient TCP/Local Network probe failure!).
     if from_launchd and _all_recorded_daemons_healthy(
         machine.id, mount_point, ep.host if ep.reachable else ""
@@ -1453,27 +1625,31 @@ def mount_single_machine_root(
     if not ep.reachable:
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
-    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=20)
-    active_ep_dict = ping.get("endpoint") if isinstance(ping.get("endpoint"), dict) else ep.to_dict()
-    active_host = str(active_ep_dict.get("host") or ep.host)
-
-    if not ping.get("ok") and machine.os == "windows":
-        # Pure-SFTP fallback: even if Windows PowerShell shell timed out, mount all drives directly over SFTP!
+    # For Windows PCs, NEVER spawn `powershell.exe` over SSH to discover drives!
+    # Use 100% pure SFTP (`sftp -b -` / `rclone lsf`) so zero PowerShell/cmd/conhost sessions are ever created.
+    if machine.os == "windows":
         cand_hosts = [ep.host]
         if machine.tailscale_host and machine.tailscale_host not in cand_hosts:
             if not is_tailscale_only_host(machine.tailscale_host) or is_local_tailscale_running():
                 cand_hosts.append(machine.tailscale_host)
         for chost in cand_hosts:
-            sftp_ping = _fallback_windows_ping_via_sftp(machine, chost, mount_point)
+            sftp_ping = _discover_windows_via_pure_sftp(machine, chost, mount_point)
             if sftp_ping is not None:
-                ping = sftp_ping
-                active_host = chost
                 active_ep_dict = {
                     **ep.to_dict(),
                     "host": chost,
                     "transport": "tailscale" if chost == machine.tailscale_host else ep.transport,
                 }
-                break
+                return _mount_windows_all_drives(machine, active_ep_dict, chost, sftp_ping, mount_point)
+        return {
+            "ok": False,
+            "machine_id": machine.id,
+            "error": f"SFTP connection failed on {ep.host} (check OpenSSH Server / sshd on Windows).",
+        }
+
+    ping = transport.run_worker_op(machine, {"op": "ping"}, timeout_sec=20)
+    active_ep_dict = ping.get("endpoint") if isinstance(ping.get("endpoint"), dict) else ep.to_dict()
+    active_host = str(active_ep_dict.get("host") or ep.host)
 
     if not ping.get("ok"):
         return {
@@ -1482,7 +1658,7 @@ def mount_single_machine_root(
             "error": f"SSH auth failed on {active_host}: {ping.get('error')}",
         }
 
-    if machine.os == "windows" or str(ping.get("os") or "").lower() == "windows":
+    if str(ping.get("os") or "").lower() == "windows":
         machine.os = "windows"
         return _mount_windows_all_drives(machine, active_ep_dict, active_host, ping, mount_point)
 
@@ -1852,13 +2028,39 @@ def _sync_local_runtime_mirror(home: Path, repo_src: Path) -> Path:
     return mirror_src
 
 
+def uninstall_macos_launch_agent(home_dir: Optional[Path] = None) -> bool:
+    """Unload and remove `~/Library/LaunchAgents/com.remote-fleet.automount.plist` so no background
+    polling timer can ever run on this Mac."""
+    home = (home_dir or Path.home()).expanduser().resolve()
+    plist_path = home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    existed = plist_path.is_file()
+
+    if home_dir is None and platform.system().lower() == "darwin" and shutil.which("launchctl"):
+        uid = os.getuid()
+        for lcmd in (
+            ["launchctl", "bootout", f"gui/{uid}/{LAUNCH_AGENT_LABEL}"],
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+        ):
+            try:
+                subprocess.run(lcmd, capture_output=True, timeout=5, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    if existed:
+        try:
+            plist_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return existed
+
+
 def install_macos_launch_agent(
     home_dir: Optional[Path] = None,
     python_executable: Optional[str] = None,
     base_dir: Optional[Path] = None,
     load_now: bool = True,
 ) -> Path:
-    """Create & load `~/Library/LaunchAgents/com.remote-fleet.automount.plist` to auto-mount at login & heal every 60s."""
+    """Create an opt-in one-shot login LaunchAgent (`RunAtLoad` ONLY — NO repeating `StartInterval` polling)."""
     home = (home_dir or Path.home()).expanduser().resolve()
     py_exe = python_executable or sys.executable or "/usr/bin/python3"
     repo_src_path = get_repo_root() / "src"
@@ -1886,7 +2088,6 @@ def install_macos_launch_agent(
             "PATH": f"{home / '.local' / 'bin'}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
         "RunAtLoad": True,
-        "StartInterval": 60,
         "AbandonProcessGroup": True,
         "StandardOutPath": str(home / ".cache" / "remote-fleet" / "automount.log"),
         "StandardErrorPath": str(home / ".cache" / "remote-fleet" / "automount.err.log"),

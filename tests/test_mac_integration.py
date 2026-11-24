@@ -127,6 +127,8 @@ class TestMacIntegration(unittest.TestCase):
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
     def test_macos_launch_agent_plist(self) -> None:
+        from remote_fleet.mac_integration import uninstall_macos_launch_agent
+
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp)
             plist_path = install_macos_launch_agent(home_dir=fake_home)
@@ -137,8 +139,12 @@ class TestMacIntegration(unittest.TestCase):
             self.assertIn("mount-all", data["ProgramArguments"])
             self.assertIn("--from-launchd", data["ProgramArguments"])
             self.assertTrue(data["AbandonProcessGroup"])
-            self.assertEqual(data["StartInterval"], 60)
+            # Never emit a periodic StartInterval timer that spams machines in the background!
+            self.assertNotIn("StartInterval", data)
             self.assertIn(".local/bin", data["EnvironmentVariables"]["PATH"])
+            self.assertTrue(uninstall_macos_launch_agent(home_dir=fake_home))
+            self.assertFalse(plist_path.exists())
+            self.assertFalse(uninstall_macos_launch_agent(home_dir=fake_home))
 
     def test_empty_unmounted_folder_cleanup(self) -> None:
         from remote_fleet.mac_integration import _cleanup_unmounted_empty_dir
@@ -817,14 +823,21 @@ class TestMacIntegration(unittest.TestCase):
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
     def test_windows_no_controlmaster_fast_ping_and_sftp_fallback(self) -> None:
-        """Regression test for Windows PC `ssh ... ControlMaster=auto ... powershell` 10s hang:
+        """Regression test for Windows PC mounting with ZERO PowerShell sessions:
         1) `build_ssh_args` disables `ControlMaster` for `os='windows'`.
-        2) `_build_windows_fast_ping_cmd` uses zero-stdin `DriveInfo::GetDrives()` without `Test-Path` / `.IsReady`.
-        3) `mount_single_machine_root` still mounts all PC drives via pure SFTP even if PowerShell SSH times out!"""
+        2) `_parse_sftp_windows_batch_output` discovers home + all drives (`C`..`L`) from ONE pure `sftp -b -` session.
+        3) `mount_single_machine_root` on Windows NEVER calls `run_worker_op` (ZERO PowerShell/cmd/conhost processes!).
+        4) `_mount_windows_all_drives` recovers transiently dropped drives (`C`, `I`, `K`) on pass 2 + restores `Home`,
+           and aborts immediately on `permission_denied` without retrying remaining drives!"""
         import base64
+        import subprocess as sp
         from unittest.mock import patch
         from remote_fleet.config import FleetConfig, MachineConfig, save_mounts_registry
-        from remote_fleet.mac_integration import mount_single_machine_root
+        from remote_fleet.mac_integration import (
+            _mount_windows_all_drives,
+            _parse_sftp_windows_batch_output,
+            mount_single_machine_root,
+        )
         from remote_fleet.transport import EndpointStatus, FleetTransport
 
         pc = MachineConfig(
@@ -847,6 +860,18 @@ class TestMacIntegration(unittest.TestCase):
         self.assertNotIn("Test-Path", decoded_fast)
         self.assertNotIn("IsReady", decoded_fast)
 
+        # Pure-SFTP batch parser extracts home + exact drive letters C..L (ignoring repeated /L:/ for M..Z)
+        sftp_sample = "\n".join(
+            [
+                "Remote working directory: /C:/Users/danli",
+                *[f"Remote working directory: /{ch}:/" for ch in "CDEFGHIJKL"],
+                *["Remote working directory: /L:/" for _ in "MNOPQRSTUVWXYZ"],
+            ]
+        )
+        parsed_home, parsed_letters = _parse_sftp_windows_batch_output(sftp_sample, default_user="danli")
+        self.assertEqual(parsed_home, "C:/Users/danli")
+        self.assertEqual(parsed_letters, list("CDEFGHIJKL"))
+
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             cfg_dir = tmp_path / "cfg"
@@ -866,29 +891,131 @@ class TestMacIntegration(unittest.TestCase):
                 live_ep = EndpointStatus(
                     machine_id="pc", transport="lan", host="192.168.68.70", port=22, reachable=True, latency_ms=2.0
                 )
-                captured_drives: list[str] = []
 
-                def fake_mount_win(
+                # 1. Pure-SFTP `sftp -b -` path mounts all C..L drives with ZERO calls to `run_worker_op` (ZERO PowerShell!)
+                captured_sftp_drives: list[str] = []
+                captured_sftp_home: list[str] = []
+
+                def fake_mount_win_capture(
                     m: MachineConfig, ep_d: dict[str, object], h: str, ping_d: dict[str, object], cdir: Path
                 ) -> dict[str, object]:
-                    captured_drives.extend(ping_d["drives"])  # type: ignore[arg-type]
+                    captured_sftp_drives.extend(ping_d["drives"])  # type: ignore[arg-type]
+                    captured_sftp_home.append(str(ping_d["home"]))
                     return {"ok": True, "machine_id": m.id, "drives": ping_d["drives"], "mount_point": str(cdir)}
 
                 with (
                     patch.object(tr, "resolve_endpoint", return_value=live_ep),
-                    patch.object(tr, "run_worker_op", return_value={"ok": False, "error": "timed out after 20 seconds"}),
+                    patch.object(tr, "run_worker_op") as mock_worker_op,
                     patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration.shutil.which", return_value="/usr/bin/sftp"),
+                    patch(
+                        "remote_fleet.mac_integration.subprocess.run",
+                        return_value=sp.CompletedProcess(["/usr/bin/sftp"], 0, stdout=sftp_sample, stderr=""),
+                    ),
+                    patch("remote_fleet.mac_integration._mount_windows_all_drives", side_effect=fake_mount_win_capture),
+                ):
+                    res_sftp = mount_single_machine_root(tr, pc, base_dir)
+
+                self.assertTrue(res_sftp["ok"], res_sftp)
+                self.assertEqual(captured_sftp_drives, [f"{ch}:/" for ch in "CDEFGHIJKL"])
+                self.assertEqual(captured_sftp_home, ["C:/Users/danli"])
+                mock_worker_op.assert_not_called()
+
+                # 2. When `/usr/bin/sftp` is absent, rclone SFTP fallback still recovers C, D, G with ZERO PowerShell!
+                captured_fallback: list[str] = []
+
+                def fake_mount_win_fb(
+                    m: MachineConfig, ep_d: dict[str, object], h: str, ping_d: dict[str, object], cdir: Path
+                ) -> dict[str, object]:
+                    captured_fallback.extend(ping_d["drives"])  # type: ignore[arg-type]
+                    return {"ok": True, "machine_id": m.id, "drives": ping_d["drives"], "mount_point": str(cdir)}
+
+                with (
+                    patch.object(tr, "resolve_endpoint", return_value=live_ep),
+                    patch.object(tr, "run_worker_op") as mock_worker_op2,
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+                    patch("remote_fleet.mac_integration.os.path.exists", return_value=False),
                     patch("remote_fleet.mac_integration.find_rclone_binary", return_value="/usr/local/bin/rclone"),
                     patch(
                         "remote_fleet.mac_integration._select_verified_rclone_sftp_flags",
                         return_value=("/C:/", ["--sftp-host", "192.168.68.70"], ""),
                     ),
-                    patch("remote_fleet.mac_integration._mount_windows_all_drives", side_effect=fake_mount_win),
+                    patch("remote_fleet.mac_integration._mount_windows_all_drives", side_effect=fake_mount_win_fb),
                 ):
-                    res = mount_single_machine_root(tr, pc, base_dir)
+                    res_fb = mount_single_machine_root(tr, pc, base_dir)
 
-                self.assertTrue(res["ok"], res)
-                self.assertEqual(captured_drives, ["C:/", "D:/", "G:/"])
+                self.assertTrue(res_fb["ok"], res_fb)
+                self.assertEqual(captured_fallback, ["C:/", "D:/", "G:/"])
+                mock_worker_op2.assert_not_called()
+
+                # 3. Transient failure on C, I, K during pass 1 is recovered on pass 2 + restores `Home` symlink!
+                attempts: dict[str, int] = {}
+
+                def fake_mount_partial(**kwargs: object) -> dict[str, object]:
+                    mp = kwargs["mount_point"]
+                    assert isinstance(mp, Path)
+                    target = str(kwargs["remote_target"])
+                    letter = target[0]
+                    attempts[letter] = attempts.get(letter, 0) + 1
+                    if letter in ("C", "I", "K") and attempts[letter] == 1:
+                        return {"ok": False, "machine_id": "pc", "error": "transient sshd MaxStartups drop"}
+                    mp.mkdir(parents=True, exist_ok=True)
+                    return {
+                        "ok": True,
+                        "visible_count": 2,
+                        "already_mounted": False,
+                        "verified_sftp_flags": ["--sftp-host", "192.168.68.70"],
+                        "verified_rclone_path": f"/{target}",
+                    }
+
+                pc_dir = base_dir / "pc_retry"
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_partial),
+                    patch("remote_fleet.mac_integration.time.sleep", return_value=None),
+                ):
+                    res_retry = _mount_windows_all_drives(
+                        pc,
+                        {"transport": "lan", "host": "192.168.68.70"},
+                        "192.168.68.70",
+                        {"ok": True, "os": "windows", "home": "C:/Users/danli", "drives": [f"{ch}:/" for ch in "CDEFGHIJKL"]},
+                        pc_dir,
+                    )
+
+                self.assertTrue(res_retry["ok"])
+                self.assertEqual(res_retry["drives"], [f"{ch}:/" for ch in "CDEFGHIJKL"])
+                self.assertTrue(res_retry["home_created"])
+                self.assertNotIn("failed_drives", res_retry)
+                self.assertEqual((pc_dir / "Home").readlink(), Path("C/Users/danli"))
+                self.assertEqual(attempts["C"], 2)
+                self.assertEqual(attempts["I"], 2)
+                self.assertEqual(attempts["K"], 2)
+                self.assertEqual(attempts["D"], 1)
+
+                # 4. EPERM (`permission_denied=True`) aborts immediately on C without attempting D..L!
+                perm_calls: list[str] = []
+
+                def fake_mount_eperm(**kwargs: object) -> dict[str, object]:
+                    perm_calls.append(str(kwargs["remote_target"]))
+                    return {"ok": False, "machine_id": "pc", "permission_denied": True, "error": "Operation not permitted"}
+
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_eperm),
+                    patch("remote_fleet.mac_integration.time.sleep", return_value=None),
+                ):
+                    res_eperm = _mount_windows_all_drives(
+                        pc,
+                        {"transport": "lan", "host": "192.168.68.70"},
+                        "192.168.68.70",
+                        {"ok": True, "os": "windows", "home": "C:/Users/danli", "drives": [f"{ch}:/" for ch in "CDEFGHIJKL"]},
+                        base_dir / "pc_eperm",
+                    )
+
+                self.assertFalse(res_eperm["ok"])
+                self.assertTrue(res_eperm.get("permission_denied"))
+                self.assertEqual(perm_calls, ["C:/"])
             finally:
                 if old_cfg_dir is None:
                     os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)

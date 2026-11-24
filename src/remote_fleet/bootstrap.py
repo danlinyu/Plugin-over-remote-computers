@@ -40,9 +40,9 @@ from remote_fleet.config import (
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
     find_rclone_binary,
-    install_macos_launch_agent,
     mount_all_machines,
     sync_ssh_config,
+    uninstall_macos_launch_agent,
 )
 from remote_fleet.mount import is_mounted
 from remote_fleet.transport import FleetTransport
@@ -870,8 +870,8 @@ def run_bootstrap(
             print(f"  [SKIP]    {mid:<10} -> {r.get('error')}")
 
     if platform.system().lower() == "darwin":
-        plist = install_macos_launch_agent(base_dir=target_mount_dir)
-        print(f"\nUpdated macOS login auto-mounter: {plist}")
+        if uninstall_macos_launch_agent():
+            print("\nRemoved legacy background LaunchAgent (com.remote-fleet.automount).")
 
     if pc_needs_windows_sshd:
         _print_windows_pc_final_banner(pc_default_lan, effective_pc_user, pub_key_str)
