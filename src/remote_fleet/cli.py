@@ -23,7 +23,9 @@ from remote_fleet.config import (
     load_active_project,
     load_fleet_config,
     merge_tailscale_into_config,
+    parse_wsl_path,
     query_tailscale_nodes,
+    resolve_windows_wsl_drive_alias,
     save_active_project,
     save_fleet_config,
 )
@@ -31,6 +33,7 @@ from remote_fleet.bootstrap import run_bootstrap
 from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
+    discover_windows_wsl_targets,
     install_macos_launch_agent,
     install_macos_login_item_app,
     mount_all_machines,
@@ -214,6 +217,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"rsync:     {shutil.which('rsync') or 'not installed (SSH worker fallback active)'}")
     print(f"sshfs:     {shutil.which('sshfs') or 'not installed (link/sync modes active)'}")
     print(f"Config:    {get_config_path()} ({'exists' if get_config_path().exists() else 'using defaults'})")
+    if sys.platform == "darwin":
+        nfs_conf = Path("/etc/nfs.conf")
+        has_downdelay = False
+        if nfs_conf.is_file():
+            try:
+                has_downdelay = "nfs.client.initialdowndelay" in nfs_conf.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                has_downdelay = False
+        if has_downdelay:
+            print("macOS NFS: /etc/nfs.conf has nfs.client.initialdowndelay configured")
+        else:
+            print(
+                "macOS NFS: default 12s initialdowndelay (optional tip to silence transient Finder disconnect banners:\n"
+                "           echo 'nfs.client.initialdowndelay = 60' | sudo tee -a /etc/nfs.conf && sudo mount_nfs configupdate)"
+            )
     print("")
 
     cfg, ts_self = load_fleet_config(include_tailscale=True)
@@ -231,6 +249,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     f"[OK]   {m.id:<12} {ep.transport.upper()} ({ep.host}, {ep.latency_ms:.1f}ms) -> "
                     f"{ping.get('hostname')} ({ping.get('os')}/{ping.get('arch')}, Python {ping.get('python')})"
                 )
+                if m.os == "windows" or str(ping.get("os") or "").lower() == "windows":
+                    wsl_targets = discover_windows_wsl_targets(m, ep.host)
+                    for wt in wsl_targets:
+                        drv_tag = f"{wt['drive_letter']}: -> " if wt.get("drive_letter") else f"{wt['mount_name']} -> "
+                        if wt.get("sftp_server"):
+                            print(
+                                f"       WSL {drv_tag}{wt['remote_uri']} (sftp-server ready: {wt['sftp_server']})"
+                            )
+                        else:
+                            print(f"       WSL {drv_tag}{wt['remote_uri']} [WARN] {wt.get('probe_error')}")
             else:
                 target_spec = f"{m.user}@{ep.host}" if m.user else ep.host
                 print(
@@ -735,6 +763,16 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     transport = FleetTransport(cfg, ts_self)
     m, base = _resolve_active(cfg, args.machine)
 
+    wsl_distro: Optional[str] = None
+    if m.os == "windows":
+        parsed_base = parse_wsl_path(base)
+        if parsed_base is not None:
+            wsl_distro = parsed_base[0]
+        else:
+            aliased = resolve_windows_wsl_drive_alias(m.id, base, wsl_drives=m.wsl_drives)
+            if aliased is not None:
+                wsl_distro = aliased[0]
+
     action = args.job_action or "list"
     if action == "start":
         cmd_parts = args.command or []
@@ -753,17 +791,27 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         )
     elif action == "status":
         if args.job_id:
-            res = transport.run_worker_op(
-                m, {"op": "job_status", "job_id": args.job_id, "tail_lines": args.tail}
-            )
+            req_st: Dict[str, Any] = {"op": "job_status", "job_id": args.job_id, "tail_lines": args.tail}
+            if wsl_distro and not str(args.job_id).startswith("job-"):
+                req_st["wsl_distro"] = wsl_distro
+            res = transport.run_worker_op(m, req_st)
         else:
-            res = transport.run_worker_op(m, {"op": "list_jobs"})
+            req_ls: Dict[str, Any] = {"op": "list_jobs"}
+            if wsl_distro:
+                req_ls["wsl_distro"] = wsl_distro
+            res = transport.run_worker_op(m, req_ls)
     elif action == "stop":
         if not args.job_id:
             raise SystemExit("`fleet jobs stop` requires a <job_id>.")
-        res = transport.run_worker_op(m, {"op": "stop_job", "job_id": args.job_id})
+        req_stop: Dict[str, Any] = {"op": "stop_job", "job_id": args.job_id}
+        if wsl_distro and not str(args.job_id).startswith("job-"):
+            req_stop["wsl_distro"] = wsl_distro
+        res = transport.run_worker_op(m, req_stop)
     else:
-        res = transport.run_worker_op(m, {"op": "list_jobs"})
+        req_ls_all: Dict[str, Any] = {"op": "list_jobs"}
+        if wsl_distro:
+            req_ls_all["wsl_distro"] = wsl_distro
+        res = transport.run_worker_op(m, req_ls_all)
 
     print(json.dumps(res, indent=2))
     return 0 if res.get("ok") else 1
@@ -822,10 +870,22 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
         if r.get("skipped"):
             print(f"  [SKIP] {mid:<12} ({r.get('reason')})")
         elif r.get("ok"):
-            if r.get("drives"):
-                drv_list = ", ".join(r["drives"])
-                home_note = " + Home shortcut" if r.get("home_created") else ""
-                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} (drives: {drv_list}{home_note})")
+            if r.get("drives") or r.get("wsl_mounts"):
+                parts: List[str] = []
+                if r.get("drives"):
+                    parts.append("drives: " + ", ".join(r["drives"]))
+                if r.get("wsl_mounts"):
+                    wsl_desc = ", ".join(
+                        f"{w['mount_name']} -> {w['distro']}" for w in r["wsl_mounts"]
+                    )
+                    parts.append("WSL: " + wsl_desc)
+                shortcuts: List[str] = []
+                if r.get("home_created"):
+                    shortcuts.append("Home")
+                if r.get("wsl_shortcut_created"):
+                    shortcuts.append("WSL")
+                shortcut_note = (" + " + "/".join(shortcuts) + " shortcut" + ("s" if len(shortcuts) > 1 else "")) if shortcuts else ""
+                print(f"  [OK]   {mid:<12} -> {r.get('mount_point')} ({' | '.join(parts)}{shortcut_note})")
                 for ferr in r.get("failed_drives") or []:
                     print(f"  [WARN] {mid:<12} -> failed drive {ferr}")
             else:
@@ -891,7 +951,10 @@ def cmd_setup_mac(args: argparse.Namespace) -> int:
         if r.get("skipped"):
             print(f"  [LOCAL] {mid:<12} (this Mac)")
         elif r.get("ok"):
-            print(f"  [MOUNT] {mid:<12} -> {r.get('mount_point')}")
+            wsl_note = ""
+            if r.get("wsl_mounts"):
+                wsl_note = " (WSL: " + ", ".join(f"{w['mount_name']} -> {w['distro']}" for w in r["wsl_mounts"]) + ")"
+            print(f"  [MOUNT] {mid:<12} -> {r.get('mount_point')}{wsl_note}")
         else:
             print(f"  [INFO]  {mid:<12} -> {r.get('error')}")
 

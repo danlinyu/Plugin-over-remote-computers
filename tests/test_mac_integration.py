@@ -547,7 +547,11 @@ class TestMacIntegration(unittest.TestCase):
         import signal
         import time
         from unittest.mock import patch
-        from remote_fleet.mac_integration import _probe_mount_health, _teardown_mount_and_daemon
+        from remote_fleet.mac_integration import (
+            DAEMON_SCHEMA_VERSION,
+            _probe_mount_health,
+            _teardown_mount_and_daemon,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -568,22 +572,31 @@ class TestMacIntegration(unittest.TestCase):
             ):
                 self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "legacy_nfsmount")
 
-            # 2b. Daemon metadata without schema=2 (e.g. broken 46ab17a `--max-connections 1` daemon) -> "outdated_daemon"
+            # 2b. Daemon metadata with missing or old schema (e.g. schema=2 pre-hardening) -> "outdated_daemon"
             meta_file = daemons / "pc-C.json"
-            meta_file.write_text(
-                json.dumps({"pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
-                encoding="utf-8",
-            )
-            with (
-                patch("remote_fleet.mac_integration.is_mounted", return_value=True),
-                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
-                patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+            for old_meta in (
+                {"pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)},
+                {"schema": 2, "pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)},
             ):
-                self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "outdated_daemon")
+                meta_file.write_text(json.dumps(old_meta), encoding="utf-8")
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                    patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                    patch("remote_fleet.mac_integration._daemons_dir", return_value=daemons),
+                ):
+                    self.assertEqual(_probe_mount_health(mp, "pc-C", timeout_sec=0.3), "outdated_daemon")
 
-            # Write valid schema=2 daemon metadata on Tailscale first
+            # Write valid current-schema daemon metadata on Tailscale first
             meta_file.write_text(
-                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "100.93.148.108", "mount_point": str(mp)}),
+                json.dumps(
+                    {
+                        "schema": DAEMON_SCHEMA_VERSION,
+                        "pid": 42424,
+                        "port": 51234,
+                        "host": "100.93.148.108",
+                        "mount_point": str(mp),
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -599,9 +612,17 @@ class TestMacIntegration(unittest.TestCase):
                     "endpoint_changed",
                 )
 
-            # Write valid schema=2 daemon metadata on Home LAN
+            # Write valid current-schema daemon metadata on Home LAN
             meta_file.write_text(
-                json.dumps({"schema": 2, "pid": 42424, "port": 51234, "host": "192.168.68.70", "mount_point": str(mp)}),
+                json.dumps(
+                    {
+                        "schema": DAEMON_SCHEMA_VERSION,
+                        "pid": 42424,
+                        "port": 51234,
+                        "host": "192.168.68.70",
+                        "mount_point": str(mp),
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -684,7 +705,7 @@ class TestMacIntegration(unittest.TestCase):
         import signal
         import subprocess as sp
         from unittest.mock import patch
-        from remote_fleet.mac_integration import _cleanup_legacy_nfsmounts
+        from remote_fleet.mac_integration import DAEMON_SCHEMA_VERSION, _cleanup_legacy_nfsmounts
         from remote_fleet.mount import parse_macos_mount_output
 
         vol_root = "/Volumes/X10 Pro/MovedFromInternal/Projects/RemoteComputers"
@@ -692,9 +713,9 @@ class TestMacIntegration(unittest.TestCase):
         raw_mount = "\n".join(
             [
                 "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
-                f"localhost:/ on {vol_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
+                f"127.0.0.1:/ on {vol_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
                 f"localhost:/ on {vol_root}/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
-                f"localhost:/ on {vol_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
+                f"127.0.0.1:/ on {vol_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
             ]
         )
         parsed = parse_macos_mount_output(raw_mount)
@@ -706,11 +727,11 @@ class TestMacIntegration(unittest.TestCase):
             daemons.mkdir()
             # spark01-Home and pc-C both have live daemon PIDs; pc-D has NO live daemon (orphaned/legacy)
             (daemons / "spark01-Home.json").write_text(
-                json.dumps({"schema": 2, "pid": os.getpid(), "mount_point": f"{vol_root}/spark01/Home"}),
+                json.dumps({"schema": DAEMON_SCHEMA_VERSION, "pid": os.getpid(), "mount_point": f"{vol_root}/spark01/Home"}),
                 encoding="utf-8",
             )
             (daemons / "pc-C.json").write_text(
-                json.dumps({"schema": 2, "pid": os.getpid(), "mount_point": f"{vol_root}/pc/C"}),
+                json.dumps({"schema": DAEMON_SCHEMA_VERSION, "pid": os.getpid(), "mount_point": f"{vol_root}/pc/C"}),
                 encoding="utf-8",
             )
             unmounted_paths: list[str] = []
@@ -1097,7 +1118,7 @@ class TestMacIntegration(unittest.TestCase):
         import subprocess as sp
         from unittest.mock import patch
         from remote_fleet.config import FleetConfig, MachineConfig, save_mounts_registry
-        from remote_fleet.mac_integration import mount_all_machines
+        from remote_fleet.mac_integration import DAEMON_SCHEMA_VERSION, mount_all_machines
         from remote_fleet.mount import parse_macos_mount_output
         from remote_fleet.transport import EndpointStatus, FleetTransport
 
@@ -1118,10 +1139,10 @@ class TestMacIntegration(unittest.TestCase):
             raw_mount = "\n".join(
                 [
                     "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
-                    f"localhost:/ on {resolved_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
-                    f"localhost:/ on {resolved_root}/spark01/raid (nfs, nodev, nosuid, mounted by danlinyu)",
-                    f"localhost:/ on {resolved_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
-                    f"localhost:/ on {resolved_root}/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"127.0.0.1:/ on {resolved_root}/spark01/Home (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"127.0.0.1:/ on {resolved_root}/spark01/raid (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"127.0.0.1:/ on {resolved_root}/pc/C (nfs, nodev, nosuid, mounted by danlinyu)",
+                    f"127.0.0.1:/ on {resolved_root}/pc/D (nfs, nodev, nosuid, mounted by danlinyu)",
                 ]
             )
             mount_table = parse_macos_mount_output(raw_mount)
@@ -1135,7 +1156,7 @@ class TestMacIntegration(unittest.TestCase):
                 (daemons / f"{stem}.json").write_text(
                     json.dumps(
                         {
-                            "schema": 2,
+                            "schema": DAEMON_SCHEMA_VERSION,
                             "pid": os.getpid(),
                             "port": 51234,
                             "host": host,
@@ -1339,7 +1360,7 @@ class TestMacIntegration(unittest.TestCase):
                 patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
                 patch(
                     "remote_fleet.mac_integration.shutil.which",
-                    side_effect=lambda name: f"/usr/bin/{name}" if name in ("swiftc", "codesign", "osascript", "launchctl") else None,
+                    side_effect=lambda name: f"/usr/bin/{name}" if name in ("swiftc", "codesign", "osascript", "xattr", "launchctl") else None,
                 ),
                 patch(
                     "remote_fleet.mac_integration.subprocess.run",
@@ -1428,6 +1449,419 @@ class TestMacIntegration(unittest.TestCase):
             self.assertTrue(res["ok"], res)
             self.assertEqual(res["mode"], "rclone-serve-nfs-soft")
             self.assertEqual(captured["remote_target"], "/home/danlinyu/proj")
+
+    def test_macos_nfs_stability_options_and_spotlight_guard(self) -> None:
+        """Verify hardened macOS `rclone serve nfs` + `/sbin/mount -t nfs` options, SSH keepalives,
+        and Spotlight `.metadata_never_index` container protection that eliminate spurious disconnect alerts."""
+        import subprocess as sp
+        from unittest.mock import patch
+
+        from remote_fleet.config import MachineConfig
+        from remote_fleet.mac_integration import (
+            DAEMON_SCHEMA_VERSION,
+            _cleanup_unmounted_empty_dir,
+            _ensure_spotlight_never_index,
+            _mount_sftp_directory,
+            build_rclone_sftp_ssh_command,
+        )
+
+        self.assertGreaterEqual(DAEMON_SCHEMA_VERSION, 3)
+
+        pc = MachineConfig(
+            id="pc",
+            name="Home PC",
+            lan_host="192.168.68.70",
+            user="danli",
+            os="windows",
+        )
+        ssh_cmd = build_rclone_sftp_ssh_command(pc, "192.168.68.70")
+        self.assertIn("ConnectTimeout=5", ssh_cmd)
+        self.assertIn("ServerAliveInterval=15", ssh_cmd)
+        self.assertIn("ServerAliveCountMax=2", ssh_cmd)
+        self.assertIn("TCPKeepAlive=yes", ssh_cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            fake_home = tmp_path / "home"
+            fake_home.mkdir()
+            container = tmp_path / "RemoteComputers" / "pc"
+            container.mkdir(parents=True)
+
+            # Spotlight marker created on unmounted APFS container, and cleaned up with `.DS_Store` if empty
+            with (
+                patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+            ):
+                _ensure_spotlight_never_index(container)
+            self.assertTrue((container / ".metadata_never_index").is_file())
+
+            dead_sub = container / "Z"
+            dead_sub.mkdir()
+            (dead_sub / ".DS_Store").write_bytes(b"finder")
+            (dead_sub / ".metadata_never_index").touch()
+            with patch("remote_fleet.mac_integration.is_mounted", return_value=False):
+                _cleanup_unmounted_empty_dir(dead_sub)
+            self.assertFalse(dead_sub.exists())
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                serve_cmds: list[list[str]] = []
+                mount_cmds: list[list[str]] = []
+
+                class _FakeProc:
+                    pid = 54321
+
+                    def poll(self) -> None:
+                        return None
+
+                    def terminate(self) -> None:
+                        return None
+
+                def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+                    serve_cmds.append(list(cmd))
+                    return _FakeProc()
+
+                def fake_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                    mount_cmds.append(list(cmd))
+                    return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                # Mount secondary Windows drive D:/ (longer 15m dir-cache) and WSL Y:/ (5m dir-cache)
+                for remote_target, mname, extra in (
+                    ("D:/", "D", {}),
+                    (
+                        "wsl://Ubuntu/",
+                        "Y",
+                        {
+                            "sftp_server_command": r"C:\Windows\System32\wsl.exe -d Ubuntu -e /usr/lib/openssh/sftp-server",
+                            "treat_as_posix": True,
+                            "rclone_remote_path": "/",
+                            "registry_extra": {"wsl_distro": "Ubuntu", "wsl_root": "/", "windows_drive": "Y:"},
+                        },
+                    ),
+                ):
+                    mp = container / mname
+                    probe_calls = {"n": 0}
+
+                    def fake_probe(*args: object, **kwargs: object) -> str:
+                        probe_calls["n"] += 1
+                        return "gone" if probe_calls["n"] == 1 else "healthy"
+
+                    with (
+                        patch("remote_fleet.mac_integration.Path.home", return_value=fake_home),
+                        patch("remote_fleet.mac_integration.platform.system", return_value="Darwin"),
+                        patch("remote_fleet.mac_integration.find_rclone_binary", return_value="/usr/local/bin/rclone"),
+                        patch("remote_fleet.mac_integration.os.path.exists", return_value=True),
+                        patch("remote_fleet.mac_integration._probe_mount_health", side_effect=fake_probe),
+                        patch("remote_fleet.mac_integration._teardown_mount_and_daemon"),
+                        patch("remote_fleet.mac_integration._wait_tcp_ready", return_value=True),
+                        patch("remote_fleet.mac_integration.is_mounted", return_value=True),
+                        patch("remote_fleet.mac_integration.get_macos_mount_table", return_value=None),
+                        patch("remote_fleet.mac_integration._safe_sample_entries", return_value=["home", "etc"]),
+                        patch(
+                            "remote_fleet.mac_integration._select_verified_rclone_sftp_flags",
+                            return_value=(extra.get("rclone_remote_path", "/D:/"), ["--sftp-host", "192.168.68.70"], ""),
+                        ),
+                        patch("remote_fleet.mac_integration.subprocess.Popen", side_effect=fake_popen),
+                        patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_run),
+                    ):
+                        res = _mount_sftp_directory(
+                            machine=pc,
+                            ep_dict={"transport": "lan", "host": "192.168.68.70"},
+                            host="192.168.68.70",
+                            remote_target=remote_target,
+                            mount_point=mp,
+                            vol_label=f"Fleet-pc-{mname}",
+                            log_stem=f"pc-{mname}",
+                            allow_empty_fallback=False,
+                            **extra,  # type: ignore[arg-type]
+                        )
+                    self.assertTrue(res["ok"], res)
+
+                self.assertEqual(len(serve_cmds), 2)
+                self.assertEqual(len(mount_cmds), 2)
+
+                # Secondary Windows HDD drive D: uses 15m dir-cache, WSL uses 5m dir-cache; both use 5m SFTP idle timeout
+                d_serve, y_serve = serve_cmds
+                self.assertEqual(d_serve[d_serve.index("--dir-cache-time") + 1], "15m")
+                self.assertEqual(y_serve[y_serve.index("--dir-cache-time") + 1], "5m")
+                for sc in serve_cmds:
+                    self.assertEqual(sc[sc.index("--sftp-idle-timeout") + 1], "5m")
+                    self.assertEqual(sc[sc.index("--attr-timeout") + 1], "5s")
+                    self.assertEqual(sc[sc.index("--contimeout") + 1], "5s")
+                    self.assertEqual(sc[sc.index("--timeout") + 1], "15s")
+                    self.assertEqual(sc[sc.index("--low-level-retries") + 1], "3")
+
+                # macOS `/sbin/mount -t nfs` uses IPv4 127.0.0.1:/ + hardened NFSv3 stability options (never `nobrowse`)
+                for mc in mount_cmds:
+                    self.assertIn("127.0.0.1:/", mc)
+                    self.assertNotIn("localhost:/", mc)
+                    opts = mc[mc.index("-o") + 1]
+                    for req_opt in (
+                        "vers=3",
+                        "proto=tcp",
+                        "soft",
+                        "intr",
+                        "deadtimeout=0",
+                        "mutejukebox",
+                        "noquota",
+                        "noatime",
+                        "acregmin=5",
+                        "acregmax=60",
+                        "acdirmin=15",
+                        "acdirmax=120",
+                    ):
+                        self.assertIn(req_opt, opts)
+                    self.assertNotIn("nobrowse", opts)
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
+    def test_windows_wsl_discovery_mounting_and_path_mapping(self) -> None:
+        """Verify end-to-end Windows WSL / Y: discovery, rclone `--sftp-server-command` preflight,
+        mounting under `~/RemoteComputers/pc/Y` + `WSL -> Y` shortcut, and `load_active_project` mapping."""
+        import subprocess as sp
+        from unittest.mock import patch
+
+        from remote_fleet.config import MachineConfig, load_mounts_registry, save_mounts_registry
+        from remote_fleet.mac_integration import (
+            _decode_windows_cli_bytes,
+            _mount_windows_all_drives,
+            _parse_windows_network_registry_wsl,
+            _parse_wsl_list_verbose,
+            _select_verified_rclone_sftp_flags,
+            discover_windows_wsl_targets,
+        )
+
+        # 1. UTF-16LE decoding (with & without BOM) + UTF-8 + str
+        wsl_raw_text = (
+            "  NAME                   STATE           VERSION\r\n"
+            "* Ubuntu                 Running         2\r\n"
+            "  Debian                 Stopped         2\r\n"
+            "  docker-desktop         Running         2\r\n"
+            "  docker-desktop-data    Stopped         2\r\n"
+            "  rancher-desktop        Stopped         2\r\n"
+            "  podman-machine-default Stopped         2\r\n"
+        )
+        self.assertIn("Ubuntu", _decode_windows_cli_bytes(wsl_raw_text.encode("utf-16-le")))
+        self.assertIn("Ubuntu", _decode_windows_cli_bytes(wsl_raw_text.encode("utf-16")))
+        self.assertIn("Ubuntu", _decode_windows_cli_bytes(wsl_raw_text.encode("utf-8")))
+
+        # 2. `wsl.exe -l -v` parser filters Docker/Rancher/Podman and places default first
+        distros = _parse_wsl_list_verbose(wsl_raw_text)
+        self.assertEqual([d["name"] for d in distros], ["Ubuntu", "Debian"])
+        self.assertTrue(distros[0]["is_default"])
+
+        # 3. `reg.exe query HKCU\Network /s` parser extracts WSL drives and ignores regular SMB shares
+        reg_output = "\n".join(
+            [
+                "HKEY_CURRENT_USER\\Network\\S",
+                "    RemotePath    REG_SZ    \\\\nas-box\\media",
+                "",
+                "HKEY_CURRENT_USER\\Network\\Y",
+                "    RemotePath    REG_SZ    \\\\wsl.localhost\\Ubuntu",
+                "    ProviderName    REG_SZ    Plan 9 Network Provider",
+                "",
+                "HKEY_CURRENT_USER\\Network\\Z",
+                "    RemotePath    REG_SZ    \\\\wsl$\\Ubuntu-24.04\\home\\danli",
+            ]
+        )
+        mapped = _parse_windows_network_registry_wsl(reg_output)
+        self.assertEqual(
+            mapped,
+            [
+                {"drive_letter": "Y", "distro": "Ubuntu", "wsl_root": "/"},
+                {"drive_letter": "Z", "distro": "Ubuntu-24.04", "wsl_root": "/home/danli"},
+            ],
+        )
+
+        # 4. `discover_windows_wsl_targets` merges HKCU\Network + wsl.exe -l -v + sftp-server probe
+        pc = MachineConfig(
+            id="pc",
+            name="Home PC (danlin-hud)",
+            lan_host="192.168.68.70",
+            user="danli",
+            os="windows",
+        )
+        reg_y_only = "HKEY_CURRENT_USER\\Network\\Y\n    RemotePath    REG_SZ    \\\\wsl.localhost\\ubuntu\n"
+
+        def fake_discover_ssh(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[bytes]:
+            remote_arg = cmd[-1]
+            if "reg.exe" in remote_arg:
+                return sp.CompletedProcess(cmd, 0, stdout=reg_y_only.encode("utf-8"), stderr=b"")
+            if "wsl.exe -l -v" in remote_arg:
+                return sp.CompletedProcess(cmd, 0, stdout=wsl_raw_text.encode("utf-16-le"), stderr=b"")
+            if "-d Ubuntu -e ls -1" in remote_arg:
+                return sp.CompletedProcess(
+                    cmd,
+                    2,
+                    stdout=b"/usr/lib/openssh/sftp-server\n",
+                    stderr=b"ls: cannot access '/usr/libexec/openssh/sftp-server': No such file or directory\n",
+                )
+            if "-d Debian -e ls -1" in remote_arg:
+                return sp.CompletedProcess(cmd, 2, stdout=b"", stderr=b"ls: cannot access ...\n")
+            return sp.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+
+        with (
+            patch("remote_fleet.mac_integration.shutil.which", return_value="/usr/bin/ssh"),
+            patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_discover_ssh),
+        ):
+            targets = discover_windows_wsl_targets(pc, "192.168.68.70")
+
+        self.assertEqual([t["mount_name"] for t in targets], ["Y", "WSL-Debian"])
+        # Canonical distro casing from `wsl.exe -l -v` ("Ubuntu") is preserved even when registry had "ubuntu"
+        self.assertEqual(targets[0]["distro"], "Ubuntu")
+        self.assertEqual(targets[0]["drive_letter"], "Y")
+        self.assertEqual(targets[0]["remote_uri"], "wsl://Ubuntu/")
+        self.assertEqual(
+            targets[0]["sftp_server_command"],
+            r"C:\Windows\System32\wsl.exe -d Ubuntu -e /usr/lib/openssh/sftp-server",
+        )
+        self.assertEqual(targets[1]["sftp_server_command"], "")
+        self.assertIn("openssh-sftp-server", targets[1]["probe_error"])
+
+        # 5. Unmapped WSL distro mounts as `WSL`; explicit `wsl_drives` overrides drive letter & subpath
+        def fake_discover_unmapped(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[bytes]:
+            remote_arg = cmd[-1]
+            if "reg.exe" in remote_arg:
+                return sp.CompletedProcess(cmd, 1, stdout=b"", stderr=b"ERROR: The system was unable to find")
+            if "wsl.exe -l -v" in remote_arg:
+                return sp.CompletedProcess(
+                    cmd, 0, stdout="* Ubuntu   Running   2\r\n".encode("utf-16-le"), stderr=b""
+                )
+            if "-d Ubuntu -e ls -1" in remote_arg:
+                return sp.CompletedProcess(cmd, 0, stdout=b"/usr/lib/openssh/sftp-server\n", stderr=b"")
+            return sp.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+
+        with (
+            patch("remote_fleet.mac_integration.shutil.which", return_value="/usr/bin/ssh"),
+            patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_discover_unmapped),
+        ):
+            unmapped_targets = discover_windows_wsl_targets(pc, "192.168.68.70")
+            pc_override = MachineConfig(
+                id="pc",
+                name="Home PC",
+                lan_host="192.168.68.70",
+                user="danli",
+                os="windows",
+                wsl_drives={"Y": "Ubuntu:/home/danli"},
+            )
+            override_targets = discover_windows_wsl_targets(pc_override, "192.168.68.70")
+
+        self.assertEqual([t["mount_name"] for t in unmapped_targets], ["WSL"])
+        self.assertEqual(override_targets[0]["mount_name"], "Y")
+        self.assertEqual(override_targets[0]["wsl_root"], "/home/danli")
+        self.assertEqual(override_targets[0]["remote_uri"], "wsl://Ubuntu/home/danli")
+
+        # 6. `_select_verified_rclone_sftp_flags` with `sftp_server_command` uses native SSH (NEVER `--sftp-ssh` or `--sftp-skip-links`)
+        seen_rclone_cmds: list[list[str]] = []
+
+        def fake_wsl_lsf(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+            seen_rclone_cmds.append(list(cmd))
+            return sp.CompletedProcess(cmd, 0, stdout="home/\netc/\n", stderr="")
+
+        with (
+            patch("remote_fleet.mac_integration._detect_default_ssh_key", return_value="/tmp/id_ed25519"),
+            patch("remote_fleet.mac_integration.subprocess.run", side_effect=fake_wsl_lsf),
+        ):
+            vpath, vflags, verr = _select_verified_rclone_sftp_flags(
+                "/usr/local/bin/rclone",
+                pc,
+                "192.168.68.70",
+                "/",
+                allow_empty_fallback=False,
+                sftp_server_command=targets[0]["sftp_server_command"],
+                treat_as_posix=True,
+            )
+        self.assertEqual(verr, "")
+        self.assertEqual(vpath, "/")
+        assert vflags is not None
+        self.assertIn("--sftp-server-command", vflags)
+        self.assertNotIn("--sftp-ssh", vflags)
+        self.assertNotIn("--sftp-skip-links", vflags)
+
+        # 7. `_mount_windows_all_drives` mounts C, D + WSL Y + creates `WSL -> Y` symlink + maps `load_active_project`
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            pc_container = tmp_path / "RemoteComputers" / "pc"
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                mount_calls: list[dict[str, object]] = []
+
+                def fake_mount_dir(**kwargs: object) -> dict[str, object]:
+                    mount_calls.append(dict(kwargs))
+                    mp = kwargs["mount_point"]
+                    assert isinstance(mp, Path)
+                    mp.mkdir(parents=True, exist_ok=True)
+                    target = str(kwargs["remote_target"])
+                    if target == "C:/":
+                        (mp / "Users" / "danli").mkdir(parents=True, exist_ok=True)
+                    elif target == "wsl://Ubuntu/":
+                        (mp / "home" / "danli" / "ml-job").mkdir(parents=True, exist_ok=True)
+                    reg = load_mounts_registry()
+                    entry = {"machine_id": pc.id, "remote_root": target}
+                    extra = kwargs.get("registry_extra")
+                    if isinstance(extra, dict):
+                        entry.update({str(k): str(v) for k, v in extra.items() if v})
+                    reg[str(mp.resolve())] = entry
+                    save_mounts_registry(reg)
+                    return {"ok": True, "visible_count": 4, "already_mounted": False}
+
+                ping = {
+                    "ok": True,
+                    "os": "windows",
+                    "home": "C:/Users/danli",
+                    "drives": ["C:/", "D:/", "Y:/"],
+                    "wsl_targets": targets,
+                }
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_dir),
+                    patch("remote_fleet.mac_integration.time.sleep", return_value=None),
+                ):
+                    res = _mount_windows_all_drives(
+                        pc, {"transport": "lan", "host": "192.168.68.70"}, "192.168.68.70", ping, pc_container
+                    )
+
+                self.assertTrue(res["ok"], res)
+                # Y: is claimed by WSL so regular Windows drives only mount C:/ and D:/
+                self.assertEqual(res["drives"], ["C:/", "D:/"])
+                self.assertEqual(len(res["wsl_mounts"]), 1)
+                self.assertEqual(res["wsl_mounts"][0]["mount_name"], "Y")
+                self.assertEqual(res["wsl_mounts"][0]["distro"], "Ubuntu")
+                self.assertTrue(res.get("wsl_shortcut_created"))
+                self.assertTrue((pc_container / "WSL").is_symlink())
+                self.assertEqual((pc_container / "WSL").readlink(), Path("Y"))
+                self.assertIn("Y", res["sample_entries"])
+                self.assertIn("WSL", res["sample_entries"])
+                # Missing sftp-server on WSL-Debian produces an actionable warning in failed_drives
+                self.assertTrue(
+                    any("openssh-sftp-server" in msg for msg in res.get("failed_drives") or []),
+                    res.get("failed_drives"),
+                )
+
+                # Mounted path auto-binding maps `pc/Y/...`, `pc/Y`, AND `pc/WSL/...` back to `wsl://Ubuntu/...`!
+                s_sub = load_active_project(cwd=pc_container / "Y" / "home" / "danli" / "ml-job")
+                assert s_sub is not None
+                self.assertEqual((s_sub.machine_id, s_sub.remote_path), ("pc", "wsl://Ubuntu/home/danli/ml-job"))
+
+                s_root = load_active_project(cwd=pc_container / "Y")
+                assert s_root is not None
+                self.assertEqual((s_root.machine_id, s_root.remote_path), ("pc", "wsl://Ubuntu/"))
+
+                s_link = load_active_project(cwd=pc_container / "WSL" / "home" / "danli" / "ml-job")
+                assert s_link is not None
+                self.assertEqual((s_link.machine_id, s_link.remote_path), ("pc", "wsl://Ubuntu/home/danli/ml-job"))
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
 
 
 if __name__ == "__main__":

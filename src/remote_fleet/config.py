@@ -12,10 +12,11 @@ import platform
 import shutil
 import socket
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 WORKSPACE_MARKER_FILENAME = ".remote-fleet.json"
+WSL_URI_PREFIX = "wsl://"
 
 
 @dataclass
@@ -35,9 +36,16 @@ class MachineConfig:
     ssh_extra_args: List[str] = field(default_factory=list)
     hostnames: List[str] = field(default_factory=list)
     description: str = ""
+    wsl_drives: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MachineConfig":
+        raw_wsl = data.get("wsl_drives")
+        wsl_drives = (
+            {str(k).strip().rstrip(":/\\").upper(): str(v).strip() for k, v in raw_wsl.items() if str(k).strip() and str(v).strip()}
+            if isinstance(raw_wsl, dict)
+            else {}
+        )
         return cls(
             id=str(data["id"]).strip(),
             name=str(data.get("name") or data["id"]).strip(),
@@ -52,6 +60,7 @@ class MachineConfig:
             ssh_extra_args=list(data.get("ssh_extra_args") or []),
             hostnames=list(data.get("hostnames") or []),
             description=str(data.get("description") or "").strip(),
+            wsl_drives=wsl_drives,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -76,6 +85,8 @@ class MachineConfig:
             out["hostnames"] = self.hostnames
         if self.description:
             out["description"] = self.description
+        if self.wsl_drives:
+            out["wsl_drives"] = dict(self.wsl_drives)
         return out
 
 
@@ -595,8 +606,171 @@ def save_mounts_registry(mapping: Dict[str, Dict[str, str]]) -> Path:
     return reg_file
 
 
+def parse_wsl_path(raw_path: str) -> Optional[Tuple[str, str]]:
+    """Parse a WSL URI (`wsl://<distro>/...`) or Windows WSL UNC path (`\\\\wsl.localhost\\<distro>\\...` / `\\\\wsl$\\<distro>\\...`).
+
+    Returns `(distro, linux_path)` or `None` if `raw_path` is not a WSL path.
+    """
+    s = (raw_path or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith(WSL_URI_PREFIX):
+        rest = s[len(WSL_URI_PREFIX) :].replace("\\", "/")
+        if not rest:
+            return None
+        if "/" not in rest:
+            return rest, "~"
+        distro, tail = rest.split("/", 1)
+        distro = distro.strip()
+        if not distro:
+            return None
+        if not tail:
+            return distro, "/"
+        if tail == "~" or tail.startswith("~/"):
+            parts = [seg for seg in tail[2:].split("/") if seg]
+            return distro, ("~/" + "/".join(parts)) if parts else "~"
+        parts = [seg for seg in tail.split("/") if seg]
+        return distro, ("/" + "/".join(parts)) if parts else "/"
+
+    norm = s.replace("\\", "/")
+    norm_low = norm.lower()
+    for unc_prefix in ("//wsl.localhost/", "//wsl$/"):
+        if norm_low.startswith(unc_prefix):
+            rest = norm[len(unc_prefix) :]
+            if not rest:
+                return None
+            if "/" not in rest:
+                return rest.strip(), "/"
+            distro, tail = rest.split("/", 1)
+            distro = distro.strip()
+            if not distro:
+                return None
+            parts = [seg for seg in tail.split("/") if seg]
+            return distro, ("/" + "/".join(parts)) if parts else "/"
+    return None
+
+
+def format_wsl_path(distro: str, linux_path: str) -> str:
+    """Format `(distro, linux_path)` into canonical `wsl://<distro>/...` URI form."""
+    d = distro.strip()
+    p = (linux_path or "/").strip().replace("\\", "/")
+    if p == "~" or p.startswith("~/"):
+        return f"{WSL_URI_PREFIX}{d}/{p}"
+    if not p.startswith("/"):
+        p = "/" + p
+    return f"{WSL_URI_PREFIX}{d}{p}"
+
+
+def _parse_wsl_drive_spec(spec: str) -> Tuple[str, str]:
+    """Parse a config `wsl_drives` value like `'Ubuntu'`, `'Ubuntu:/home/danli'`, `'wsl://Ubuntu/home/danli'`,
+    or `'\\\\wsl.localhost\\Ubuntu'` into `(distro, wsl_root)`."""
+    parsed = parse_wsl_path(spec)
+    if parsed:
+        distro, sub = parsed
+        sub_clean = "/" if sub == "~" else ("/" + sub.lstrip("/") if not sub.startswith("/") else sub)
+        return distro, sub_clean
+    s = spec.strip().replace("\\", "/")
+    if ":" in s:
+        distro, sub = s.split(":", 1)
+        sub_clean = "/" + sub.strip().lstrip("/") if sub.strip() else "/"
+        return distro.strip(), sub_clean
+    if "/" in s:
+        distro, sub = s.split("/", 1)
+        sub_clean = "/" + sub.strip().lstrip("/") if sub.strip() else "/"
+        return distro.strip(), sub_clean
+    return s, "/"
+
+
+def get_registered_wsl_mounts(
+    machine_id: str,
+    wsl_drives: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, str]]:
+    """Return WSL mount descriptors for `machine_id` from `mounts.json` and optional `MachineConfig.wsl_drives`."""
+    found: List[Dict[str, str]] = []
+    seen_keys: Set[Tuple[str, str, str]] = set()
+    reg = load_mounts_registry()
+    for local_mp, info in sorted(reg.items()):
+        if str(info.get("machine_id") or "") != machine_id or info.get("container_only") == "1":
+            continue
+        distro = str(info.get("wsl_distro") or "").strip()
+        wsl_root = str(info.get("wsl_root") or "").strip()
+        win_drv = str(info.get("windows_drive") or "").strip().upper()
+        if not distro:
+            parsed = parse_wsl_path(str(info.get("remote_root") or ""))
+            if parsed:
+                distro, wsl_root = parsed
+        if not distro:
+            continue
+        if not wsl_root:
+            wsl_root = "/"
+        key = (win_drv, distro.lower(), wsl_root)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        found.append(
+            {
+                "distro": distro,
+                "wsl_root": wsl_root,
+                "windows_drive": win_drv,
+                "local_path": local_mp,
+                "remote_root": format_wsl_path(distro, wsl_root),
+            }
+        )
+
+    if wsl_drives:
+        for raw_letter, spec in sorted(wsl_drives.items()):
+            letter = raw_letter.strip().rstrip(":/\\").upper()
+            if len(letter) != 1 or not letter.isalpha():
+                continue
+            distro, wsl_root = _parse_wsl_drive_spec(spec)
+            if not distro:
+                continue
+            win_drv = f"{letter}:"
+            key = (win_drv, distro.lower(), wsl_root)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            found.append(
+                {
+                    "distro": distro,
+                    "wsl_root": wsl_root,
+                    "windows_drive": win_drv,
+                    "local_path": "",
+                    "remote_root": format_wsl_path(distro, wsl_root),
+                }
+            )
+    return found
+
+
+def resolve_windows_wsl_drive_alias(
+    machine_id: str,
+    raw_path: str,
+    wsl_drives: Optional[Dict[str, str]] = None,
+) -> Optional[Tuple[str, str]]:
+    """If `raw_path` uses a Windows drive letter mapped to WSL (e.g. `Y:/home/danli/proj`),
+    resolve it to `(distro, linux_path)`."""
+    s = (raw_path or "").strip()
+    if len(s) < 2 or not s[0].isalpha() or s[1] != ":":
+        return None
+    if len(s) > 2 and s[2] not in ("/", "\\"):
+        return None
+    target_drive = f"{s[0].upper()}:"
+    sub_rel = s[2:].replace("\\", "/").lstrip("/")
+
+    for item in get_registered_wsl_mounts(machine_id, wsl_drives=wsl_drives):
+        if item.get("windows_drive", "").upper() == target_drive:
+            distro = item["distro"]
+            base_root = item.get("wsl_root") or "/"
+            trimmed = base_root.rstrip("/")
+            if not sub_rel:
+                return distro, base_root if base_root else "/"
+            return distro, f"/{sub_rel}" if trimmed == "" else f"{trimmed}/{sub_rel}"
+    return None
+
+
 def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[ActiveProjectState]:
-    """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/pc/D/foo`), map it back."""
+    """If `start_dir` lies inside a mounted machine root (e.g. `~/RemoteComputers/pc/D/foo` or `~/RemoteComputers/pc/Y/home/danli`), map it back."""
     try:
         cur = (start_dir or Path.cwd()).resolve()
     except OSError:
@@ -623,7 +797,8 @@ def detect_mounted_machine_path(start_dir: Optional[Path] = None) -> Optional[Ac
             continue
         if rel_posix in ("", "."):
             is_win_drive = len(trimmed_root) == 2 and trimmed_root[0].isalpha() and trimmed_root[1] == ":"
-            if is_win_drive or raw_remote_root == "/":
+            is_wsl_root_slash = raw_remote_root.lower().startswith(WSL_URI_PREFIX) and raw_remote_root.endswith("/")
+            if is_win_drive or raw_remote_root == "/" or is_wsl_root_slash:
                 remote_path = f"{trimmed_root}/"
             else:
                 remote_path = trimmed_root

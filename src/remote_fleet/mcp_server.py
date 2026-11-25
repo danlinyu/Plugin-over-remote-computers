@@ -14,10 +14,14 @@ from remote_fleet.config import (
     ActiveProjectState,
     FleetConfig,
     MachineConfig,
+    WSL_URI_PREFIX,
+    format_wsl_path,
     get_config_path,
     load_active_project,
     load_fleet_config,
     load_mounts_registry,
+    parse_wsl_path,
+    resolve_windows_wsl_drive_alias,
     save_active_project,
 )
 from remote_fleet.mount import compute_local_workspace_dir, prepare_local_workspace, sync_workspace
@@ -30,12 +34,14 @@ SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 SERVER_INSTRUCTIONS = (
     "Remote Fleet lets the user run this harness smoothly on their local interface machine (e.g., Mac Mini) "
     "while picking a folder, keeping all project files/changes/datasets, and running computations on any "
-    "computer across their Home LAN or Tailscale (e.g., PC, DGX Sparks such as spark01/spark03/spark04, Mac Mini). "
+    "computer across their Home LAN or Tailscale (e.g., PC — including its Windows WSL mounts such as "
+    "~/RemoteComputers/pc/Y/... or wsl://<distro>/... — DGX Sparks such as spark01/spark03/spark04, Mac Mini). "
     "When starting a new project, call `fleet_list_machines(probe=true, include_load=true)` and `fleet_browse_folders`, "
     "then `fleet_select_project` (or `fleet_create_project`). Once a remote project is selected, ALWAYS use "
     "`fleet_read_file`, `fleet_write_file`, `fleet_edit_file`, `fleet_list_files`, `fleet_search_files`, "
     "`fleet_run_command`, and `fleet_start_job` (for heavy/long calculations) so all changes and compute "
-    "happen on the target computer without slowing down the local interface machine."
+    "happen on the target computer (or directly inside its WSL distro when working in a WSL folder) without "
+    "slowing down the local interface machine."
 )
 
 
@@ -490,10 +496,33 @@ class RemoteFleetMCPServer:
         cwd = cwd_raw.strip()
         if not cwd:
             return base
-        if cwd.startswith(("/", "~", "\\")) or (len(cwd) >= 2 and cwd[0].isalpha() and cwd[1] == ":"):
+        if (
+            cwd.lower().startswith(WSL_URI_PREFIX)
+            or cwd.startswith("\\\\")
+            or (len(cwd) >= 2 and cwd[0].isalpha() and cwd[1] == ":")
+        ):
+            return cwd
+        base_wsl = parse_wsl_path(base)
+        if base_wsl is not None:
+            distro, _ = base_wsl
+            if cwd.startswith(("/", "~")):
+                return format_wsl_path(distro, cwd)
+            trimmed = base.rstrip("/\\")
+            return f"{trimmed}/{cwd}"
+        if cwd.startswith(("/", "~", "\\")):
             return cwd
         trimmed = base.rstrip("/\\")
         return f"{trimmed}/{cwd}"
+
+    @staticmethod
+    def _active_wsl_distro(machine: MachineConfig, base: str) -> Optional[str]:
+        if machine.os != "windows":
+            return None
+        parsed = parse_wsl_path(base)
+        if parsed is not None:
+            return parsed[0]
+        aliased = resolve_windows_wsl_drive_alias(machine.id, base, wsl_drives=machine.wsl_drives)
+        return aliased[0] if aliased is not None else None
 
     def _resolve_machine_and_base(
         self, machine_arg: Optional[str] = None
@@ -816,31 +845,37 @@ class RemoteFleetMCPServer:
             return self._tool_result(res, is_error=not res.get("ok", False))
 
         if name == "fleet_job_status":
-            m, _, err = self._resolve_machine_and_base(args.get("machine"))
+            m, base, err = self._resolve_machine_and_base(args.get("machine"))
             if err or not m:
                 return self._tool_result(err, is_error=True)
+            wsl_distro = self._active_wsl_distro(m, base)
             job_id = str(args.get("job_id") or "").strip()
             if not job_id:
-                res = self.transport.run_worker_op(m, {"op": "list_jobs"})
+                req_jobs: Dict[str, Any] = {"op": "list_jobs"}
+                if wsl_distro:
+                    req_jobs["wsl_distro"] = wsl_distro
+                res = self.transport.run_worker_op(m, req_jobs)
             else:
-                res = self.transport.run_worker_op(
-                    m,
-                    {
-                        "op": "job_status",
-                        "job_id": job_id,
-                        "tail_lines": int(args.get("tail_lines", 60)),
-                    },
-                )
+                req_status: Dict[str, Any] = {
+                    "op": "job_status",
+                    "job_id": job_id,
+                    "tail_lines": int(args.get("tail_lines", 60)),
+                }
+                if wsl_distro and not job_id.startswith("job-"):
+                    req_status["wsl_distro"] = wsl_distro
+                res = self.transport.run_worker_op(m, req_status)
             return self._tool_result(res, is_error=not res.get("ok", False))
 
         if name == "fleet_stop_job":
-            m, _, err = self._resolve_machine_and_base(args.get("machine"))
+            m, base, err = self._resolve_machine_and_base(args.get("machine"))
             if err or not m:
                 return self._tool_result(err, is_error=True)
-            res = self.transport.run_worker_op(
-                m,
-                {"op": "stop_job", "job_id": str(args["job_id"])},
-            )
+            job_id = str(args["job_id"]).strip()
+            wsl_distro = self._active_wsl_distro(m, base)
+            req_stop: Dict[str, Any] = {"op": "stop_job", "job_id": job_id}
+            if wsl_distro and not job_id.startswith("job-"):
+                req_stop["wsl_distro"] = wsl_distro
+            res = self.transport.run_worker_op(m, req_stop)
             return self._tool_result(res, is_error=not res.get("ok", False))
 
         return self._tool_result(f"Unknown tool: {name}", is_error=True)

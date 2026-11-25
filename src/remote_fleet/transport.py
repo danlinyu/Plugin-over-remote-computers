@@ -18,14 +18,19 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 from remote_fleet.config import (
     FleetConfig,
     MachineConfig,
     TailscaleNodeInfo,
+    format_wsl_path,
+    get_registered_wsl_mounts,
     is_local_tailscale_running,
     is_self_machine,
     is_tailscale_only_host,
+    parse_wsl_path,
+    resolve_windows_wsl_drive_alias,
 )
 
 
@@ -988,6 +993,92 @@ class FleetTransport:
         }
     )
 
+    @staticmethod
+    def _resolve_wsl_path_for_machine(
+        machine: MachineConfig, raw_path: str
+    ) -> Optional[Tuple[str, str]]:
+        """Resolve `wsl://...`, `\\\\wsl.localhost\\...`, or a registered WSL drive (`Y:/...`) to `(distro, linux_path)`."""
+        if not raw_path:
+            return None
+        parsed = parse_wsl_path(raw_path)
+        if parsed is not None:
+            return parsed
+        if machine.os == "windows":
+            return resolve_windows_wsl_drive_alias(
+                machine.id, raw_path, wsl_drives=machine.wsl_drives
+            )
+        return None
+
+    @classmethod
+    def _extract_wsl_worker_request(
+        cls, machine: MachineConfig, req: Dict[str, Any]
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """If `req` targets WSL on a Windows machine, strip WSL prefixes and return `(distro, linux_req)`."""
+        if machine.os != "windows":
+            return None, req
+
+        distro: Optional[str] = None
+        explicit = str(req.get("wsl_distro") or "").strip()
+        if explicit:
+            distro = explicit
+
+        job_id = str(req.get("job_id") or "").strip()
+        jm = re.match(r"^wsl__(.+?)__job-", job_id)
+        if jm:
+            distro = jm.group(1)
+
+        rewritten = dict(req)
+        path_parsed: Dict[str, Tuple[str, str]] = {}
+        for key in ("path", "base_dir", "cwd"):
+            val = req.get(key)
+            if isinstance(val, str) and val.strip():
+                hit = cls._resolve_wsl_path_for_machine(machine, val)
+                if hit is not None:
+                    path_parsed[key] = hit
+                    if not distro:
+                        distro = hit[0]
+
+        if not distro:
+            return None, req
+
+        rewritten.pop("wsl_distro", None)
+        for key, (d_name, l_path) in path_parsed.items():
+            if d_name.lower() == distro.lower():
+                rewritten[key] = l_path
+
+        # If `path` is an absolute WSL path while `base_dir` was a Windows path, normalize `base_dir` to `~`
+        if "path" in path_parsed and "base_dir" in rewritten and "base_dir" not in path_parsed:
+            bd = str(rewritten.get("base_dir") or "")
+            if len(bd) >= 2 and bd[0].isalpha() and bd[1] == ":":
+                rewritten["base_dir"] = "~"
+
+        if rewritten.get("op") == "browse_folders":
+            rewritten["default_roots"] = ["~/projects", "~"]
+        elif rewritten.get("op") == "start_job" and not rewritten.get("job_id"):
+            rewritten["job_id"] = f"wsl__{distro}__job-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+        return distro, rewritten
+
+    @staticmethod
+    def _annotate_wsl_worker_result(res: Dict[str, Any], distro: str) -> Dict[str, Any]:
+        """Prefix returned POSIX paths from a WSL worker op with `wsl://<distro>` so callers round-trip cleanly."""
+        res["wsl_distro"] = distro
+        for key in ("path", "root", "cwd", "parent", "requested_path"):
+            val = res.get(key)
+            if isinstance(val, str) and val.startswith("/"):
+                res[key] = format_wsl_path(distro, val)
+        dirs = res.get("directories")
+        if isinstance(dirs, list):
+            for entry in dirs:
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"].startswith("/"):
+                    entry["path"] = format_wsl_path(distro, entry["path"])
+        roots = res.get("roots")
+        if isinstance(roots, list):
+            for entry in roots:
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str) and entry["path"].startswith("/"):
+                    entry["path"] = format_wsl_path(distro, entry["path"])
+        return res
+
     def _exec_worker_on_endpoint(
         self,
         machine: MachineConfig,
@@ -996,10 +1087,13 @@ class FleetTransport:
         timeout_sec: int,
     ) -> Dict[str, Any]:
         """Run a worker request against a single resolved endpoint `ep`."""
-        is_win_fast_ping = machine.os == "windows" and req.get("op") == "ping"
-        envelope = "" if is_win_fast_ping else (json.dumps({"code": REMOTE_WORKER_SOURCE, "req": req}) + "\n")
+        wsl_distro, effective_req = self._extract_wsl_worker_request(machine, req)
+        is_win_fast_ping = machine.os == "windows" and not wsl_distro and effective_req.get("op") == "ping"
+        envelope = "" if is_win_fast_ping else (json.dumps({"code": REMOTE_WORKER_SOURCE, "req": effective_req}) + "\n")
 
-        if is_win_fast_ping:
+        if wsl_distro:
+            remote_py_cmd = self._build_windows_wsl_worker_cmd(wsl_distro, timeout_sec=timeout_sec)
+        elif is_win_fast_ping:
             remote_py_cmd = self._build_windows_fast_ping_cmd(timeout_sec=timeout_sec)
         elif machine.os == "windows":
             remote_py_cmd = self._build_windows_worker_cmd(timeout_sec=timeout_sec)
@@ -1091,6 +1185,21 @@ class FleetTransport:
         last_line = stdout.splitlines()[-1] if stdout else ""
         try:
             parsed = json.loads(last_line)
+            if wsl_distro:
+                self._annotate_wsl_worker_result(parsed, wsl_distro)
+            elif (
+                machine.os == "windows"
+                and effective_req.get("op") == "browse_folders"
+                and isinstance(parsed.get("roots"), list)
+            ):
+                existing_paths = {str(r.get("path") or "") for r in parsed["roots"] if isinstance(r, dict)}
+                for wm in get_registered_wsl_mounts(machine.id, wsl_drives=machine.wsl_drives):
+                    wpath = wm["remote_root"]
+                    if wpath not in existing_paths:
+                        win_drv = wm.get("windows_drive")
+                        lbl = f"{win_drv} (WSL {wm['distro']})" if win_drv else f"WSL ({wm['distro']})"
+                        parsed["roots"].append({"label": lbl, "path": wpath, "exists": True})
+                        existing_paths.add(wpath)
             parsed["endpoint"] = ep.to_dict()
             return parsed
         except json.JSONDecodeError:
@@ -1239,6 +1348,124 @@ class FleetTransport:
         )
         return cls._encode_windows_powershell(ps_script)
 
+    @classmethod
+    def _build_windows_wsl_worker_cmd(cls, distro: str, timeout_sec: int = 30) -> str:
+        """Build a watchdog-guarded Windows PowerShell launcher that streams the single-line JSON worker
+        payload directly into `wsl.exe -d <distro>`'s Python 3 interpreter (zero quoting hazards)."""
+        wd_sec = max(5, int(timeout_sec) + 5)
+        esc_distro = distro.replace("'", "''")
+        err_json = json.dumps(
+            {"ok": False, "error": f"Python 3 not found inside WSL distro '{distro}'."}
+        )
+        inner_sh = (
+            "PY=$(command -v python3 || command -v python)\n"
+            'if [ -z "$PY" ]; then\n'
+            f"  printf '%s\\n' {shlex.quote(err_json)}\n"
+            "  exit 0\n"
+            "fi\n"
+            "PY_SNIP='import json,sys; d=json.loads(sys.stdin.readline()); ns={}; exec(d[\"code\"], ns); print(json.dumps(ns[\"handle\"](d[\"req\"])))'\n"
+            "if command -v timeout >/dev/null 2>&1; then\n"
+            f'  timeout -k 5 {wd_sec} "$PY" -c "$PY_SNIP"\n'
+            "else\n"
+            '  "$PY" -c "$PY_SNIP"\n'
+            "fi\n"
+        )
+        b64_sh = base64.b64encode(inner_sh.encode("utf-8")).decode("ascii")
+        # Zero single/double quotes so Windows PowerShell 5.1 / cmd.exe pass `-c` verbatim to wsl.exe
+        sh_trampoline = (
+            f"_t=$(mktemp) && printf %s {b64_sh} | base64 -d > $_t && /bin/sh $_t; "
+            "_r=$?; rm -f $_t; exit $_r"
+        )
+        ps_script = (
+            cls._windows_watchdog_prefix(timeout_sec)
+            + "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            + "$raw = [Console]::In.ReadLine()\n"
+            + f"if (-not $raw) {{ {cls._WINDOWS_WD_STOP}; exit 1 }}\n"
+            + f"$raw | & 'C:\\Windows\\System32\\wsl.exe' -d '{esc_distro}' -e /bin/sh -c '{sh_trampoline}'\n"
+            + "$__rc = $LASTEXITCODE\n"
+            + f"{cls._WINDOWS_WD_STOP}\n"
+            + "exit $__rc\n"
+        )
+        return cls._encode_windows_powershell(ps_script)
+
+    @staticmethod
+    def _build_posix_remote_command(
+        command: str,
+        cwd: str,
+        timeout_sec: int,
+        env: Optional[Dict[str, str]] = None,
+        extra_path_entries: Optional[List[str]] = None,
+    ) -> str:
+        env_prefix = ""
+        if env:
+            exports = [
+                f"export {k}={shlex.quote(str(v))}"
+                for k, v in env.items()
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(k))
+            ]
+            if exports:
+                env_prefix = "; ".join(exports) + "; "
+        if cwd in ("", "~"):
+            cd_expr = "cd ~"
+        elif cwd.startswith("~/"):
+            cd_expr = f"cd ~/{shlex.quote(cwd[2:])}"
+        else:
+            cd_expr = f"cd {shlex.quote(cwd)}"
+        path_parts = [
+            "$HOME/.local/bin",
+            "$HOME/.cargo/bin",
+            *(extra_path_entries or []),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "$PATH",
+        ]
+        path_init = f'export PATH="{":".join(path_parts)}"; '
+        inner_cmd = f"{path_init}{cd_expr} && {{ {env_prefix}{command}; }}"
+        wd_sec = max(5, int(timeout_sec) + 5)
+        return (
+            f"if command -v timeout >/dev/null 2>&1; then "
+            f"_RF_SH=$(command -v bash || echo /bin/sh); "
+            f"timeout -k 5 {wd_sec} \"$_RF_SH\" -c {shlex.quote(inner_cmd)}; "
+            f"else {inner_cmd}; fi"
+        )
+
+    @classmethod
+    def _build_windows_wsl_bash_cmd(
+        cls,
+        distro: str,
+        command: str,
+        linux_cwd: str,
+        timeout_sec: int = 120,
+        env: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Execute a Linux shell command directly inside `wsl.exe -d <distro>` with both Windows and Linux watchdogs."""
+        esc_distro = distro.replace("'", "''")
+        posix_script = cls._build_posix_remote_command(
+            command=command,
+            cwd=linux_cwd,
+            timeout_sec=timeout_sec,
+            env=env,
+            extra_path_entries=[
+                "$HOME/miniconda3/bin",
+                "$HOME/miniforge3/bin",
+                "$HOME/anaconda3/bin",
+            ],
+        )
+        b64_sh = base64.b64encode((posix_script + "\n").encode("utf-8")).decode("ascii")
+        sh_trampoline = (
+            f"_t=$(mktemp) && printf %s {b64_sh} | base64 -d > $_t && /bin/sh $_t </dev/null; "
+            "_r=$?; rm -f $_t; exit $_r"
+        )
+        ps_script = (
+            cls._windows_watchdog_prefix(timeout_sec)
+            + "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+            + f"& 'C:\\Windows\\System32\\wsl.exe' -d '{esc_distro}' -e /bin/sh -c '{sh_trampoline}'\n"
+            + "$__rc = $LASTEXITCODE\n"
+            + f"{cls._WINDOWS_WD_STOP}\n"
+            + "exit $__rc\n"
+        )
+        return cls._encode_windows_powershell(ps_script)
+
     def run_command(
         self,
         machine: MachineConfig,
@@ -1303,7 +1530,18 @@ class FleetTransport:
                 "endpoint": ep.to_dict(),
             }
 
-        if machine.os == "windows":
+        wsl_cwd = self._resolve_wsl_path_for_machine(machine, cwd) if machine.os == "windows" else None
+        effective_cwd = format_wsl_path(wsl_cwd[0], wsl_cwd[1]) if wsl_cwd else cwd
+
+        if wsl_cwd is not None:
+            remote_cmd = self._build_windows_wsl_bash_cmd(
+                distro=wsl_cwd[0],
+                command=command,
+                linux_cwd=wsl_cwd[1],
+                timeout_sec=timeout_sec,
+                env=env,
+            )
+        elif machine.os == "windows":
             env_lines = [
                 self._windows_watchdog_prefix(timeout_sec).rstrip("\n"),
                 "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
@@ -1332,30 +1570,11 @@ class FleetTransport:
             ps_script = "\n".join([*env_lines, cd_line, cd_check, "$global:LASTEXITCODE = $null", command, *footer_lines])
             remote_cmd = self._encode_windows_powershell(ps_script)
         else:
-            env_prefix = ""
-            if env:
-                exports = [
-                    f"export {k}={shlex.quote(str(v))}"
-                    for k, v in env.items()
-                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(k))
-                ]
-                if exports:
-                    env_prefix = "; ".join(exports) + "; "
-            if cwd in ("", "~"):
-                cd_expr = "cd ~"
-            elif cwd.startswith("~/"):
-                cd_expr = f"cd ~/{shlex.quote(cwd[2:])}"
-            else:
-                cd_expr = f"cd {shlex.quote(cwd)}"
-            # Load common user PATH locations (/opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin) for non-login SSH shells
-            path_init = 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
-            inner_cmd = f"{path_init}{cd_expr} && {{ {env_prefix}{command}; }}"
-            wd_sec = max(5, int(timeout_sec) + 5)
-            remote_cmd = (
-                f"if command -v timeout >/dev/null 2>&1; then "
-                f"_RF_SH=$(command -v bash || echo /bin/sh); "
-                f"timeout -k 5 {wd_sec} \"$_RF_SH\" -c {shlex.quote(inner_cmd)}; "
-                f"else {inner_cmd}; fi"
+            remote_cmd = self._build_posix_remote_command(
+                command=command,
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+                env=env,
             )
 
         ssh_cmd = [*self.build_ssh_args(machine, ep.host), remote_cmd]
@@ -1369,22 +1588,25 @@ class FleetTransport:
                 check=False,
             )
             elapsed_ms = (time.monotonic() - start) * 1000.0
-            return {
+            out_dict: Dict[str, Any] = {
                 "ok": proc.returncode == 0,
                 "exit_code": proc.returncode,
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
-                "cwd": cwd,
+                "cwd": effective_cwd,
                 "duration_ms": round(elapsed_ms, 1),
                 "endpoint": ep.to_dict(),
             }
+            if wsl_cwd is not None:
+                out_dict["wsl_distro"] = wsl_cwd[0]
+            return out_dict
         except subprocess.TimeoutExpired as exc:
             return {
                 "ok": False,
                 "exit_code": -1,
                 "stdout": (exc.stdout or "") if isinstance(exc.stdout, str) else "",
                 "stderr": f"Remote command timed out after {timeout_sec}s on '{machine.id}'",
-                "cwd": cwd,
+                "cwd": effective_cwd,
                 "endpoint": ep.to_dict(),
             }
         except OSError as exc:
@@ -1393,6 +1615,6 @@ class FleetTransport:
                 "exit_code": -1,
                 "stdout": "",
                 "stderr": f"Failed to execute SSH command on '{machine.id}': {exc}",
-                "cwd": cwd,
+                "cwd": effective_cwd,
                 "endpoint": ep.to_dict(),
             }

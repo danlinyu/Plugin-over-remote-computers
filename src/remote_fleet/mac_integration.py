@@ -29,10 +29,13 @@ from remote_fleet.config import (
     FleetConfig,
     MachineConfig,
     TailscaleNodeInfo,
+    _parse_wsl_drive_spec,
+    format_wsl_path,
     is_local_tailscale_running,
     is_self_machine,
     is_tailscale_only_host,
     load_mounts_registry,
+    parse_wsl_path,
     save_mounts_registry,
 )
 from remote_fleet.mount import (
@@ -193,13 +196,21 @@ def _detect_default_ssh_key(machine: MachineConfig) -> Optional[str]:
 
 
 def build_rclone_sftp_ssh_command(machine: MachineConfig, host: str) -> str:
-    """Build `--sftp-ssh` string so rclone uses `/usr/bin/ssh` directly."""
+    """Build `--sftp-ssh` string so rclone uses `/usr/bin/ssh` directly with keepalives."""
     parts = [
         shutil.which("ssh") or "/usr/bin/ssh",
         "-o",
         "BatchMode=yes",
         "-o",
+        "ConnectTimeout=5",
+        "-o",
         "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "TCPKeepAlive=yes",
     ]
     if machine.port and machine.port != 22:
         parts.extend(["-p", str(machine.port)])
@@ -230,16 +241,39 @@ def _rclone_supports_flag(rclone_bin: str, flag: str) -> bool:
     return flag in _RCLONE_FLAGS_CACHE[rclone_bin]
 
 
+def _ensure_spotlight_never_index(directory: Path) -> None:
+    """Drop an empty `.metadata_never_index` marker inside a local APFS container folder on macOS.
+
+    Stops Spotlight (`mds`/`mdworker`) from crawling remote NFS mounts under `~/RemoteComputers/`
+    (especially when symlinked onto an external SSD such as `/Volumes/X10 Pro/...`), which otherwise
+    wakes parked Windows HDDs and triggers spurious macOS 'Server connections interrupted' alerts.
+    Never writes into an already-mounted NFS filesystem.
+    """
+    if platform.system().lower() != "darwin":
+        return
+    if is_mounted(directory) or not directory.is_dir():
+        return
+    marker = directory / ".metadata_never_index"
+    if not marker.exists():
+        try:
+            marker.touch(exist_ok=True)
+        except OSError:
+            pass
+
+
 def _cleanup_unmounted_empty_dir(mount_point: Path) -> None:
-    """Remove an unmounted folder that only contains `.DS_Store` or nothing so Finder never shows dead empty folders."""
+    """Remove an unmounted folder that only contains `.DS_Store`/`.metadata_never_index` or nothing
+    so Finder never shows dead empty folders."""
     if is_mounted(mount_point) or not mount_point.is_dir():
         return
+    ignorable = {".DS_Store", ".metadata_never_index"}
     try:
-        items = [p for p in mount_point.iterdir() if p.name != ".DS_Store"]
+        items = [p for p in mount_point.iterdir() if p.name not in ignorable]
         if not items:
-            ds = mount_point / ".DS_Store"
-            if ds.is_file():
-                ds.unlink()
+            for meta_name in ignorable:
+                mf = mount_point / meta_name
+                if mf.is_file():
+                    mf.unlink()
             mount_point.rmdir()
     except OSError:
         pass
@@ -251,6 +285,8 @@ def _select_verified_rclone_sftp_flags(
     host: str,
     rclone_path: str,
     allow_empty_fallback: bool = True,
+    sftp_server_command: str = "",
+    treat_as_posix: bool = False,
 ) -> Tuple[str, Optional[List[str]], str]:
     """Run a fast `rclone lsf --max-depth 1` preflight to pick working SFTP path & flags before mounting."""
     flag_candidates: List[Tuple[str, List[str]]] = []
@@ -262,9 +298,13 @@ def _select_verified_rclone_sftp_flags(
         "--sftp-sha1sum-command",
         "none",
     ]
-    if machine.os == "windows":
+    if machine.os == "windows" and not treat_as_posix:
         # Skip legacy NTFS junction traps in C:\Users\<user> and C:\ (Cookies, My Documents, Documents and Settings, etc.)
         common_sftp_opts.append("--sftp-skip-links")
+    if sftp_server_command:
+        # Official rclone `--sftp-server-command` launches a custom SFTP server over SSH (e.g. WSL's native Linux sftp-server).
+        # Note: rclone ignores `--sftp-server-command` whenever `--sftp-ssh` is set, so we strictly use rclone's native SSH client.
+        common_sftp_opts.extend(["--sftp-server-command", sftp_server_command])
 
     key_path = _detect_default_ssh_key(machine)
     if key_path:
@@ -281,16 +321,29 @@ def _select_verified_rclone_sftp_flags(
             native_flags.extend(["--sftp-user", machine.user])
         flag_candidates.append(("native-key", native_flags))
 
-    ssh_ext = build_rclone_sftp_ssh_command(machine, host)
-    ext_flags = [
-        "--sftp-ssh",
-        ssh_ext,
-        *common_sftp_opts,
-    ]
-    flag_candidates.append(("external-ssh", ext_flags))
+    if sftp_server_command:
+        agent_flags = [
+            "--sftp-host",
+            host,
+            "--sftp-port",
+            str(machine.port or 22),
+            "--sftp-key-use-agent",
+            *common_sftp_opts,
+        ]
+        if machine.user:
+            agent_flags.extend(["--sftp-user", machine.user])
+        flag_candidates.append(("native-agent", agent_flags))
+    else:
+        ssh_ext = build_rclone_sftp_ssh_command(machine, host)
+        ext_flags = [
+            "--sftp-ssh",
+            ssh_ext,
+            *common_sftp_opts,
+        ]
+        flag_candidates.append(("external-ssh", ext_flags))
 
     raw_paths: List[str] = []
-    if machine.os == "windows":
+    if machine.os == "windows" and not treat_as_posix:
         drv_match = re.match(r"^/?([A-Za-z]):/?$", rclone_path.strip())
         if drv_match and not allow_empty_fallback:
             letter = drv_match.group(1).upper()
@@ -307,6 +360,7 @@ def _select_verified_rclone_sftp_flags(
         if allow_empty_fallback and "" not in raw_paths:
             raw_paths.append("")
 
+    preflight_timeout = 15 if sftp_server_command else 10
     errors: List[str] = []
     for cand_path in raw_paths:
         for label, flags in flag_candidates:
@@ -319,7 +373,7 @@ def _select_verified_rclone_sftp_flags(
                 "1",
             ]
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=preflight_timeout, check=False)
             except (subprocess.TimeoutExpired, OSError) as exc:
                 errors.append(f"{label}({cand_path or '.'}): {exc}")
                 continue
@@ -355,7 +409,10 @@ def _wait_tcp_ready(port: int, proc: subprocess.Popen[Any], timeout_sec: float =
     return False
 
 
-DAEMON_SCHEMA_VERSION = 2
+# Schema v3: IPv4 127.0.0.1:/ + vers=3,proto=tcp,deadtimeout=0,mutejukebox,noquota,noatime,acreg*/acdir*,
+# tighter `--sftp-idle-timeout 5m` (prevents stale idle TCP sockets), longer `--dir-cache-time` (prevents
+# waking parked HDDs), and Spotlight `.metadata_never_index` containers.
+DAEMON_SCHEMA_VERSION = 3
 
 
 def _probe_mount_health(
@@ -511,16 +568,27 @@ def _mount_sftp_directory(
     log_stem: str,
     allow_empty_fallback: bool = True,
     preverified_sftp: Optional[Tuple[str, List[str]]] = None,
+    sftp_server_command: str = "",
+    treat_as_posix: bool = False,
+    rclone_remote_path: Optional[str] = None,
+    registry_extra: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Mount a single remote folder or drive (`remote_target`) onto `mount_point` with soft-NFS self-healing."""
+    """Mount a single remote folder, Windows drive, or WSL root (`remote_target`) onto `mount_point`
+    with hardened macOS soft-NFS options and self-healing."""
     _ = vol_label
     mount_point = safe_lexical_resolve(mount_point)
+
+    reg_entry: Dict[str, str] = {"machine_id": machine.id, "remote_root": remote_target}
+    if registry_extra:
+        for rk, rv in registry_extra.items():
+            if rv:
+                reg_entry[str(rk)] = str(rv)
 
     health = _probe_mount_health(mount_point, log_stem, timeout_sec=12.0, expected_host=host)
     if health == "healthy":
         visible = _safe_sample_entries(mount_point, timeout_sec=2.5)
         reg = load_mounts_registry()
-        reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+        reg[str(mount_point)] = dict(reg_entry)
         save_mounts_registry(reg)
         return {
             "ok": True,
@@ -559,21 +627,24 @@ def _mount_sftp_directory(
             "permission_denied": is_perm,
             "error": f"Cannot access mount folder {mount_point}: {exc}",
         }
-    try:
-        (mount_point / ".DS_Store").unlink(missing_ok=True)
-    except OSError:
-        pass
+    for junk_name in (".DS_Store", ".metadata_never_index"):
+        try:
+            (mount_point / junk_name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     cache_root = Path.home() / ".cache" / "remote-fleet"
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. macOS preferred path: `rclone serve nfs` on loopback + `/sbin/mount -t nfs` with soft,intr,nolocks,locallocks,nfc
+    effective_rclone_path = rclone_remote_path if rclone_remote_path is not None else remote_target
+    initial_rclone_path = (
+        f"/{effective_rclone_path}"
+        if (not treat_as_posix and len(effective_rclone_path) >= 2 and effective_rclone_path[1] == ":")
+        else effective_rclone_path
+    )
+
+    # 1. macOS preferred path: `rclone serve nfs` on IPv4 loopback + hardened `/sbin/mount -t nfs`
     if rclone_bin and is_macos and os.path.exists("/sbin/mount"):
-        initial_rclone_path = (
-            f"/{remote_target}"
-            if (len(remote_target) >= 2 and remote_target[1] == ":")
-            else remote_target
-        )
         if preverified_sftp is not None:
             verified_rclone_path, sftp_flags = preverified_sftp[0], list(preverified_sftp[1])
             preflight_err = ""
@@ -584,6 +655,8 @@ def _mount_sftp_directory(
                 host,
                 initial_rclone_path,
                 allow_empty_fallback=allow_empty_fallback,
+                sftp_server_command=sftp_server_command,
+                treat_as_posix=treat_as_posix,
             )
         if not sftp_flags:
             _cleanup_unmounted_empty_dir(mount_point)
@@ -594,8 +667,18 @@ def _mount_sftp_directory(
             }
 
         # Never pass `--max-connections 1` (deadlocks rclone VFS on nested Finder READDIRPLUS + .DS_Store calls!).
+        # Secondary Windows drives (D..Z, often parked USB/SATA HDDs) use a longer dir-cache so background
+        # Finder metadata reads do not repeatedly spin up disks and trigger macOS's 5-12s disconnect warning.
+        is_secondary_win_drive = (
+            machine.os == "windows"
+            and not treat_as_posix
+            and len(remote_target) >= 2
+            and remote_target[1] == ":"
+            and remote_target[0].upper() != "C"
+        )
+        dir_cache_time = "15m" if is_secondary_win_drive else "5m"
         permission_denied = False
-        probe_timeout = 20.0 if machine.os == "windows" else 15.0
+        probe_timeout = 25.0 if sftp_server_command else (20.0 if machine.os == "windows" else 15.0)
         for _attempt in range(2 if preverified_sftp is not None else 1):
             nfs_port = _allocate_loopback_port()
             nfs_cache_dir = cache_root / "nfs-handles" / log_stem
@@ -622,19 +705,21 @@ def _mount_sftp_directory(
                 "writes",
                 "--vfs-fast-fingerprint",
                 "--dir-cache-time",
-                "2m",
+                dir_cache_time,
+                "--attr-timeout",
+                "5s",
                 "--poll-interval",
                 "0",
                 "--sftp-idle-timeout",
-                "4h",
+                "5m",
                 "--contimeout",
-                "8s",
+                "5s",
                 "--timeout",
-                "30s",
+                "15s",
                 "--low-level-retries",
-                "2",
+                "3",
                 "--retries",
-                "2",
+                "3",
                 "--checkers",
                 "2",
                 "--transfers",
@@ -654,15 +739,21 @@ def _mount_sftp_directory(
             mounted_ok = False
             mount_err_detail = ""
             if _wait_tcp_ready(nfs_port, proc, timeout_sec=10.0):
-                # Soft, interruptible, local-lock, NFC-normalized NFSv3 mount — never wedges Finder or pops hard-mount dialogs!
+                # Hardened IPv4 TCP NFSv3 mount:
+                # - 127.0.0.1:/ + vers=3,proto=tcp avoids IPv6 ::1 / mDNS delays & v4 negotiation.
+                # - soft,intr,deadtimeout=0,mutejukebox prevents Finder wedges, auto-force-unmounts, and jukebox popups.
+                # - noquota,noatime + acreg*/acdir* avoids redundant RQUOTA/atime/GETATTR RPC storms on idle mounts.
+                # - Never pass `nobrowse`: Finder/NSOpenPanel hides `nobrowse` child mountpoints inside containers.
                 nfs_opts = (
-                    f"port={nfs_port},mountport={nfs_port},tcp,"
-                    "soft,intr,timeo=600,retrans=2,"
-                    "nolocks,locallocks,nfc,rsize=131072,wsize=131072"
+                    f"vers=3,proto=tcp,port={nfs_port},mountport={nfs_port},"
+                    "soft,intr,timeo=600,retrans=2,deadtimeout=0,mutejukebox,"
+                    "nolocks,locallocks,noquota,noatime,nfc,"
+                    "acregmin=5,acregmax=60,acdirmin=15,acdirmax=120,"
+                    "rsize=131072,wsize=131072"
                 )
                 try:
                     mnt_proc = subprocess.run(
-                        ["/sbin/mount", "-t", "nfs", "-o", nfs_opts, "localhost:/", str(mount_point)],
+                        ["/sbin/mount", "-t", "nfs", "-o", nfs_opts, "127.0.0.1:/", str(mount_point)],
                         capture_output=True,
                         text=True,
                         timeout=15,
@@ -685,25 +776,25 @@ def _mount_sftp_directory(
                             recorded_mp = tbl_key
                             break
                 meta_file = _daemons_dir() / f"{log_stem}.json"
+                meta_payload: Dict[str, Any] = {
+                    "schema": DAEMON_SCHEMA_VERSION,
+                    "pid": proc.pid,
+                    "port": nfs_port,
+                    "host": host,
+                    "machine_id": machine.id,
+                    "mount_point": recorded_mp,
+                    "remote_target": remote_target,
+                }
+                if registry_extra and registry_extra.get("wsl_distro"):
+                    meta_payload["wsl_distro"] = registry_extra["wsl_distro"]
                 meta_file.write_text(
-                    json.dumps(
-                        {
-                            "schema": DAEMON_SCHEMA_VERSION,
-                            "pid": proc.pid,
-                            "port": nfs_port,
-                            "host": host,
-                            "machine_id": machine.id,
-                            "mount_point": recorded_mp,
-                            "remote_target": remote_target,
-                        },
-                        indent=2,
-                    ),
+                    json.dumps(meta_payload, indent=2),
                     encoding="utf-8",
                 )
                 if _probe_mount_health(mount_point, log_stem, timeout_sec=probe_timeout, expected_host=host) == "healthy":
                     visible = _safe_sample_entries(mount_point, timeout_sec=4.0)
                     reg = load_mounts_registry()
-                    reg[recorded_mp] = {"machine_id": machine.id, "remote_root": remote_target}
+                    reg[recorded_mp] = dict(reg_entry)
                     save_mounts_registry(reg)
                     return {
                         "ok": True,
@@ -737,6 +828,8 @@ def _mount_sftp_directory(
                     host,
                     initial_rclone_path,
                     allow_empty_fallback=allow_empty_fallback,
+                    sftp_server_command=sftp_server_command,
+                    treat_as_posix=treat_as_posix,
                 )
                 if not fallback_flags:
                     mount_err_detail = preflight_err
@@ -759,13 +852,14 @@ def _mount_sftp_directory(
 
     # 2. Linux / non-macOS rclone FUSE fallback
     if rclone_bin and not is_macos and not sshfs_bin:
-        initial_rclone_path = (
-            f"/{remote_target}"
-            if (len(remote_target) >= 2 and remote_target[1] == ":")
-            else remote_target
-        )
         verified_rclone_path, sftp_flags, preflight_err = _select_verified_rclone_sftp_flags(
-            rclone_bin, machine, host, initial_rclone_path, allow_empty_fallback=allow_empty_fallback
+            rclone_bin,
+            machine,
+            host,
+            initial_rclone_path,
+            allow_empty_fallback=allow_empty_fallback,
+            sftp_server_command=sftp_server_command,
+            treat_as_posix=treat_as_posix,
         )
         if sftp_flags:
             log_file = cache_root / f"rclone-{log_stem}.log"
@@ -783,6 +877,8 @@ def _mount_sftp_directory(
                 "0",
                 "--dir-cache-time",
                 "30s",
+                "--sftp-idle-timeout",
+                "5m",
             ]
             with open(log_file, "w", encoding="utf-8") as lf:
                 proc = subprocess.Popen(
@@ -793,7 +889,7 @@ def _mount_sftp_directory(
                 if is_mounted(mount_point):
                     visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
                     reg = load_mounts_registry()
-                    reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+                    reg[str(mount_point)] = dict(reg_entry)
                     save_mounts_registry(reg)
                     return {
                         "ok": True,
@@ -812,9 +908,9 @@ def _mount_sftp_directory(
     # 3. `sshfs` fallback
     if sshfs_bin:
         target_spec = (
-            f"{machine.user}@{host}:{remote_target}"
+            f"{machine.user}@{host}:{effective_rclone_path}"
             if machine.user
-            else f"{host}:{remote_target}"
+            else f"{host}:{effective_rclone_path}"
         )
         cmd = [
             sshfs_bin,
@@ -823,6 +919,8 @@ def _mount_sftp_directory(
             "-o",
             "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3",
         ]
+        if sftp_server_command:
+            cmd.extend(["-o", f"sftp_server={sftp_server_command}"])
         if machine.port and machine.port != 22:
             cmd.extend(["-p", str(machine.port)])
         key_path = _detect_default_ssh_key(machine)
@@ -840,7 +938,7 @@ def _mount_sftp_directory(
         if proc2.returncode == 0 and is_mounted(mount_point):
             visible = _safe_sample_entries(mount_point, timeout_sec=2.0)
             reg = load_mounts_registry()
-            reg[str(mount_point)] = {"machine_id": machine.id, "remote_root": remote_target}
+            reg[str(mount_point)] = dict(reg_entry)
             save_mounts_registry(reg)
             return {
                 "ok": True,
@@ -888,8 +986,8 @@ def _mount_windows_all_drives(
     ping: Dict[str, Any],
     container_dir: Path,
 ) -> Dict[str, Any]:
-    """Mount EVERY drive (`C:/`, `D:/`, `E:/`, ...) on a Windows PC under `~/RemoteComputers/<id>/<Drive>`
-    plus a `Home` shortcut pointing straight to `C/Users/<user>`."""
+    """Mount EVERY drive (`C:/`, `D:/`, `E:/`, ...) AND any discovered WSL drives/distros (e.g. `Y:` -> WSL)
+    on a Windows PC under `~/RemoteComputers/<id>/<Drive>`, plus `Home` (`C/Users/<user>`) and `WSL` shortcuts."""
     container_dir = safe_lexical_resolve(container_dir)
 
     # Transition cleanly if `container_dir` (`~/RemoteComputers/pc`) was previously mounted directly to `C:\Users\<user>`
@@ -912,6 +1010,7 @@ def _mount_windows_all_drives(
             "permission_denied": isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES),
             "error": f"Cannot access {container_dir}: {exc}",
         }
+    _ensure_spotlight_never_index(container_dir)
     remote_home = str(ping.get("home") or "C:/").replace("\\", "/")
     reg = _prune_stale_registry_entries(machine.id, container_dir)
     reg[str(container_dir)] = {
@@ -921,20 +1020,34 @@ def _mount_windows_all_drives(
     }
     save_mounts_registry(reg)
 
+    wsl_targets: List[Dict[str, Any]] = [
+        t
+        for t in (ping.get("wsl_targets") or [])
+        if isinstance(t, dict) and str(t.get("distro") or "").strip() and str(t.get("mount_name") or "").strip()
+    ]
+    wsl_claimed_letters: Set[str] = {
+        str(t.get("drive_letter") or "").strip().upper()
+        for t in wsl_targets
+        if str(t.get("drive_letter") or "").strip()
+    }
+
     raw_drives = ping.get("drives") or ["C:/"]
     drive_letters: List[str] = []
     for drv in raw_drives:
         s = str(drv).strip().replace("\\", "/")
         if s and s[0].isalpha():
             letter = s[0].upper()
-            if letter not in drive_letters:
+            if letter not in drive_letters and letter not in wsl_claimed_letters:
                 drive_letters.append(letter)
-    if not drive_letters:
+    if not drive_letters and not wsl_targets:
         drive_letters = ["C"]
 
     mounted_drives: List[str] = []
+    mounted_wsl: List[Dict[str, str]] = []
     drive_errors: Dict[str, str] = {}
+    wsl_errors: Dict[str, str] = {}
     failed_letters: List[str] = []
+    failed_wsl_targets: List[Dict[str, Any]] = []
     total_visible = 0
     any_already = True
     cached_sftp_flags: Optional[List[str]] = None
@@ -981,8 +1094,89 @@ def _mount_windows_all_drives(
                 aborted_permission = True
                 break
 
-    # Single clean retry pass for any drives that transiently failed (e.g. parked HDD spin-up or sshd handshake hiccup)
-    if failed_letters and not aborted_permission:
+    def _attempt_wsl_mount(target: Dict[str, Any]) -> Tuple[bool, bool, str]:
+        nonlocal total_visible, any_already, new_mount_attempts
+        mname = str(target["mount_name"]).strip()
+        distro = str(target["distro"]).strip()
+        wsl_root = str(target.get("wsl_root") or "/").strip() or "/"
+        remote_uri = str(target.get("remote_uri") or format_wsl_path(distro, wsl_root))
+        drv_letter = str(target.get("drive_letter") or "").strip().upper()
+        sftp_cmd = str(target.get("sftp_server_command") or "").strip()
+        label_key = f"{drv_letter}:" if drv_letter else mname
+
+        if not sftp_cmd:
+            err_msg = str(
+                target.get("probe_error")
+                or (
+                    f"WSL distro '{distro}' is missing sftp-server. "
+                    "Run once in WSL: sudo apt update && sudo apt install -y openssh-sftp-server"
+                )
+            )
+            wsl_errors[label_key] = f"{label_key} (WSL {distro}): {err_msg}"
+            return False, False, label_key
+
+        wsl_mp = safe_lexical_resolve(container_dir / mname)
+        if not is_mounted(wsl_mp) and wsl_mp.is_symlink():
+            try:
+                wsl_mp.unlink()
+            except OSError:
+                pass
+
+        if new_mount_attempts > 0:
+            time.sleep(0.4)
+
+        reg_extra: Dict[str, str] = {"wsl_distro": distro, "wsl_root": wsl_root}
+        if drv_letter:
+            reg_extra["windows_drive"] = f"{drv_letter}:"
+
+        res_wsl = _mount_sftp_directory(
+            machine=machine,
+            ep_dict=ep_dict,
+            host=host,
+            remote_target=remote_uri,
+            mount_point=wsl_mp,
+            vol_label=f"Fleet-{machine.id}-{mname}",
+            log_stem=f"{machine.id}-{mname}",
+            allow_empty_fallback=False,
+            sftp_server_command=sftp_cmd,
+            treat_as_posix=True,
+            rclone_remote_path=wsl_root,
+            registry_extra=reg_extra,
+        )
+        if res_wsl.get("ok"):
+            mounted_wsl.append(
+                {
+                    "mount_name": mname,
+                    "drive_letter": drv_letter,
+                    "distro": distro,
+                    "wsl_root": wsl_root,
+                    "remote_root": remote_uri,
+                    "mount_point": str(wsl_mp),
+                }
+            )
+            total_visible += int(res_wsl.get("visible_count") or 0)
+            if not res_wsl.get("already_mounted"):
+                any_already = False
+                new_mount_attempts += 1
+            wsl_errors.pop(label_key, None)
+            return True, False, label_key
+
+        new_mount_attempts += 1
+        wsl_errors[label_key] = f"{label_key} (WSL {distro}): {res_wsl.get('error')}"
+        return False, bool(res_wsl.get("permission_denied")), label_key
+
+    if wsl_targets and not aborted_permission:
+        for wt in wsl_targets:
+            ok_w, perm_w, _ = _attempt_wsl_mount(wt)
+            if not ok_w:
+                if perm_w:
+                    aborted_permission = True
+                    break
+                if str(wt.get("sftp_server_command") or "").strip():
+                    failed_wsl_targets.append(wt)
+
+    # Single clean retry pass for any drives or WSL targets that transiently failed (e.g. parked HDD spin-up, cold WSL2 boot, or sshd hiccup)
+    if (failed_letters or failed_wsl_targets) and not aborted_permission:
         time.sleep(2.0)
         for letter in list(failed_letters):
             drive_mp = safe_lexical_resolve(container_dir / letter)
@@ -1005,11 +1199,23 @@ def _mount_windows_all_drives(
             else:
                 drive_errors[letter] = f"{letter}: {res2.get('error')}"
                 if res2.get("permission_denied"):
+                    aborted_permission = True
                     break
             time.sleep(0.4)
 
+        if not aborted_permission:
+            for wt in list(failed_wsl_targets):
+                ok_w2, perm_w2, _ = _attempt_wsl_mount(wt)
+                if ok_w2:
+                    failed_wsl_targets.remove(wt)
+                elif perm_w2:
+                    aborted_permission = True
+                    break
+
     mounted_drives.sort()
-    final_errors = [drive_errors[ch] for ch in sorted(drive_errors.keys())]
+    final_errors = [drive_errors[ch] for ch in sorted(drive_errors.keys())] + [
+        wsl_errors[k] for k in sorted(wsl_errors.keys())
+    ]
 
     # Create/refresh `Home` shortcut (`~/RemoteComputers/pc/Home -> C/Users/danli`) for 1-click access to user profile
     home_link = container_dir / "Home"
@@ -1030,18 +1236,34 @@ def _mount_windows_all_drives(
             except OSError:
                 pass
 
+    # Create/refresh `WSL` shortcut (`~/RemoteComputers/pc/WSL -> Y`) when primary WSL distro is mounted on a drive letter
+    mounted_wsl_names = {w["mount_name"] for w in mounted_wsl}
+    wsl_shortcut_created = False
+    if mounted_wsl and "WSL" not in mounted_wsl_names:
+        wsl_link = container_dir / "WSL"
+        rel_wsl_target = mounted_wsl[0]["mount_name"]
+        try:
+            if not is_mounted(wsl_link):
+                if wsl_link.is_symlink() or wsl_link.is_file():
+                    wsl_link.unlink()
+                if not wsl_link.exists():
+                    wsl_link.symlink_to(rel_wsl_target)
+                wsl_shortcut_created = True
+        except OSError:
+            pass
+
     # Clean up any stale unmounted empty drive directories from previously unplugged USB drives
-    mounted_names = {d[0] for d in mounted_drives}
+    mounted_names = {d[0] for d in mounted_drives} | mounted_wsl_names
     try:
         for child in list(container_dir.iterdir()):
-            if child.name == "Home" or child.name in mounted_names:
+            if child.name in ("Home", "WSL") or child.name in mounted_names:
                 continue
             if not is_mounted(child) and not child.is_symlink() and child.is_dir():
                 _cleanup_unmounted_empty_dir(child)
     except OSError:
         pass
 
-    if not mounted_drives:
+    if not mounted_drives and not mounted_wsl:
         # Never delete `container_dir` itself — keep its APFS inode permanent for macOS Sidebar Favorites!
         return {
             "ok": False,
@@ -1051,15 +1273,25 @@ def _mount_windows_all_drives(
         }
 
     flat_entries = [d[0] for d in mounted_drives]
+    for wm in mounted_wsl:
+        if wm["mount_name"] not in flat_entries:
+            flat_entries.append(wm["mount_name"])
+    if wsl_shortcut_created and "WSL" not in flat_entries:
+        flat_entries.append("WSL")
     if home_created:
         flat_entries.insert(0, "Home")
+
+    remote_parts = list(mounted_drives) + [
+        (f"{w['drive_letter']}: ({w['remote_root']})" if w["drive_letter"] else w["remote_root"])
+        for w in mounted_wsl
+    ]
 
     out: Dict[str, Any] = {
         "ok": True,
         "machine_id": machine.id,
         "engine": "rclone-serve-nfs-drives" if platform.system().lower() == "darwin" else "rclone-mount-drives",
         "mount_point": str(container_dir),
-        "remote_root": ", ".join(mounted_drives),
+        "remote_root": ", ".join(remote_parts),
         "drives": mounted_drives,
         "home_created": home_created,
         "already_mounted": any_already,
@@ -1067,6 +1299,10 @@ def _mount_windows_all_drives(
         "sample_entries": flat_entries,
         "endpoint": ep_dict,
     }
+    if mounted_wsl:
+        out["wsl_mounts"] = mounted_wsl
+    if wsl_shortcut_created:
+        out["wsl_shortcut_created"] = True
     if final_errors:
         out["failed_drives"] = final_errors
     return out
@@ -1109,6 +1345,7 @@ def _mount_posix_container(
             "permission_denied": isinstance(exc, PermissionError) or exc.errno in (errno.EPERM, errno.EACCES),
             "error": f"Cannot access {container_dir}: {exc}",
         }
+    _ensure_spotlight_never_index(container_dir)
     remote_home = str(ping.get("home") or "/").replace("\\", "/")
 
     reg = _prune_stale_registry_entries(machine.id, container_dir)
@@ -1625,6 +1862,357 @@ def _fallback_windows_ping_via_sftp(
     }
 
 
+_IGNORED_WSL_DISTROS = {
+    "docker-desktop",
+    "docker-desktop-data",
+    "rancher-desktop",
+    "rancher-desktop-data",
+    "podman-machine-default",
+}
+
+_WSL_SFTP_SERVER_CANDIDATES = (
+    "/usr/lib/openssh/sftp-server",
+    "/usr/libexec/openssh/sftp-server",
+    "/usr/lib/ssh/sftp-server",
+    "/usr/libexec/sftp-server",
+)
+
+
+def _decode_windows_cli_bytes(raw: Any) -> str:
+    """Decode Windows CLI output that may be UTF-16LE (e.g. `wsl.exe -l -v`), UTF-8, or already `str`."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.replace("\x00", "").lstrip("\ufeff")
+    if isinstance(raw, (bytes, bytearray)):
+        data = bytes(raw)
+        if not data:
+            return ""
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return data.decode("utf-16", errors="replace").replace("\x00", "").lstrip("\ufeff")
+        if b"\x00" in data:
+            return data.decode("utf-16-le", errors="replace").replace("\x00", "").lstrip("\ufeff")
+        return data.decode("utf-8", errors="replace").lstrip("\ufeff")
+    return str(raw)
+
+
+def _parse_windows_network_registry_wsl(stdout: str) -> List[Dict[str, str]]:
+    """Parse `reg.exe query HKCU\\Network /s` output for persistent mapped drive letters pointing to WSL
+    (e.g. `Y:` -> `\\\\wsl.localhost\\Ubuntu` or `\\\\wsl$\\Ubuntu\\home\\danli`)."""
+    found: List[Dict[str, str]] = []
+    seen_letters: Set[str] = set()
+    current_letter: Optional[str] = None
+
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        km = re.match(r"^HKEY_CURRENT_USER\\Network\\([A-Za-z])$", line, re.IGNORECASE)
+        if km:
+            current_letter = km.group(1).upper()
+            continue
+        if line.upper().startswith("HKEY_"):
+            current_letter = None
+            continue
+        if not current_letter:
+            continue
+        vm = re.match(r"^RemotePath\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$", line, re.IGNORECASE)
+        if not vm:
+            continue
+        parsed = parse_wsl_path(vm.group(1).strip())
+        if not parsed:
+            continue
+        distro, wsl_root = parsed
+        if not distro or current_letter in seen_letters:
+            continue
+        seen_letters.add(current_letter)
+        found.append(
+            {
+                "drive_letter": current_letter,
+                "distro": distro,
+                "wsl_root": wsl_root if wsl_root.startswith("/") else "/",
+            }
+        )
+    return found
+
+
+def _parse_wsl_list_verbose(text: str) -> List[Dict[str, Any]]:
+    """Parse `wsl.exe -l -v` output, filtering out internal Docker/Rancher/Podman distros and placing the default first."""
+    distros: List[Dict[str, Any]] = []
+    seen_names: Set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.replace("\r", "").strip()
+        if not line:
+            continue
+        m = re.match(
+            r"^(\*?)\s*(.+?)\s+(Running|Stopped|Installing|Converting|Uninstalling)\s+(\d+)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not m:
+            continue
+        is_default = bool(m.group(1))
+        name = m.group(2).strip()
+        state = m.group(3)
+        version = int(m.group(4))
+        low = name.lower()
+        if (
+            not name
+            or low in _IGNORED_WSL_DISTROS
+            or low.startswith("docker-desktop")
+            or low.startswith("podman-machine-")
+            or low in seen_names
+        ):
+            continue
+        seen_names.add(low)
+        distros.append(
+            {
+                "name": name,
+                "state": state,
+                "version": version,
+                "is_default": is_default,
+            }
+        )
+    distros.sort(key=lambda item: (0 if item["is_default"] else 1))
+    return distros
+
+
+def _build_direct_windows_ssh_cmd(machine: MachineConfig, host: str) -> Optional[List[str]]:
+    """Build a direct, non-multiplexed SSH command against a Windows OpenSSH server (zero PowerShell)."""
+    ssh_bin = shutil.which("ssh") or ("/usr/bin/ssh" if os.path.exists("/usr/bin/ssh") else None)
+    if not ssh_bin:
+        return None
+    cmd = [
+        ssh_bin,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-T",
+    ]
+    if machine.port and machine.port != 22:
+        cmd.extend(["-p", str(machine.port)])
+    key_path = _detect_default_ssh_key(machine)
+    if key_path:
+        cmd.extend(["-i", key_path])
+    target = f"{machine.user}@{host}" if machine.user else host
+    cmd.append(target)
+    return cmd
+
+
+def _build_wsl_sftp_server_command(distro: str, sftp_server_path: str) -> str:
+    """Build the remote command passed to rclone's `--sftp-server-command` to launch WSL's native Linux `sftp-server`.
+
+    Uses `-e` (never `--`) and quotes `distro` only if it contains whitespace so both `cmd.exe` and PowerShell
+    `DefaultShell` configurations on Windows OpenSSH invoke `wsl.exe` identically.
+    """
+    clean_distro = distro.strip()
+    clean_bin = sftp_server_path.strip()
+    if not clean_distro or not clean_bin or any(ch in clean_distro for ch in "\r\n;&|`$"):
+        return ""
+    d_arg = f'"{clean_distro}"' if any(c.isspace() for c in clean_distro) else clean_distro
+    return f"C:\\Windows\\System32\\wsl.exe -d {d_arg} -e {clean_bin}"
+
+
+def _probe_wsl_distro_sftp_server(machine: MachineConfig, host: str, distro: str) -> Dict[str, Any]:
+    """Check which Linux `sftp-server` binary is installed inside WSL distro `distro` (zero PowerShell)."""
+    ssh_base = _build_direct_windows_ssh_cmd(machine, host)
+    if not ssh_base:
+        return {"ok": False, "sftp_server": "", "sftp_server_command": "", "error": "ssh CLI not found"}
+    clean_distro = distro.strip()
+    if not clean_distro or any(ch in clean_distro for ch in "\r\n;&|`$"):
+        return {"ok": False, "sftp_server": "", "sftp_server_command": "", "error": f"Invalid WSL distro name: {distro!r}"}
+
+    d_arg = f'"{clean_distro}"' if any(c.isspace() for c in clean_distro) else clean_distro
+    probe_cmd = f"C:\\Windows\\System32\\wsl.exe -d {d_arg} -e ls -1 " + " ".join(_WSL_SFTP_SERVER_CANDIDATES)
+    try:
+        proc = subprocess.run(
+            [*ssh_base, probe_cmd],
+            capture_output=True,
+            timeout=12,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "ok": False,
+            "sftp_server": "",
+            "sftp_server_command": "",
+            "error": f"Timed out probing WSL distro '{clean_distro}': {exc}",
+        }
+
+    out_text = _decode_windows_cli_bytes(proc.stdout)
+    err_text = _decode_windows_cli_bytes(proc.stderr)
+    cand_set = set(_WSL_SFTP_SERVER_CANDIDATES)
+    for raw_line in out_text.splitlines():
+        cand = raw_line.strip()
+        if cand in cand_set:
+            return {
+                "ok": True,
+                "sftp_server": cand,
+                "sftp_server_command": _build_wsl_sftp_server_command(clean_distro, cand),
+                "error": "",
+            }
+
+    err_low = (out_text + "\n" + err_text).lower()
+    if "there is no distribution" in err_low or "wsl_e_distro_not_found" in err_low:
+        return {
+            "ok": False,
+            "sftp_server": "",
+            "sftp_server_command": "",
+            "error": f"WSL distro '{clean_distro}' was not found on {host}.",
+        }
+    return {
+        "ok": False,
+        "sftp_server": "",
+        "sftp_server_command": "",
+        "error": (
+            f"sftp-server not installed in WSL distro '{clean_distro}'. "
+            "Run once in WSL: sudo apt update && sudo apt install -y openssh-sftp-server"
+        ),
+    }
+
+
+def discover_windows_wsl_targets(machine: MachineConfig, host: str) -> List[Dict[str, Any]]:
+    """Discover WSL mapped drives (`HKCU\\Network\\Y` -> `\\\\wsl.localhost\\Ubuntu`), explicit config
+    `MachineConfig.wsl_drives`, and installed non-Docker WSL distributions (`wsl.exe -l -v`) on a Windows PC.
+
+    Uses lightweight direct `reg.exe` / `wsl.exe` SSH calls (never spawns PowerShell) and probes each
+    discovered distro for its native Linux `sftp-server` binary so rclone can mount WSL directly over SFTP.
+    """
+    ssh_base = _build_direct_windows_ssh_cmd(machine, host)
+    if not ssh_base:
+        return []
+
+    mapped_entries: List[Dict[str, str]] = []
+    try:
+        reg_proc = subprocess.run(
+            [*ssh_base, "C:\\Windows\\System32\\reg.exe query HKCU\\Network /s"],
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        reg_text = _decode_windows_cli_bytes(reg_proc.stdout)
+        if reg_text:
+            mapped_entries = _parse_windows_network_registry_wsl(reg_text)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    installed_distros: List[Dict[str, Any]] = []
+    try:
+        wsl_proc = subprocess.run(
+            [*ssh_base, "C:\\Windows\\System32\\wsl.exe -l -v"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        wsl_text = _decode_windows_cli_bytes(wsl_proc.stdout)
+        if wsl_text:
+            installed_distros = _parse_wsl_list_verbose(wsl_text)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    canonical_distro_names = {d["name"].lower(): d["name"] for d in installed_distros}
+
+    raw_targets: List[Dict[str, str]] = []
+    used_mount_names: Set[str] = set()
+    covered_distros: Set[str] = set()
+
+    # 1. Explicit `wsl_drives` overrides from `~/.config/remote-fleet/fleet.json` (e.g. {"Y": "Ubuntu"})
+    for raw_letter, spec in sorted((machine.wsl_drives or {}).items()):
+        letter = raw_letter.strip().rstrip(":/\\").upper()
+        if len(letter) != 1 or not letter.isalpha():
+            continue
+        distro, wsl_root = _parse_wsl_drive_spec(spec)
+        if not distro:
+            continue
+        distro = canonical_distro_names.get(distro.lower(), distro)
+        if letter in used_mount_names:
+            continue
+        used_mount_names.add(letter)
+        covered_distros.add(distro.lower())
+        raw_targets.append(
+            {
+                "mount_name": letter,
+                "drive_letter": letter,
+                "distro": distro,
+                "wsl_root": wsl_root or "/",
+            }
+        )
+
+    # 2. Persistent Windows mapped network drives pointing to `\\wsl.localhost\<distro>` or `\\wsl$\<distro>`
+    for entry in mapped_entries:
+        letter = entry["drive_letter"].upper()
+        if letter in used_mount_names:
+            continue
+        distro = canonical_distro_names.get(entry["distro"].lower(), entry["distro"])
+        used_mount_names.add(letter)
+        covered_distros.add(distro.lower())
+        raw_targets.append(
+            {
+                "mount_name": letter,
+                "drive_letter": letter,
+                "distro": distro,
+                "wsl_root": entry.get("wsl_root") or "/",
+            }
+        )
+
+    # 3. Any remaining user WSL distributions from `wsl.exe -l -v` not yet exposed via a mapped drive letter
+    for item in installed_distros:
+        distro = str(item["name"])
+        if distro.lower() in covered_distros:
+            continue
+        if not raw_targets and "WSL" not in used_mount_names:
+            mount_name = "WSL"
+        else:
+            slug = re.sub(r"[^A-Za-z0-9._-]+", "-", distro).strip("-") or "Linux"
+            mount_name = f"WSL-{slug}"
+        if mount_name in used_mount_names:
+            continue
+        used_mount_names.add(mount_name)
+        covered_distros.add(distro.lower())
+        raw_targets.append(
+            {
+                "mount_name": mount_name,
+                "drive_letter": "",
+                "distro": distro,
+                "wsl_root": "/",
+            }
+        )
+
+    if not raw_targets:
+        return []
+
+    # Probe native Linux `sftp-server` once per unique distro
+    probe_cache: Dict[str, Dict[str, Any]] = {}
+    targets: List[Dict[str, Any]] = []
+    for item in raw_targets:
+        distro = item["distro"]
+        cache_key = distro.lower()
+        if cache_key not in probe_cache:
+            probe_cache[cache_key] = _probe_wsl_distro_sftp_server(machine, host, distro)
+        probe = probe_cache[cache_key]
+        wsl_root = item["wsl_root"] or "/"
+        targets.append(
+            {
+                "mount_name": item["mount_name"],
+                "drive_letter": item["drive_letter"],
+                "distro": distro,
+                "wsl_root": wsl_root,
+                "remote_uri": format_wsl_path(distro, wsl_root),
+                "sftp_server": str(probe.get("sftp_server") or ""),
+                "sftp_server_command": str(probe.get("sftp_server_command") or ""),
+                "probe_error": str(probe.get("error") or ""),
+            }
+        )
+    return targets
+
+
 def mount_single_machine_root(
     transport: FleetTransport,
     machine: MachineConfig,
@@ -1670,7 +2258,7 @@ def mount_single_machine_root(
         return {"ok": False, "machine_id": machine.id, "error": f"Unreachable ({ep.error})"}
 
     # For Windows PCs, NEVER spawn `powershell.exe` over SSH to discover drives!
-    # Use 100% pure SFTP (`sftp -b -` / `rclone lsf`) so zero PowerShell/cmd/conhost sessions are ever created.
+    # Use 100% pure SFTP (`sftp -b -` / `rclone lsf`) + direct `reg.exe`/`wsl.exe` WSL discovery.
     if machine.os == "windows":
         cand_hosts = [ep.host]
         if machine.tailscale_host and machine.tailscale_host not in cand_hosts:
@@ -1679,6 +2267,9 @@ def mount_single_machine_root(
         for chost in cand_hosts:
             sftp_ping = _discover_windows_via_pure_sftp(machine, chost, mount_point)
             if sftp_ping is not None:
+                wsl_targets = discover_windows_wsl_targets(machine, chost)
+                if wsl_targets:
+                    sftp_ping["wsl_targets"] = wsl_targets
                 active_ep_dict = {
                     **ep.to_dict(),
                     "host": chost,
@@ -1704,6 +2295,9 @@ def mount_single_machine_root(
 
     if str(ping.get("os") or "").lower() == "windows":
         machine.os = "windows"
+        wsl_targets = discover_windows_wsl_targets(machine, active_host)
+        if wsl_targets:
+            ping["wsl_targets"] = wsl_targets
         return _mount_windows_all_drives(machine, active_ep_dict, active_host, ping, mount_point)
 
     return _mount_posix_container(machine, active_ep_dict, active_host, ping, mount_point)
@@ -1903,6 +2497,7 @@ def mount_all_machines(
             "results": [],
             "error": f"Cannot access {root}: {exc}",
         }
+    _ensure_spotlight_never_index(root)
 
     lock_dir = Path.home() / ".cache" / "remote-fleet"
     lock_dir.mkdir(parents=True, exist_ok=True)

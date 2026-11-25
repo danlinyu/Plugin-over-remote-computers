@@ -242,6 +242,62 @@ class TestMCPServerStdio(unittest.TestCase):
                     else:
                         os.environ[k] = v
 
+    def test_mcp_wsl_cwd_and_job_routing(self) -> None:
+        from unittest.mock import patch
+
+        from remote_fleet.config import ActiveProjectState, FleetConfig, MachineConfig
+        from remote_fleet.mcp_server import RemoteFleetMCPServer
+
+        # 1. `_resolve_tool_cwd` handles `wsl://`, `\\wsl.localhost\`, relative paths, and Linux absolute paths inside WSL base
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd("wsl://Ubuntu/opt", "C:/Users/danli"),
+            "wsl://Ubuntu/opt",
+        )
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd(r"\\wsl.localhost\Ubuntu\etc", "C:/Users/danli"),
+            r"\\wsl.localhost\Ubuntu\etc",
+        )
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd("sub/run", "wsl://Ubuntu/home/danli/job"),
+            "wsl://Ubuntu/home/danli/job/sub/run",
+        )
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd("/tmp", "wsl://Ubuntu/home/danli/job"),
+            "wsl://Ubuntu/tmp",
+        )
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd("~/exp", "wsl://Ubuntu/home/danli/job"),
+            "wsl://Ubuntu/~/exp",
+        )
+        self.assertEqual(
+            RemoteFleetMCPServer._resolve_tool_cwd("C:/Users/danli", "wsl://Ubuntu/home/danli/job"),
+            "C:/Users/danli",
+        )
+
+        # 2. `fleet_job_status` / `fleet_stop_job` route list_jobs & WSL jobs to active WSL distro, while keeping native `job-...` on Windows
+        pc = MachineConfig(id="pc", name="PC", lan_host="192.168.68.70", user="danli", os="windows")
+        srv = RemoteFleetMCPServer(config=FleetConfig(machines=[pc]))
+        srv.session_project = ActiveProjectState(
+            machine_id="pc",
+            remote_path="wsl://Ubuntu/home/danli/ml",
+            source="session",
+        )
+        seen_reqs: list[dict[str, object]] = []
+        with patch.object(
+            srv.transport,
+            "run_worker_op",
+            side_effect=lambda m, req, **kw: seen_reqs.append(dict(req)) or {"ok": True},
+        ):
+            srv.call_tool("fleet_job_status", {})
+            srv.call_tool("fleet_job_status", {"job_id": "wsl__Ubuntu__job-123"})
+            srv.call_tool("fleet_job_status", {"job_id": "job-999"})
+            srv.call_tool("fleet_stop_job", {"job_id": "wsl__Ubuntu__job-123"})
+
+        self.assertEqual(seen_reqs[0], {"op": "list_jobs", "wsl_distro": "Ubuntu"})
+        self.assertEqual(seen_reqs[1].get("wsl_distro"), "Ubuntu")
+        self.assertNotIn("wsl_distro", seen_reqs[2])
+        self.assertEqual(seen_reqs[3], {"op": "stop_job", "job_id": "wsl__Ubuntu__job-123", "wsl_distro": "Ubuntu"})
+
 
 if __name__ == "__main__":
     unittest.main()

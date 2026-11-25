@@ -369,6 +369,196 @@ class TestTransportAndOps(unittest.TestCase):
             self.assertTrue(st_live["ok"] and st_live["running"], st_live)
             self.assertTrue(st_dead["ok"] and not st_dead["running"], st_dead)
 
+    def test_windows_wsl_worker_and_run_command_end_to_end(self) -> None:
+        """Verify Windows WSL routing for `wsl://`, `\\\\wsl.localhost\\`, and registered `Y:/` drive aliases,
+        including live execution of the zero-quote `/bin/sh` trampoline in real `/bin/sh`."""
+        import base64
+        import json as _json
+        import re
+        import subprocess as sp
+        from unittest.mock import patch
+
+        from remote_fleet.config import parse_wsl_path, save_mounts_registry
+        from remote_fleet.transport import EndpointStatus
+
+        # 1. Path parsing round-trips
+        self.assertEqual(parse_wsl_path("wsl://Ubuntu/home/danli/job"), ("Ubuntu", "/home/danli/job"))
+        self.assertEqual(parse_wsl_path("wsl://Ubuntu/"), ("Ubuntu", "/"))
+        self.assertEqual(parse_wsl_path("wsl://Ubuntu"), ("Ubuntu", "~"))
+        self.assertEqual(parse_wsl_path(r"\\wsl.localhost\Ubuntu\home\danli"), ("Ubuntu", "/home/danli"))
+        self.assertEqual(parse_wsl_path(r"\\wsl$\Ubuntu-24.04"), ("Ubuntu-24.04", "/"))
+        self.assertIsNone(parse_wsl_path("C:/Users/danli"))
+
+        def decode_ps(cmd: str) -> str:
+            self.assertIn("-EncodedCommand ", cmd)
+            b64 = cmd.split("-EncodedCommand ", 1)[1].strip()
+            return base64.b64decode(b64).decode("utf-16-le")
+
+        def extract_trampoline(ps_script: str) -> str:
+            m = re.search(r"-e /bin/sh -c '([^']+)'", ps_script)
+            self.assertIsNotNone(m, ps_script)
+            assert m is not None
+            tramp = m.group(1)
+            # Zero single quotes, double quotes, or backslashes so PowerShell 5.1 / cmd.exe never mangle it
+            self.assertNotIn("'", tramp)
+            self.assertNotIn('"', tramp)
+            self.assertNotIn("\\", tramp)
+            return tramp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_dir = tmp_path / "cfg"
+            wsl_fs = tmp_path / "fake_wsl_home"
+            proj_dir = wsl_fs / "work" / "sim"
+            proj_dir.mkdir(parents=True)
+
+            old_cfg_dir = os.environ.get("REMOTE_FLEET_CONFIG_DIR")
+            os.environ["REMOTE_FLEET_CONFIG_DIR"] = str(cfg_dir)
+            try:
+                save_mounts_registry(
+                    {
+                        str(tmp_path / "RemoteComputers" / "pc" / "Y"): {
+                            "machine_id": "pc",
+                            "remote_root": "wsl://Ubuntu/",
+                            "wsl_distro": "Ubuntu",
+                            "wsl_root": "/",
+                            "windows_drive": "Y:",
+                        }
+                    }
+                )
+                pc = MachineConfig(
+                    id="pc",
+                    name="Home PC",
+                    lan_host="192.168.68.70",
+                    user="danli",
+                    os="windows",
+                )
+                tr = FleetTransport(FleetConfig(machines=[pc]))
+                ep_lan = EndpointStatus(
+                    machine_id="pc", transport="lan", host="192.168.68.70", port=22, reachable=True, latency_ms=1.5
+                )
+
+                captured_ps: list[str] = []
+                real_run = sp.run
+
+                def fake_wsl_ssh_run(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                    ps_script = decode_ps(cmd[-1])
+                    captured_ps.append(ps_script)
+                    self.assertIn("C:\\Windows\\System32\\wsl.exe", ps_script)
+                    self.assertIn("-d 'Ubuntu'", ps_script)
+                    self.assertIn("[powershell]::Create()", ps_script)
+                    trampoline = extract_trampoline(ps_script)
+                    env = os.environ.copy()
+                    env["HOME"] = str(wsl_fs)
+                    # Actually execute the extracted `/bin/sh` trampoline locally!
+                    stdin_data = kwargs.get("input")
+                    if isinstance(stdin_data, str):
+                        # Emulate PowerShell piping `$raw` with CRLF into `wsl.exe`
+                        return real_run(
+                            ["/bin/sh", "-c", trampoline],
+                            input=stdin_data.rstrip("\n") + "\r\n",
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            timeout=15,
+                            check=False,
+                        )
+                    return real_run(
+                        ["/bin/sh", "-c", trampoline],
+                        stdin=sp.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        timeout=15,
+                        check=False,
+                    )
+
+                with (
+                    patch.object(tr, "resolve_endpoint", return_value=ep_lan),
+                    patch("remote_fleet.transport.subprocess.run", side_effect=fake_wsl_ssh_run),
+                ):
+                    # 2. Write + read a file via `wsl://Ubuntu/...`
+                    w_res = tr.run_worker_op(
+                        pc,
+                        {
+                            "op": "write_file",
+                            "base_dir": f"wsl://Ubuntu{proj_dir}",
+                            "path": "hello.txt",
+                            "content": "from-wsl\n",
+                        },
+                    )
+                    self.assertTrue(w_res["ok"], w_res)
+                    self.assertEqual(w_res.get("wsl_distro"), "Ubuntu")
+                    self.assertEqual(w_res["path"], f"wsl://Ubuntu{proj_dir}/hello.txt")
+
+                    # 3. Read the same file via Windows `Y:/...` drive alias!
+                    r_res = tr.run_worker_op(
+                        pc,
+                        {
+                            "op": "read_file",
+                            "base_dir": f"Y:{proj_dir}",
+                            "path": "hello.txt",
+                        },
+                    )
+                    self.assertTrue(r_res["ok"], r_res)
+                    self.assertEqual(r_res["content"], "from-wsl\n")
+                    self.assertEqual(r_res.get("wsl_distro"), "Ubuntu")
+
+                    # 4. `run_command` inside `\\wsl.localhost\Ubuntu\...` executes real bash inside WSL!
+                    unc_cwd = "\\\\wsl.localhost\\Ubuntu" + str(proj_dir).replace("/", "\\")
+                    cmd_res = tr.run_command(
+                        pc,
+                        command="cat hello.txt && echo ran-in-wsl",
+                        cwd=unc_cwd,
+                        timeout_sec=15,
+                    )
+                    self.assertTrue(cmd_res["ok"], cmd_res)
+                    self.assertEqual(cmd_res.get("wsl_distro"), "Ubuntu")
+                    self.assertEqual(cmd_res["cwd"], f"wsl://Ubuntu{proj_dir}")
+                    self.assertEqual(cmd_res["stdout"].splitlines(), ["from-wsl", "ran-in-wsl"])
+
+                    # 5. Detached WSL job gets `wsl__Ubuntu__job-...` ID and `job_status` auto-routes back to Ubuntu!
+                    j_start = tr.run_worker_op(
+                        pc,
+                        {
+                            "op": "start_job",
+                            "cwd": f"wsl://Ubuntu{proj_dir}",
+                            "command": "echo wsl-job-done",
+                        },
+                    )
+                    self.assertTrue(j_start["ok"], j_start)
+                    jid = str(j_start["job_id"])
+                    self.assertTrue(jid.startswith("wsl__Ubuntu__job-"), jid)
+
+                    j_stat = tr.run_worker_op(pc, {"op": "job_status", "job_id": jid, "tail_lines": 20})
+                    self.assertTrue(j_stat["ok"], j_stat)
+                    self.assertEqual(j_stat.get("wsl_distro"), "Ubuntu")
+
+                # 6. Regular Windows `browse_folders` appends registered `Y: (WSL Ubuntu)` to `roots`
+                def fake_win_browse(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[str]:
+                    payload = {
+                        "ok": True,
+                        "path": "C:\\Users\\danli",
+                        "directories": [],
+                        "roots": [{"label": "C:", "path": "C:/", "exists": True}],
+                    }
+                    return sp.CompletedProcess(cmd, 0, stdout=_json.dumps(payload) + "\n", stderr="")
+
+                with (
+                    patch.object(tr, "resolve_endpoint", return_value=ep_lan),
+                    patch("remote_fleet.transport.subprocess.run", side_effect=fake_win_browse),
+                ):
+                    b_res = tr.run_worker_op(pc, {"op": "browse_folders", "path": "C:/Users/danli"})
+                self.assertTrue(b_res["ok"], b_res)
+                root_paths = {r["path"]: r["label"] for r in b_res["roots"]}
+                self.assertIn("wsl://Ubuntu/", root_paths)
+                self.assertEqual(root_paths["wsl://Ubuntu/"], "Y: (WSL Ubuntu)")
+            finally:
+                if old_cfg_dir is None:
+                    os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
+                else:
+                    os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
 
 if __name__ == "__main__":
     unittest.main()
