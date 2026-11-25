@@ -703,6 +703,10 @@ def _mount_sftp_directory(
                 str(vfs_cache_dir),
                 "--vfs-cache-mode",
                 "writes",
+                "--vfs-cache-max-size",
+                "256M",
+                "--vfs-cache-max-age",
+                "15m",
                 "--vfs-fast-fingerprint",
                 "--dir-cache-time",
                 dir_cache_time,
@@ -872,6 +876,10 @@ def _mount_sftp_directory(
                 "--allow-non-empty",
                 "--vfs-cache-mode",
                 "writes",
+                "--vfs-cache-max-size",
+                "256M",
+                "--vfs-cache-max-age",
+                "15m",
                 "--vfs-fast-fingerprint",
                 "--poll-interval",
                 "0",
@@ -2573,11 +2581,19 @@ def mount_all_machines(
             except (subprocess.TimeoutExpired, OSError):
                 pass
 
-        return {
+        clean_info: Optional[Dict[str, Any]] = None
+        if not non_interactive:
+            clean_info = cleanup_remote_fleet_cache()
+
+        out_summary: Dict[str, Any] = {
             "base_dir": str(root),
             "results": results,
             "sidebar_repaired": bool(sidebar_info.get("repaired")),
         }
+        if clean_info and clean_info.get("removed_count"):
+            out_summary["cleaned_bytes"] = int(clean_info.get("freed_bytes") or 0)
+            out_summary["cleaned_count"] = int(clean_info.get("removed_count") or 0)
+        return out_summary
     finally:
         if fcntl is not None:
             try:
@@ -2651,7 +2667,8 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
             if not still_mounted:
                 _kill_orphan_rclone_serve_daemons(set())
 
-        return {"base_dir": str(root), "results": results}
+        clean_summary = cleanup_remote_fleet_cache()
+        return {"base_dir": str(root), "results": results, "cleaned": clean_summary}
     finally:
         if fcntl is not None:
             try:
@@ -2659,6 +2676,177 @@ def unmount_all_machines(base_dir: Optional[Path] = None) -> Dict[str, Any]:
             except OSError:
                 pass
         lock_fp.close()
+
+
+def _path_size_bytes(path: Path) -> int:
+    """Return total byte size of a file or directory without following symlinks."""
+    try:
+        if not path.exists() and not path.is_symlink():
+            return 0
+        if path.is_symlink() or path.is_file():
+            return int(path.lstat().st_size)
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(str(path), followlinks=False):
+            for fname in filenames:
+                fpath = Path(dirpath) / fname
+                try:
+                    total += int(fpath.lstat().st_size)
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _is_live_rclone_daemon_pid(pid: int) -> bool:
+    """Return True iff `pid` is currently alive and belongs to an `rclone` daemon (protects against recycled PIDs)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    ps_bin = "/bin/ps" if os.path.exists("/bin/ps") else shutil.which("ps")
+    if ps_bin:
+        try:
+            chk = subprocess.run(
+                [ps_bin, "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if chk.returncode == 0:
+                cmdline = chk.stdout.strip().lower()
+                if cmdline and "rclone" not in cmdline:
+                    return False
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return True
+
+
+def cleanup_remote_fleet_cache(
+    home_dir: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Safely find and remove stale/obsolete `remote-fleet` caches, logs, and temp files on internal storage
+    while preserving all currently active live mounts, configs, and harnesses."""
+    home = (home_dir or Path.home()).expanduser().resolve()
+    cache_root = home / ".cache" / "remote-fleet"
+    daemons_dir = cache_root / "daemons"
+
+    live_stems: Set[str] = set()
+    removed: List[Dict[str, Any]] = []
+    freed_bytes = 0
+
+    def _remove_target(target: Path, reason: str) -> None:
+        nonlocal freed_bytes
+        if not target.exists() and not target.is_symlink():
+            return
+        size = _path_size_bytes(target)
+        if not dry_run:
+            try:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                return
+        freed_bytes += size
+        removed.append({"path": str(target), "bytes": size, "reason": reason})
+
+    # 1. Inspect recorded daemons: preserve live rclone daemons, prune dead daemon metadata files
+    if daemons_dir.is_dir():
+        for mf in sorted(daemons_dir.glob("*.json")):
+            pid = 0
+            try:
+                meta = json.loads(mf.read_text(encoding="utf-8"))
+                pid = int(meta.get("pid") or 0)
+            except Exception:
+                pid = 0
+            if pid > 0 and _is_live_rclone_daemon_pid(pid):
+                live_stems.add(mf.stem)
+            else:
+                _remove_target(mf, "dead daemon metadata")
+
+    # 2. Remove orphaned NFS handle caches and VFS write caches for non-live mounts
+    for sub_name, label in (
+        ("nfs-handles", "stale NFS handle cache"),
+        ("vfs-cache", "stale VFS write cache"),
+    ):
+        sub_dir = cache_root / sub_name
+        if sub_dir.is_dir():
+            for child in sorted(sub_dir.iterdir()):
+                if child.name not in live_stems:
+                    _remove_target(child, label)
+
+    # 3. Remove stale `rclone-*.log` files for non-live mounts
+    if cache_root.is_dir():
+        for lf in sorted(cache_root.glob("rclone-*.log")):
+            stem = lf.stem[len("rclone-") :]
+            if stem not in live_stems:
+                _remove_target(lf, "stale rclone log")
+
+        # 4. Remove obsolete legacy LaunchAgent logs and temporary Swift source after helper binary is compiled
+        for legacy_log in ("automount.log", "automount.err.log"):
+            _remove_target(cache_root / legacy_log, "obsolete LaunchAgent log")
+
+        fallback_plist = home / "Library" / "LaunchAgents" / f"{LOGIN_FALLBACK_AGENT_LABEL}.plist"
+        if not fallback_plist.exists():
+            for fb_log in ("login-app-launch.log", "login-app-launch.err.log"):
+                _remove_target(cache_root / fb_log, "unused fallback launcher log")
+
+        if (cache_root / "repair-sidebar-v1").is_file():
+            _remove_target(cache_root / "repair_sidebar_v1.swift", "temporary Swift source (already compiled)")
+
+    # 5. Remove legacy `rclone nfsmount` handle cache under `~/.cache/rclone/serve-nfs-handle-cache` if no `nfsmount` runs
+    legacy_rclone_nfs = home / ".cache" / "rclone" / "serve-nfs-handle-cache"
+    if legacy_rclone_nfs.exists():
+        nfsmount_active = False
+        if shutil.which("pgrep"):
+            try:
+                chk = subprocess.run(
+                    ["pgrep", "-f", "rclone.*nfsmount"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+                nfsmount_active = chk.returncode == 0 and bool(chk.stdout.strip())
+            except (subprocess.TimeoutExpired, OSError):
+                nfsmount_active = True
+        if not nfsmount_active:
+            _remove_target(legacy_rclone_nfs, "legacy rclone nfsmount handle cache")
+
+    # 6. Clean stale `/tmp/rf-ssh-*` control sockets (only when targeting live user home)
+    if home_dir is None and os.name == "posix":
+        try:
+            for sock in sorted(Path("/tmp").glob("rf-ssh-*")):
+                _remove_target(sock, "stale SSH mux socket")
+        except OSError:
+            pass
+
+    storage_paths = [
+        ("cache_remote_fleet", cache_root),
+        ("cache_rclone", home / ".cache" / "rclone"),
+        ("local_share_mirror", home / ".local" / "share" / "remote-fleet"),
+        ("login_app", home / "Applications" / f"{LOGIN_APP_NAME}.app"),
+        ("fleet_workspaces", home / "Fleet"),
+    ]
+    storage_usage = [
+        {"name": name, "path": str(p), "bytes": _path_size_bytes(p), "exists": p.exists()}
+        for name, p in storage_paths
+    ]
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "live_mounts": sorted(live_stems),
+        "removed_count": len(removed),
+        "freed_bytes": freed_bytes,
+        "removed": removed,
+        "storage_usage": storage_usage,
+    }
 
 
 def _sync_local_runtime_mirror(home: Path, repo_src: Path) -> Path:

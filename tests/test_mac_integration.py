@@ -1587,6 +1587,8 @@ class TestMacIntegration(unittest.TestCase):
                 self.assertEqual(d_serve[d_serve.index("--dir-cache-time") + 1], "15m")
                 self.assertEqual(y_serve[y_serve.index("--dir-cache-time") + 1], "5m")
                 for sc in serve_cmds:
+                    self.assertEqual(sc[sc.index("--vfs-cache-max-size") + 1], "256M")
+                    self.assertEqual(sc[sc.index("--vfs-cache-max-age") + 1], "15m")
                     self.assertEqual(sc[sc.index("--sftp-idle-timeout") + 1], "5m")
                     self.assertEqual(sc[sc.index("--attr-timeout") + 1], "5s")
                     self.assertEqual(sc[sc.index("--contimeout") + 1], "5s")
@@ -1862,6 +1864,77 @@ class TestMacIntegration(unittest.TestCase):
                     os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
                 else:
                     os.environ["REMOTE_FLEET_CONFIG_DIR"] = old_cfg_dir
+
+    def test_cleanup_remote_fleet_cache_preserves_live_and_removes_stale(self) -> None:
+        """Verify `cleanup_remote_fleet_cache` preserves active daemon caches while removing
+        orphaned NFS/VFS caches, dead daemon JSONs, obsolete logs, temp Swift source, and legacy rclone cache."""
+        import json
+        from unittest.mock import patch
+
+        from remote_fleet.mac_integration import cleanup_remote_fleet_cache
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            cache = fake_home / ".cache" / "remote-fleet"
+            daemons = cache / "daemons"
+            daemons.mkdir(parents=True)
+
+            # Live daemon: pc-C (PID 11111 mocked live)
+            (daemons / "pc-C.json").write_text(json.dumps({"pid": 11111}), encoding="utf-8")
+            (cache / "nfs-handles" / "pc-C").mkdir(parents=True)
+            (cache / "nfs-handles" / "pc-C" / "h1").write_bytes(b"live-handle")
+            (cache / "vfs-cache" / "pc-C").mkdir(parents=True)
+            (cache / "vfs-cache" / "pc-C" / "f1").write_bytes(b"live-vfs")
+            (cache / "rclone-pc-C.log").write_text("live log\n", encoding="utf-8")
+
+            # Dead/orphaned daemon: spark02-Home (PID 22222 mocked dead) + legacy junk
+            (daemons / "spark02-Home.json").write_text(json.dumps({"pid": 22222}), encoding="utf-8")
+            (cache / "nfs-handles" / "spark02-Home").mkdir(parents=True)
+            (cache / "nfs-handles" / "spark02-Home" / "old").write_bytes(b"x" * 2048)
+            (cache / "vfs-cache" / "spark02-Home").mkdir(parents=True)
+            (cache / "vfs-cache" / "spark02-Home" / "old.bin").write_bytes(b"y" * 4096)
+            (cache / "rclone-spark02-Home.log").write_text("old log\n" * 50, encoding="utf-8")
+            (cache / "automount.log").write_text("legacy launchd\n", encoding="utf-8")
+            (cache / "repair-sidebar-v1").write_bytes(b"bin")
+            (cache / "repair_sidebar_v1.swift").write_text("import Foundation\n", encoding="utf-8")
+
+            legacy_rclone = fake_home / ".cache" / "rclone" / "serve-nfs-handle-cache"
+            legacy_rclone.mkdir(parents=True)
+            (legacy_rclone / "stale").write_bytes(b"z" * 1024)
+
+            with (
+                patch("remote_fleet.mac_integration._is_live_rclone_daemon_pid", side_effect=lambda p: p == 11111),
+                patch("remote_fleet.mac_integration.shutil.which", return_value=None),
+            ):
+                dry = cleanup_remote_fleet_cache(home_dir=fake_home, dry_run=True)
+                self.assertEqual(dry["live_mounts"], ["pc-C"])
+                self.assertGreater(dry["removed_count"], 5)
+                self.assertGreater(dry["freed_bytes"], 7000)
+                # Dry run must not delete anything
+                self.assertTrue((cache / "vfs-cache" / "spark02-Home").exists())
+                self.assertTrue(legacy_rclone.exists())
+
+                res = cleanup_remote_fleet_cache(home_dir=fake_home, dry_run=False)
+
+            self.assertEqual(res["live_mounts"], ["pc-C"])
+            self.assertEqual(res["removed_count"], dry["removed_count"])
+            self.assertEqual(res["freed_bytes"], dry["freed_bytes"])
+
+            # Active live mount files preserved
+            self.assertTrue((daemons / "pc-C.json").is_file())
+            self.assertTrue((cache / "nfs-handles" / "pc-C" / "h1").is_file())
+            self.assertTrue((cache / "vfs-cache" / "pc-C" / "f1").is_file())
+            self.assertTrue((cache / "rclone-pc-C.log").is_file())
+            self.assertTrue((cache / "repair-sidebar-v1").is_file())
+
+            # Stale & obsolete files removed
+            self.assertFalse((daemons / "spark02-Home.json").exists())
+            self.assertFalse((cache / "nfs-handles" / "spark02-Home").exists())
+            self.assertFalse((cache / "vfs-cache" / "spark02-Home").exists())
+            self.assertFalse((cache / "rclone-spark02-Home.log").exists())
+            self.assertFalse((cache / "automount.log").exists())
+            self.assertFalse((cache / "repair_sidebar_v1.swift").exists())
+            self.assertFalse(legacy_rclone.exists())
 
 
 if __name__ == "__main__":

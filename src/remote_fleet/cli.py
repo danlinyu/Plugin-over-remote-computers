@@ -33,6 +33,7 @@ from remote_fleet.bootstrap import run_bootstrap
 from remote_fleet.gui_picker import gui_pick_machine_and_folder
 from remote_fleet.installer import install_all_harnesses
 from remote_fleet.mac_integration import (
+    cleanup_remote_fleet_cache,
     discover_windows_wsl_targets,
     install_macos_launch_agent,
     install_macos_login_item_app,
@@ -896,6 +897,11 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
             print(f"  [WARN] {mid:<12} -> {r.get('error')}")
     if summary.get("sidebar_repaired"):
         print("  [FIXED] Repaired macOS Finder & Open-Dialog Sidebar Favorites (`pc`, `spark01`, `spark03`, `spark04`)!")
+    if summary.get("cleaned_count"):
+        print(
+            f"  [CLEAN] Removed {summary['cleaned_count']} stale cache/log item(s) "
+            f"({_fmt_bytes(int(summary.get('cleaned_bytes') or 0))} freed)."
+        )
     if sys.platform == "darwin" and not from_launchd and not from_login_app:
         if uninstall_macos_launch_agent():
             print("  [CLEAN] Removed legacy background LaunchAgent (com.remote-fleet.automount) — no background polling.")
@@ -915,6 +921,34 @@ def cmd_mount_all(args: argparse.Namespace) -> int:
                 )
         elif login_res.get("error"):
             print(f"  [WARN]  Could not install login auto-mount app: {login_res['error']}")
+    return 0
+
+
+def _fmt_bytes(num_bytes: int) -> str:
+    val = float(max(0, num_bytes))
+    for unit in ("B", "KB", "MB", "GB"):
+        if val < 1024.0 or unit == "GB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{int(num_bytes)} B"
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    summary = cleanup_remote_fleet_cache(dry_run=bool(args.dry_run))
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+    verb = "Would remove" if args.dry_run else "Removed"
+    if summary["removed"]:
+        print(f"{verb} {summary['removed_count']} stale item(s) ({_fmt_bytes(summary['freed_bytes'])}):")
+        for item in summary["removed"]:
+            print(f"  - {_fmt_bytes(int(item['bytes'])):>9}  {item['path']}  ({item['reason']})")
+    else:
+        print("No stale remote-fleet cache or log files found.")
+    print("\nCurrent internal-disk footprint:")
+    for entry in summary["storage_usage"]:
+        status = _fmt_bytes(int(entry["bytes"])) if entry["exists"] else "(absent)"
+        print(f"  - {status:>10}  {entry['path']}")
     return 0
 
 
@@ -1155,6 +1189,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_umall = sub.add_parser("unmount-all", help="Unmount all ~/RemoteComputers/<machine> mounts")
     p_umall.add_argument("--dir", help="Mount root directory (default: ~/RemoteComputers)")
     p_umall.set_defaults(func=cmd_unmount_all)
+
+    p_clean = sub.add_parser(
+        "clean",
+        help="Remove stale/obsolete remote-fleet caches, logs, and temp files on internal disk (keeps active mounts intact)",
+    )
+    p_clean.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting anything")
+    p_clean.add_argument("--json", action="store_true", help="Output JSON")
+    p_clean.set_defaults(func=cmd_clean)
 
     p_mac = sub.add_parser(
         "setup-mac",
