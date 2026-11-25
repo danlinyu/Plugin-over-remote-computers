@@ -710,8 +710,6 @@ def _mount_sftp_directory(
                 "--vfs-fast-fingerprint",
                 "--dir-cache-time",
                 dir_cache_time,
-                "--attr-timeout",
-                "5s",
                 "--poll-interval",
                 "0",
                 "--sftp-idle-timeout",
@@ -1102,6 +1100,10 @@ def _mount_windows_all_drives(
                 aborted_permission = True
                 break
 
+    has_explicit_wsl = any(
+        bool(t.get("explicit") or t.get("drive_letter")) for t in wsl_targets
+    )
+
     def _attempt_wsl_mount(target: Dict[str, Any]) -> Tuple[bool, bool, str]:
         nonlocal total_visible, any_already, new_mount_attempts
         mname = str(target["mount_name"]).strip()
@@ -1110,9 +1112,13 @@ def _mount_windows_all_drives(
         remote_uri = str(target.get("remote_uri") or format_wsl_path(distro, wsl_root))
         drv_letter = str(target.get("drive_letter") or "").strip().upper()
         sftp_cmd = str(target.get("sftp_server_command") or "").strip()
+        is_explicit = bool(target.get("explicit") or drv_letter)
         label_key = f"{drv_letter}:" if drv_letter else mname
 
         if not sftp_cmd:
+            # Don't spam warnings for old/unused unmapped WSL distros when a mapped WSL drive (e.g. Y:) is already present
+            if not is_explicit and has_explicit_wsl:
+                return False, False, label_key
             err_msg = str(
                 target.get("probe_error")
                 or (
@@ -2170,14 +2176,20 @@ def discover_windows_wsl_targets(machine: MachineConfig, host: str) -> List[Dict
             }
         )
 
-    # 3. Any remaining user WSL distributions from `wsl.exe -l -v` not yet exposed via a mapped drive letter
+    has_mapped_wsl = bool(raw_targets)
+
+    # 3. Any remaining user WSL distributions from `wsl.exe -l -v` not yet exposed via a mapped drive letter.
+    #    Never cold-boot old/unused Stopped distros when an explicit mapped drive (e.g. `Y:`) or primary WSL target already exists.
     for item in installed_distros:
         distro = str(item["name"])
         if distro.lower() in covered_distros:
             continue
+        is_running = str(item.get("state") or "").lower() == "running"
         if not raw_targets and "WSL" not in used_mount_names:
             mount_name = "WSL"
         else:
+            if not is_running:
+                continue
             slug = re.sub(r"[^A-Za-z0-9._-]+", "-", distro).strip("-") or "Linux"
             mount_name = f"WSL-{slug}"
         if mount_name in used_mount_names:
@@ -2213,6 +2225,7 @@ def discover_windows_wsl_targets(machine: MachineConfig, host: str) -> List[Dict
                 "distro": distro,
                 "wsl_root": wsl_root,
                 "remote_uri": format_wsl_path(distro, wsl_root),
+                "explicit": bool(item["drive_letter"]) or (not has_mapped_wsl and item["mount_name"] == "WSL"),
                 "sftp_server": str(probe.get("sftp_server") or ""),
                 "sftp_server_command": str(probe.get("sftp_server_command") or ""),
                 "probe_error": str(probe.get("error") or ""),

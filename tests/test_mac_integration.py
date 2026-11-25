@@ -1587,10 +1587,10 @@ class TestMacIntegration(unittest.TestCase):
                 self.assertEqual(d_serve[d_serve.index("--dir-cache-time") + 1], "15m")
                 self.assertEqual(y_serve[y_serve.index("--dir-cache-time") + 1], "5m")
                 for sc in serve_cmds:
+                    self.assertNotIn("--attr-timeout", sc)
                     self.assertEqual(sc[sc.index("--vfs-cache-max-size") + 1], "256M")
                     self.assertEqual(sc[sc.index("--vfs-cache-max-age") + 1], "15m")
                     self.assertEqual(sc[sc.index("--sftp-idle-timeout") + 1], "5m")
-                    self.assertEqual(sc[sc.index("--attr-timeout") + 1], "5s")
                     self.assertEqual(sc[sc.index("--contimeout") + 1], "5s")
                     self.assertEqual(sc[sc.index("--timeout") + 1], "15s")
                     self.assertEqual(sc[sc.index("--low-level-retries") + 1], "3")
@@ -1642,7 +1642,8 @@ class TestMacIntegration(unittest.TestCase):
         wsl_raw_text = (
             "  NAME                   STATE           VERSION\r\n"
             "* Ubuntu                 Running         2\r\n"
-            "  Debian                 Stopped         2\r\n"
+            "  Debian                 Running         2\r\n"
+            "  Ubuntu-24.04           Stopped         2\r\n"
             "  docker-desktop         Running         2\r\n"
             "  docker-desktop-data    Stopped         2\r\n"
             "  rancher-desktop        Stopped         2\r\n"
@@ -1654,7 +1655,7 @@ class TestMacIntegration(unittest.TestCase):
 
         # 2. `wsl.exe -l -v` parser filters Docker/Rancher/Podman and places default first
         distros = _parse_wsl_list_verbose(wsl_raw_text)
-        self.assertEqual([d["name"] for d in distros], ["Ubuntu", "Debian"])
+        self.assertEqual([d["name"] for d in distros], ["Ubuntu", "Debian", "Ubuntu-24.04"])
         self.assertTrue(distros[0]["is_default"])
 
         # 3. `reg.exe query HKCU\Network /s` parser extracts WSL drives and ignores regular SMB shares
@@ -1681,6 +1682,7 @@ class TestMacIntegration(unittest.TestCase):
         )
 
         # 4. `discover_windows_wsl_targets` merges HKCU\Network + wsl.exe -l -v + sftp-server probe
+        #    and skips Stopped unmapped distros (`Ubuntu-24.04`) without cold-booting them!
         pc = MachineConfig(
             id="pc",
             name="Home PC (danlin-hud)",
@@ -1689,9 +1691,11 @@ class TestMacIntegration(unittest.TestCase):
             os="windows",
         )
         reg_y_only = "HKEY_CURRENT_USER\\Network\\Y\n    RemotePath    REG_SZ    \\\\wsl.localhost\\ubuntu\n"
+        probed_cmds: list[str] = []
 
         def fake_discover_ssh(cmd: list[str], **kwargs: object) -> sp.CompletedProcess[bytes]:
             remote_arg = cmd[-1]
+            probed_cmds.append(remote_arg)
             if "reg.exe" in remote_arg:
                 return sp.CompletedProcess(cmd, 0, stdout=reg_y_only.encode("utf-8"), stderr=b"")
             if "wsl.exe -l -v" in remote_arg:
@@ -1714,6 +1718,7 @@ class TestMacIntegration(unittest.TestCase):
             targets = discover_windows_wsl_targets(pc, "192.168.68.70")
 
         self.assertEqual([t["mount_name"] for t in targets], ["Y", "WSL-Debian"])
+        self.assertFalse(any("Ubuntu-24.04" in c for c in probed_cmds))
         # Canonical distro casing from `wsl.exe -l -v` ("Ubuntu") is preserved even when registry had "ubuntu"
         self.assertEqual(targets[0]["distro"], "Ubuntu")
         self.assertEqual(targets[0]["drive_letter"], "Y")
@@ -1841,11 +1846,8 @@ class TestMacIntegration(unittest.TestCase):
                 self.assertEqual((pc_container / "WSL").readlink(), Path("Y"))
                 self.assertIn("Y", res["sample_entries"])
                 self.assertIn("WSL", res["sample_entries"])
-                # Missing sftp-server on WSL-Debian produces an actionable warning in failed_drives
-                self.assertTrue(
-                    any("openssh-sftp-server" in msg for msg in res.get("failed_drives") or []),
-                    res.get("failed_drives"),
-                )
+                # Unmapped secondary WSL-Debian lacking sftp-server is quietly skipped when Y: is mapped
+                self.assertNotIn("failed_drives", res)
 
                 # Mounted path auto-binding maps `pc/Y/...`, `pc/Y`, AND `pc/WSL/...` back to `wsl://Ubuntu/...`!
                 s_sub = load_active_project(cwd=pc_container / "Y" / "home" / "danli" / "ml-job")
@@ -1859,6 +1861,27 @@ class TestMacIntegration(unittest.TestCase):
                 s_link = load_active_project(cwd=pc_container / "WSL" / "home" / "danli" / "ml-job")
                 assert s_link is not None
                 self.assertEqual((s_link.machine_id, s_link.remote_path), ("pc", "wsl://Ubuntu/home/danli/ml-job"))
+
+                # Whereas an explicitly mapped drive (Y:) lacking sftp-server MUST emit the actionable install hint
+                missing_y_ping = {
+                    "ok": True,
+                    "os": "windows",
+                    "home": "C:/Users/danli",
+                    "drives": ["C:/"],
+                    "wsl_targets": [{**targets[0], "sftp_server": "", "sftp_server_command": "", "probe_error": targets[1]["probe_error"]}],
+                }
+                with (
+                    patch("remote_fleet.mac_integration.is_mounted", return_value=False),
+                    patch("remote_fleet.mac_integration._mount_sftp_directory", side_effect=fake_mount_dir),
+                    patch("remote_fleet.mac_integration.time.sleep", return_value=None),
+                ):
+                    res_miss = _mount_windows_all_drives(
+                        pc, {"transport": "lan", "host": "192.168.68.70"}, "192.168.68.70", missing_y_ping, tmp_path / "pc_miss"
+                    )
+                self.assertTrue(
+                    any("openssh-sftp-server" in msg for msg in res_miss.get("failed_drives") or []),
+                    res_miss.get("failed_drives"),
+                )
             finally:
                 if old_cfg_dir is None:
                     os.environ.pop("REMOTE_FLEET_CONFIG_DIR", None)
